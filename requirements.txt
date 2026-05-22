@@ -1,0 +1,9 @@
+tensorflow
+numpy
+streamlit
+pillow
+pywebview
+websocket-client
+streamlit-drawable-canvas
+pyserial
+opencv-python

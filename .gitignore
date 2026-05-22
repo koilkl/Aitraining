@@ -1,1 +1,13 @@
 examples/
+.workspace/
+datasets/
+dist/
+build/
+__pycache__/
+*.spec
+.DS_Store
+/.vscode
+AItraining.code-workspace
+model.h
+model.cpp
+g_model.tflite
