@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 
-HEADER = bytes([0xAA, 0x55, 0xAA])
+HEADER = bytes([0xAA, 0x55, 0xAA])  # default frame sync header
 FRAME_W = 96
 FRAME_H = 96
 FRAME_SIZE = FRAME_W * FRAME_H
@@ -21,9 +21,10 @@ class SerialPortInfo:
 
 
 class SerialFrameReader:
-    def __init__(self, port: str, baud: int) -> None:
+    def __init__(self, port: str, baud: int, sync_header: bytes | str | None = None) -> None:
         self._port = port
         self._baud = int(baud)
+        self._header = parse_sync_header(sync_header)
         self._ser = None
 
     def open(self) -> None:
@@ -52,9 +53,9 @@ class SerialFrameReader:
             if not chunk:
                 continue
             for b in chunk:
-                if b == HEADER[header_pos]:
+                if b == self._header[header_pos]:
                     header_pos += 1
-                    if header_pos == len(HEADER):
+                    if header_pos == len(self._header):
                         header_pos = 0
                         frame = _read_exact(self._ser, FRAME_SIZE, timeout_s=max(0.2, timeout_s - (time.time() - start)))
                         if frame is None:
@@ -80,9 +81,10 @@ def list_serial_ports() -> List[SerialPortInfo]:
 def read_frame_png_from_serial(
     port: str,
     baud: int,
+    sync_header: bytes | str | None = None,
     timeout_s: float = 3.0,
 ) -> bytes:
-    reader = SerialFrameReader(port=port, baud=baud)
+    reader = SerialFrameReader(port=port, baud=baud, sync_header=sync_header)
     reader.open()
     try:
         frame = reader.read_frame(timeout_s=timeout_s)
@@ -91,6 +93,34 @@ def read_frame_png_from_serial(
     arr = np.frombuffer(frame, dtype=np.uint8).reshape((FRAME_H, FRAME_W))
     img = Image.fromarray(arr, mode="L")
     return _to_png_bytes(img)
+
+
+def parse_sync_header(sync_header: bytes | str | None) -> bytes:
+    if isinstance(sync_header, bytes):
+        if not sync_header:
+            raise ValueError("Sync header cannot be empty.")
+        return sync_header
+    raw = str(sync_header or "").strip()
+    if not raw:
+        return HEADER
+    cleaned = raw.replace(",", " ").replace("0x", "").replace("0X", "")
+    parts = [part.strip() for part in cleaned.split() if part.strip()]
+    if not parts:
+        return HEADER
+    values = []
+    for part in parts:
+        if len(part) > 2:
+            raise ValueError("Sync header bytes must be 1-2 hex digits.")
+        try:
+            value = int(part, 16)
+        except Exception as e:
+            raise ValueError("Sync header must use hex bytes like AA 55 AA.") from e
+        if value < 0 or value > 255:
+            raise ValueError("Sync header byte out of range.")
+        values.append(value)
+    if not values:
+        raise ValueError("Sync header cannot be empty.")
+    return bytes(values)
 
 
 def _read_exact(ser, n: int, timeout_s: float) -> Optional[bytes]:

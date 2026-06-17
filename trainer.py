@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -15,7 +15,7 @@ from tensorflow.lite.python.util import convert_bytes_to_c_source
 @dataclass(frozen=True)
 class TrainConfig:
     img_size: int = 96
-    color_mode: str = "rgb"
+    color_mode: str = "grayscale"
     batch_size: int = 16
     epochs: int = 10
     validation_split: float = 0.2
@@ -43,34 +43,68 @@ def _channels(color_mode: str) -> int:
     return 1 if color_mode == "grayscale" else 3
 
 
+def _list_image_files(dataset_dir: Path) -> Dict[str, List[Path]]:
+    allowed = {".bmp", ".gif", ".jpeg", ".jpg", ".png"}
+    out: Dict[str, List[Path]] = {}
+    for class_dir in sorted([p for p in dataset_dir.iterdir() if p.is_dir()]):
+        files = [p for p in sorted(class_dir.iterdir()) if p.is_file() and p.suffix.lower() in allowed]
+        if files:
+            out[class_dir.name] = files
+    return out
+
+
 def load_datasets(
     dataset_dir: Path, cfg: TrainConfig
-) -> Tuple[tf.data.Dataset, tf.data.Dataset, List[str], Tuple[int, int, int]]:
+) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], List[str], Tuple[int, int, int]]:
     dataset_dir = dataset_dir.resolve()
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        str(dataset_dir),
-        labels="inferred",
-        label_mode="int",
-        color_mode=cfg.color_mode,
-        batch_size=cfg.batch_size,
-        image_size=(cfg.img_size, cfg.img_size),
-        shuffle=True,
-        seed=cfg.seed,
-        validation_split=cfg.validation_split,
-        subset="training",
-    )
-    val_ds = tf.keras.utils.image_dataset_from_directory(
-        str(dataset_dir),
-        labels="inferred",
-        label_mode="int",
-        color_mode=cfg.color_mode,
-        batch_size=cfg.batch_size,
-        image_size=(cfg.img_size, cfg.img_size),
-        shuffle=True,
-        seed=cfg.seed,
-        validation_split=cfg.validation_split,
-        subset="validation",
-    )
+    image_map = _list_image_files(dataset_dir)
+    total_files = sum(len(files) for files in image_map.values())
+    if len(image_map) < 2:
+        raise ValueError("Need at least 2 classes with images before training.")
+    if total_files < 2:
+        raise ValueError("Need at least 2 images before training.")
+    can_split_validation = cfg.validation_split > 0 and total_files >= 3
+    if can_split_validation:
+        val_count = int(total_files * float(cfg.validation_split))
+        train_count = total_files - val_count
+        can_split_validation = val_count >= 1 and train_count >= 1
+    if can_split_validation:
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            str(dataset_dir),
+            labels="inferred",
+            label_mode="int",
+            color_mode=cfg.color_mode,
+            batch_size=cfg.batch_size,
+            image_size=(cfg.img_size, cfg.img_size),
+            shuffle=True,
+            seed=cfg.seed,
+            validation_split=cfg.validation_split,
+            subset="training",
+        )
+        val_ds = tf.keras.utils.image_dataset_from_directory(
+            str(dataset_dir),
+            labels="inferred",
+            label_mode="int",
+            color_mode=cfg.color_mode,
+            batch_size=cfg.batch_size,
+            image_size=(cfg.img_size, cfg.img_size),
+            shuffle=True,
+            seed=cfg.seed,
+            validation_split=cfg.validation_split,
+            subset="validation",
+        )
+    else:
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            str(dataset_dir),
+            labels="inferred",
+            label_mode="int",
+            color_mode=cfg.color_mode,
+            batch_size=cfg.batch_size,
+            image_size=(cfg.img_size, cfg.img_size),
+            shuffle=True,
+            seed=cfg.seed,
+        )
+        val_ds = None
     class_names = list(train_ds.class_names)
     input_shape = (cfg.img_size, cfg.img_size, _channels(cfg.color_mode))
 
@@ -79,7 +113,8 @@ def load_datasets(
         return x, y
 
     train_ds = train_ds.map(normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    val_ds = val_ds.map(normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    if val_ds is not None:
+        val_ds = val_ds.map(normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
     return train_ds, val_ds, class_names, input_shape
 
 
@@ -148,6 +183,7 @@ def train_and_export(
     cfg: TrainConfig,
     model_base_name: str = "model",
     array_name: str = "g_model",
+    progress: Optional[Callable[[float, str], None]] = None,
 ) -> TrainResult:
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -155,16 +191,42 @@ def train_and_export(
     train_ds, val_ds, labels, input_shape = load_datasets(Path(dataset_dir), cfg)
     model = build_model(input_shape, len(labels), cfg)
 
-    model.fit(train_ds, validation_data=val_ds, epochs=cfg.epochs, verbose=1)
-    loss, acc = model.evaluate(val_ds, verbose=0)
+    if progress is not None:
+        progress(0.02, "Building datasets...")
+
+    fit_kwargs = {"epochs": cfg.epochs, "verbose": 1}
+    if val_ds is not None:
+        fit_kwargs["validation_data"] = val_ds
+    if progress is not None:
+        epochs_total = max(1, int(cfg.epochs))
+
+        class _Progress(tf.keras.callbacks.Callback):
+            def on_epoch_end(self, epoch, logs=None):
+                try:
+                    p = 0.05 + 0.75 * (float(epoch + 1) / float(epochs_total))
+                    progress(p, f"Training epoch {int(epoch + 1)}/{epochs_total}...")
+                except Exception:
+                    pass
+
+        fit_kwargs["callbacks"] = [_Progress()]
+
+    model.fit(train_ds, **fit_kwargs)
+    eval_ds = val_ds if val_ds is not None else train_ds
+    if progress is not None:
+        progress(0.85, "Evaluating...")
+    loss, acc = model.evaluate(eval_ds, verbose=0)
 
     keras_model_path = run_dir / f"{model_base_name}.keras"
     model.save(str(keras_model_path))
 
+    if progress is not None:
+        progress(0.9, "Converting to int8 TFLite...")
     tflite_bytes = convert_to_int8_tflite(model, train_ds, cfg)
     tflite_path = run_dir / f"{model_base_name}.tflite"
     tflite_path.write_bytes(tflite_bytes)
 
+    if progress is not None:
+        progress(0.96, "Exporting sources...")
     source_code, header_code = export_tflite_c_sources(tflite_bytes, array_name=array_name)
     model_h_path = run_dir / "model.h"
     model_cpp_path = run_dir / "model.cpp"
@@ -177,6 +239,8 @@ def train_and_export(
         json.dumps(asdict(cfg), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    if progress is not None:
+        progress(1.0, "Done.")
 
     return TrainResult(
         run_dir=run_dir,
@@ -193,4 +257,3 @@ def new_run_dir(base_dir: Path) -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
     rand = os.urandom(3).hex()
     return base_dir / f"run_{ts}_{rand}"
-

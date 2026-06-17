@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import multiprocessing
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -49,6 +51,39 @@ def _app_data_dir() -> Path:
     return (base / "TFLiteTraining").resolve()
 
 
+def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None = None) -> None:
+    env_path = Path(".dbg/open-project-layout.env")
+    url = "http://127.0.0.1:7777/event"
+    session_id = "open-project-layout"
+    try:
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("DEBUG_SERVER_URL="):
+                    url = line.split("=", 1)[1].strip() or url
+                elif line.startswith("DEBUG_SESSION_ID="):
+                    session_id = line.split("=", 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        "sessionId": session_id,
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": msg,
+        "data": data or {},
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=1.5).read()
+    except Exception:
+        pass
+
+
 def _run_streamlit_server(port: int, log_path: str) -> None:
     import traceback
 
@@ -80,6 +115,112 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
                 f.write("\n")
                 f.flush()
                 raise
+
+
+_LAYOUT_REFRESH_JS = r"""
+(() => {
+  const refreshTarget = (win) => {
+    if (!win) return;
+    try { win.dispatchEvent(new Event('resize')); } catch (e) {}
+    try { win.dispatchEvent(new Event('orientationchange')); } catch (e) {}
+    try { if (typeof win.scheduleLayoutResync === 'function') win.scheduleLayoutResync(); } catch (e) {}
+    try { if (typeof win.queueFrameHeightSync === 'function') win.queueFrameHeightSync(); } catch (e) {}
+    try { if (typeof win.syncFrameHeight === 'function') win.syncFrameHeight(); } catch (e) {}
+  };
+  refreshTarget(window);
+  try {
+    document.querySelectorAll('iframe').forEach((frame) => {
+      try { refreshTarget(frame.contentWindow); } catch (e) {}
+    });
+  } catch (e) {}
+  return true;
+})();
+"""
+
+
+def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") -> None:
+    # #region debug-point C:schedule-window-layout-refresh
+    _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell layout refresh scheduled", {"reason": str(reason or "")})
+    # #endregion
+    def _run_once(delay_s: float) -> None:
+        def _inner() -> None:
+            try:
+                # #region debug-point C:evaluate-layout-refresh-js
+                _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell evaluate_js layout refresh", {"reason": str(reason or ""), "delay_s": float(delay_s)})
+                # #endregion
+                window.evaluate_js(_LAYOUT_REFRESH_JS)
+            except Exception:
+                pass
+
+        timer = threading.Timer(delay_s, _inner)
+        timer.daemon = True
+        timer.start()
+
+    for delay_s in (0.0, 0.12, 0.35, 0.8):
+        _run_once(delay_s)
+
+
+_LAST_NATIVE_NUDGE_AT = 0.0
+
+
+def _maybe_native_resize_nudge(window: "webview.Window", reason: str = "") -> bool:
+    global _LAST_NATIVE_NUDGE_AT
+    reason_s = str(reason or "")
+    if reason_s.startswith("resized:"):
+        return False
+    if not (reason_s.startswith("image-project-mount") or reason_s in {"shown", "loaded", "startup", "open-project"}):
+        return False
+    now = time.time()
+    if (now - float(_LAST_NATIVE_NUDGE_AT or 0.0)) < 1.2:
+        return False
+    resize_fn = getattr(window, "resize", None)
+    width = int(getattr(window, "width", 0) or 0)
+    height = int(getattr(window, "height", 0) or 0)
+    if not callable(resize_fn) or width < 300 or height < 300:
+        # #region debug-point C:native-resize-nudge-skip
+        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge skipped", {"reason": reason_s, "width": width, "height": height, "has_resize": bool(callable(resize_fn))})
+        # #endregion
+        return False
+    try:
+        _LAST_NATIVE_NUDGE_AT = now
+        # #region debug-point C:native-resize-nudge
+        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge start", {"reason": reason_s, "width": width, "height": height})
+        # #endregion
+        resize_fn(width + 1, height + 1)
+        time.sleep(0.03)
+        resize_fn(width, height)
+        # #region debug-point C:native-resize-nudge-done
+        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge done", {"reason": reason_s, "width": width, "height": height})
+        # #endregion
+        return True
+    except Exception as e:
+        # #region debug-point C:native-resize-nudge-error
+        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge failed", {"reason": reason_s, "error": str(e)})
+        # #endregion
+        return False
+
+
+class _ShellApi:
+    def __init__(self) -> None:
+        self.window = None
+
+    def bind(self, window: "webview.Window") -> None:
+        self.window = window
+
+    def request_reflow(self, reason: str = "") -> bool:
+        if self.window is None:
+            return False
+        # #region debug-point C:request-reflow
+        _debug_post("C", "desktop_launcher.py:_ShellApi.request_reflow", "[DEBUG] shell request_reflow invoked", {"reason": str(reason or "")})
+        # #endregion
+        _schedule_window_layout_refresh(self.window, reason=reason)
+        _maybe_native_resize_nudge(self.window, reason=reason)
+        return True
+
+
+def _startup_window_logic(window: "webview.Window") -> None:
+    _schedule_window_layout_refresh(window, reason="startup")
+    _maybe_native_resize_nudge(window, reason="startup")
 
 
 def main() -> None:
@@ -114,9 +255,16 @@ def main() -> None:
 
         import webview
 
-        window = webview.create_window("TF Lite Training", url, width=1200, height=800)
+        shell_api = _ShellApi()
+        window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
+        shell_api.bind(window)
+        window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
+        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"))
+        window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _schedule_window_layout_refresh(window, reason="restored"))
+        window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
+        window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
-        webview.start()
+        webview.start(_startup_window_logic, window)
     finally:
         if proc.is_alive():
             proc.terminate()

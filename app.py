@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import base64
+import json
 import shutil
+import time
 import uuid
 import os
 import sys
 import re
+import subprocess
+import urllib.request
+import zipfile
+from html import escape as html_escape
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 
+from camera_permission import ensure_camera_access, get_camera_access_status
 from trainer import TrainConfig, new_run_dir, train_and_export
 from ui_styles import inject_teachable_style
 
@@ -30,6 +38,84 @@ from record_controller import RecordController, SessionConfig, make_hold_button_
 
 
 APP_NAME = "TFLiteTraining"
+
+
+#region debug-point capture-webcam-source-helper
+def _dbg_capture_webcam_source(hypothesis_id: str, run_id: str, location: str, msg: str, data: dict) -> None:
+    _paths = [".dbg/packaged-webcam-bounce.env", ".dbg/capture-webcam-source.env"]
+    _u = "http://127.0.0.1:7777/event"
+    _s = "packaged-webcam-bounce"
+    try:
+        for _p in _paths:
+            if not Path(_p).exists():
+                continue
+            with open(_p, "r", encoding="utf-8") as f:
+                for _line in f.read().splitlines():
+                    if _line.startswith("DEBUG_SERVER_URL="):
+                        _u = _line.split("=", 1)[1].strip() or _u
+                    elif _line.startswith("DEBUG_SESSION_ID="):
+                        _s = _line.split("=", 1)[1].strip() or _s
+            break
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(
+                    {
+                        "sessionId": _s,
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "msg": msg,
+                        "data": data,
+                        "ts": int(time.time() * 1000),
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.5,
+        ).read()
+    except Exception:
+        pass
+#endregion
+
+
+#region debug-point open-project-layout-helper
+def _dbg_open_project_layout(hypothesis_id: str, run_id: str, location: str, msg: str, data: dict) -> None:
+    _paths = [".dbg/open-project-layout.env"]
+    _u = "http://127.0.0.1:7777/event"
+    _s = "open-project-layout"
+    try:
+        for _p in _paths:
+            if not Path(_p).exists():
+                continue
+            with open(_p, "r", encoding="utf-8") as f:
+                for _line in f.read().splitlines():
+                    if _line.startswith("DEBUG_SERVER_URL="):
+                        _u = _line.split("=", 1)[1].strip() or _u
+                    elif _line.startswith("DEBUG_SESSION_ID="):
+                        _s = _line.split("=", 1)[1].strip() or _s
+            break
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(
+                    {
+                        "sessionId": _s,
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "msg": msg,
+                        "data": data,
+                        "ts": int(time.time() * 1000),
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.5,
+        ).read()
+    except Exception:
+        pass
+#endregion
 
 
 def _app_data_dir() -> Path:
@@ -59,6 +145,30 @@ def _default_export_dir() -> Path:
 
 
 def _pick_directory_dialog(initial_dir: Optional[str] = None) -> Optional[str]:
+    if sys.platform == "darwin":
+        try:
+            start_dir = Path(initial_dir).expanduser().resolve() if initial_dir else _documents_dir()
+        except Exception:
+            start_dir = _documents_dir()
+        try:
+            start_posix = str(start_dir).replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                'POSIX path of (choose folder with prompt "Choose Folder" '
+                f'default location (POSIX file "{start_posix}"))'
+            )
+            proc = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    return picked
+        except Exception:
+            pass
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -81,41 +191,100 @@ def _pick_directory_dialog(initial_dir: Optional[str] = None) -> Optional[str]:
     return path or None
 
 
+def _pick_tmproj_file_dialog() -> Optional[Path]:
+    if sys.platform != "darwin":
+        return None
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", 'POSIX path of (choose file with prompt "Open Project")'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    picked = (proc.stdout or "").strip()
+    if not picked:
+        return None
+    p = Path(picked).expanduser()
+    if p.suffix.lower() != ".tmproj":
+        return None
+    return p
+
+
+def _tmproj_read_manifest(path: Path) -> Dict[str, Any]:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            raw = zf.read("manifest.json")
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tmproj_detect_project_type(path: Path, manifest: Dict[str, Any]) -> str:
+    ptype = str(manifest.get("project_type") or "").strip().lower()
+    name = str(path.name or "").lower()
+    if "pose" in ptype or "pose" in name:
+        return "pose"
+    if "image" in ptype or "image" in name:
+        return "image"
+    return "image"
+
+
 def _validate_export_inputs(export_dir: Path, model_name: str, array_name: str, tflite_path: Path) -> List[str]:
     errors: List[str] = []
     if not model_name.strip():
-        errors.append("模型文件名前缀不能为空")
+        errors.append("Model file prefix cannot be empty.")
     if any(sep in model_name for sep in ("/", "\\", os.sep)):
-        errors.append("模型文件名前缀不能包含路径分隔符")
+        errors.append("Model file prefix must not include path separators.")
     if not re.match(r"^[A-Za-z0-9_.-]+$", model_name):
-        errors.append("模型文件名前缀仅允许字母/数字/._-")
+        errors.append("Model file prefix may only contain letters, numbers, '.', '_' and '-'.")
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", array_name):
-        errors.append("C 数组名必须是合法标识符（字母/数字/下划线，且不能以数字开头）")
+        errors.append("C array name must be a valid identifier (letters/numbers/underscore, not starting with a number).")
     try:
         export_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        errors.append(f"无法创建导出目录：{export_dir} ({e})")
+        errors.append(f"Failed to create export directory: {export_dir} ({e})")
         return errors
     if not export_dir.is_dir():
-        errors.append(f"导出目录不是文件夹：{export_dir}")
+        errors.append(f"Export path is not a directory: {export_dir}")
     if not tflite_path.exists():
-        errors.append("找不到 .tflite 文件，请先完成训练")
+        errors.append("Missing .tflite file. Train the model first.")
     try:
         test_file = export_dir / ".write_test"
         test_file.write_text("ok", encoding="utf-8")
         test_file.unlink(missing_ok=True)
     except Exception as e:
-        errors.append(f"导出目录不可写：{export_dir} ({e})")
+        errors.append(f"Export directory is not writable: {export_dir} ({e})")
     return errors
 
 
 def _init_session() -> None:
     if "session_id" not in st.session_state:
-        st.session_state.session_id = uuid.uuid4().hex
+        resumed_session_id = ""
+        try:
+            resumed_session_id = str(st.query_params.get("tm_session") or "")
+        except Exception:
+            try:
+                resumed_session_id = str(st.experimental_get_query_params().get("tm_session", [""])[0] or "")
+            except Exception:
+                resumed_session_id = ""
+        st.session_state.session_id = resumed_session_id.strip() or uuid.uuid4().hex
     if "imported" not in st.session_state:
         st.session_state.imported = None
     if "project_type" not in st.session_state:
-        st.session_state.project_type = None
+        resumed_project_type = ""
+        try:
+            resumed_project_type = str(st.query_params.get("tm_project") or "")
+        except Exception:
+            try:
+                resumed_project_type = str(st.experimental_get_query_params().get("tm_project", [""])[0] or "")
+            except Exception:
+                resumed_project_type = ""
+        st.session_state.project_type = resumed_project_type.strip() or None
     if "step" not in st.session_state:
         st.session_state.step = 0
     if "dataset_dir" not in st.session_state:
@@ -146,6 +315,8 @@ def _init_session() -> None:
         st.session_state.tm_serial_port = ""
     if "tm_serial_baud" not in st.session_state:
         st.session_state.tm_serial_baud = 115200
+    if "tm_serial_sync" not in st.session_state:
+        st.session_state.tm_serial_sync = "AA 55 AA"
     if "tm_last_device_frame" not in st.session_state:
         st.session_state.tm_last_device_frame = None
     if "tm_capture_open" not in st.session_state:
@@ -158,6 +329,8 @@ def _init_session() -> None:
         st.session_state.tm_record_fps = 8.0
     if "tm_webcam_index" not in st.session_state:
         st.session_state.tm_webcam_index = 0
+    if "tm_webcam_user_selected" not in st.session_state:
+        st.session_state.tm_webcam_user_selected = False
     if "tm_record_crop_box" not in st.session_state:
         st.session_state.tm_record_crop_box = None
     if "tm_crop_mode" not in st.session_state:
@@ -166,6 +339,20 @@ def _init_session() -> None:
         st.session_state.tm_pending_image = None
     if "tm_pending_class" not in st.session_state:
         st.session_state.tm_pending_class = None
+    if "tm_camera_permission_status" not in st.session_state:
+        st.session_state.tm_camera_permission_status = ""
+    if "tm_camera_permission_note" not in st.session_state:
+        st.session_state.tm_camera_permission_note = ""
+    if "tm_camera_permission_class" not in st.session_state:
+        st.session_state.tm_camera_permission_class = ""
+    if "tm_open_source_class" not in st.session_state:
+        st.session_state.tm_open_source_class = ""
+    if "tm_open_source_kind" not in st.session_state:
+        st.session_state.tm_open_source_kind = ""
+    if "tm_frontend_notice" not in st.session_state:
+        st.session_state.tm_frontend_notice = ""
+    if "tm_return_target" not in st.session_state:
+        st.session_state.tm_return_target = "home"
 
 
 def _session_workspace() -> Path:
@@ -198,6 +385,26 @@ def _reset_session_workspace() -> None:
     st.session_state.tm_capture_source = ""
     st.session_state.tm_capture_class = ""
     st.session_state.tm_record_crop_box = None
+    st.session_state.tm_camera_permission_status = ""
+    st.session_state.tm_camera_permission_note = ""
+    st.session_state.tm_camera_permission_class = ""
+    st.session_state.tm_open_source_class = ""
+    st.session_state.tm_open_source_kind = ""
+    st.session_state.tm_frontend_notice = ""
+    st.session_state.tm_webcam_index = 0
+    st.session_state.tm_webcam_user_selected = False
+
+
+def _begin_fresh_tm_session() -> str:
+    # #region debug-point B:begin-fresh-session
+    _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] begin fresh session", {"old_session": str(st.session_state.get("session_id", ""))})
+    # #endregion
+    _reset_session_workspace()
+    st.session_state.session_id = uuid.uuid4().hex
+    # #region debug-point B:begin-fresh-session-new
+    _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] fresh session created", {"new_session": str(st.session_state.session_id)})
+    # #endregion
+    return st.session_state.session_id
 
 
 def _read_uploaded_images(uploaded_files) -> List[Tuple[str, bytes]]:
@@ -208,23 +415,23 @@ def _read_uploaded_images(uploaded_files) -> List[Tuple[str, bytes]]:
 
 
 def _render_import_panel() -> None:
-    st.subheader("导入图片")
-    method = st.radio("导入方式", ["ZIP 压缩包", "多张图片", "本地文件夹路径"], horizontal=True)
+    st.subheader("Import images")
+    method = st.radio("Import method", ["ZIP file", "Multiple images", "Local folder path"], horizontal=True)
     ws = _session_workspace()
 
-    if method == "ZIP 压缩包":
-        zip_file = st.file_uploader("拖入或选择 .zip", type=["zip"])
-        if zip_file is not None and st.button("导入", type="primary"):
+    if method == "ZIP file":
+        zip_file = st.file_uploader("Drop or select a .zip file", type=["zip"])
+        if zip_file is not None and st.button("Import", type="primary"):
             dest = ws / "import"
             materialize_zip_bytes(zip_file.getvalue(), dest)
             st.session_state.imported = infer_imported_data(dest)
             st.session_state.assignments = {}
             st.session_state.class_rename = {}
 
-    elif method == "多张图片":
+    elif method == "Multiple images":
         exts = sorted([e.lstrip(".") for e in IMAGE_EXTS])
-        files = st.file_uploader("从文件夹中全选图片后拖入（或多选）", type=exts, accept_multiple_files=True)
-        if files and st.button("导入", type="primary"):
+        files = st.file_uploader("Select or drop multiple images", type=exts, accept_multiple_files=True)
+        if files and st.button("Import", type="primary"):
             dest = ws / "import"
             materialize_files(_read_uploaded_images(files), dest)
             st.session_state.imported = infer_imported_data(dest)
@@ -235,22 +442,22 @@ def _render_import_panel() -> None:
         left, right = st.columns([4, 1])
         with left:
             path_str = st.text_input(
-                "输入本地文件夹路径（可已分类或未分类）",
+                "Local folder path (classified or unclassified)",
                 value=st.session_state.local_import_path,
             )
             st.session_state.local_import_path = path_str
         with right:
-            if st.button("浏览...", key="browse_import_dir"):
+            if st.button("Browse...", key="browse_import_dir"):
                 picked = _pick_directory_dialog(initial_dir=st.session_state.local_import_path)
                 if picked:
                     st.session_state.local_import_path = picked
                     st.rerun()
 
-        if st.button("读取路径", type="primary"):
+        if st.button("Load folder", type="primary"):
             path_str = st.session_state.local_import_path
             p = Path(path_str).expanduser()
             if not p.exists() or not p.is_dir():
-                st.error("路径不存在或不是文件夹")
+                st.error("Path does not exist or is not a folder.")
                 return
             st.session_state.imported = infer_imported_data(p)
             st.session_state.assignments = {}
@@ -258,13 +465,13 @@ def _render_import_panel() -> None:
 
 
 def _render_overview(imported: ImportedData) -> None:
-    st.subheader("预览")
+    st.subheader("Preview")
     st.markdown(
         f"""
 <div class="tm-kv">
-  <b>导入目录</b>：{imported.root_dir}<br/>
-  <b>图片数量</b>：{len(imported.images)}<br/>
-  <b>已按文件夹分类</b>：{imported.classified}
+  <b>Source</b>: {imported.root_dir}<br/>
+  <b>Images</b>: {len(imported.images)}<br/>
+  <b>Classified folders</b>: {imported.classified}
 </div>
         """,
         unsafe_allow_html=True,
@@ -279,9 +486,9 @@ def _render_overview(imported: ImportedData) -> None:
 
 
 def _render_classified_flow(imported: ImportedData) -> Optional[Path]:
-    st.subheader("Class 重命名（已分类数据）")
+    st.subheader("Rename classes (classified folders)")
     class_names = list(imported.class_to_images.keys())
-    st.write({"检测到的 class": class_names})
+    st.write({"Detected classes": class_names})
 
     rename: Dict[str, str] = {}
     for c in class_names:
@@ -290,7 +497,7 @@ def _render_classified_flow(imported: ImportedData) -> Optional[Path]:
 
     st.write({c: len(imported.class_to_images[c]) for c in class_names})
 
-    if st.button("保存为训练数据集", type="primary"):
+    if st.button("Save as dataset", type="primary"):
         DATASETS_DIR.mkdir(parents=True, exist_ok=True)
         out_dir = new_output_dir(DATASETS_DIR, prefix="classified")
         try:
@@ -298,24 +505,24 @@ def _render_classified_flow(imported: ImportedData) -> Optional[Path]:
         except Exception as e:
             st.error(str(e))
             return None
-        st.success(f"已生成训练数据集：{out_dir}")
+        st.success(f"Dataset created: {out_dir}")
         return out_dir
     return None
 
 
 def _render_unclassified_flow(imported: ImportedData) -> Optional[Path]:
-    st.subheader("选择/Clarify Class（未分类数据）")
+    st.subheader("Assign classes (unclassified images)")
     st.session_state.class_names = _render_class_editor(st.session_state.class_names)
     class_names = st.session_state.class_names
 
     if not class_names:
-        st.warning("请先创建至少 1 个 class")
+        st.warning("Create at least 1 class first.")
         return None
 
-    page_size = st.slider("每页显示图片数", min_value=6, max_value=60, value=18, step=6)
+    page_size = st.slider("Images per page", min_value=6, max_value=60, value=18, step=6)
     total = len(imported.images)
     max_page = max(1, (total + page_size - 1) // page_size)
-    page = st.number_input("页码", min_value=1, max_value=max_page, value=1, step=1)
+    page = st.number_input("Page", min_value=1, max_value=max_page, value=1, step=1)
     start = (page - 1) * page_size
     end = min(total, start + page_size)
 
@@ -326,7 +533,7 @@ def _render_unclassified_flow(imported: ImportedData) -> Optional[Path]:
             st.image(str(img), use_container_width=True)
         with right:
             default = st.session_state.assignments.get(idx)
-            options = ["未分配"] + class_names
+            options = ["Unassigned"] + class_names
             try:
                 default_index = options.index(default) if default in options else 0
             except Exception:
@@ -337,16 +544,16 @@ def _render_unclassified_flow(imported: ImportedData) -> Optional[Path]:
                 index=default_index,
                 key=f"assign_{idx}",
             )
-            if choice == "未分配":
+            if choice == "Unassigned":
                 st.session_state.assignments.pop(idx, None)
             else:
                 st.session_state.assignments[idx] = choice
 
-    require_all = st.checkbox("保存时要求全部图片已分配类别", value=True)
+    require_all = st.checkbox("Require all images to be assigned before saving", value=True)
     assigned_count = len(st.session_state.assignments)
-    st.write({"已分配": assigned_count, "未分配": total - assigned_count})
+    st.write({"Assigned": assigned_count, "Unassigned": total - assigned_count})
 
-    if st.button("保存为训练数据集", type="primary"):
+    if st.button("Save as dataset", type="primary"):
         DATASETS_DIR.mkdir(parents=True, exist_ok=True)
         out_dir = new_output_dir(DATASETS_DIR, prefix="labeled")
         assignments: List[Optional[str]] = []
@@ -357,14 +564,14 @@ def _render_unclassified_flow(imported: ImportedData) -> Optional[Path]:
         except Exception as e:
             st.error(str(e))
             return None
-        st.success(f"已生成训练数据集：{out_dir}")
+        st.success(f"Dataset created: {out_dir}")
         return out_dir
 
     return None
 
 
 def _render_class_editor(class_names: List[str]) -> List[str]:
-    st.write("Class 列表（每行一个）")
+    st.write("Classes (one per line)")
     txt = st.text_area(" ", value="\n".join(class_names), height=140, key="class_editor")
     names = [x.strip() for x in txt.splitlines()]
     names = [x for x in names if x]
@@ -383,32 +590,352 @@ def _render_steps() -> None:
     st.markdown(f'<div class="tm-steps">{"  ·  ".join(parts)}</div>', unsafe_allow_html=True)
 
 
+def _next_class_name(existing: List[str]) -> str:
+    idx = 1
+    existing_set = {sanitize_class_name(name) for name in existing}
+    while True:
+        candidate = f"Class {idx}"
+        if sanitize_class_name(candidate) not in existing_set:
+            return candidate
+        idx += 1
+
+
+def _rename_tm_class_dir(old_name: str, new_name: str) -> None:
+    old_safe = sanitize_class_name(old_name)
+    new_safe = sanitize_class_name(new_name)
+    if old_safe == new_safe:
+        return
+    root = _tm_dataset_dir()
+    old_dir = root / old_safe
+    new_dir = root / new_safe
+    if not old_dir.exists():
+        return
+    if new_dir.exists():
+        raise ValueError(f"Class already exists: {new_safe}")
+    old_dir.rename(new_dir)
+
+
+def _apply_tm_class_names(current_names: List[str], edited_names: List[str]) -> List[str]:
+    normalized: List[str] = []
+    used: set[str] = set()
+    for idx, raw in enumerate(edited_names):
+        candidate = sanitize_class_name(raw) if raw.strip() else f"Class {idx + 1}"
+        if candidate in used:
+            raise ValueError(f"Duplicate class name: {candidate}")
+        used.add(candidate)
+        normalized.append(candidate)
+
+    for old_name, new_name in zip(current_names, normalized):
+        _rename_tm_class_dir(old_name, new_name)
+
+    return normalized
+
+
+def _remove_tm_class(class_name: str) -> None:
+    class_dir = _tm_dataset_dir() / sanitize_class_name(class_name)
+    if class_dir.exists():
+        shutil.rmtree(class_dir)
+    if st.session_state.tm_capture_class == class_name:
+        st.session_state.tm_capture_open = False
+        st.session_state.tm_capture_source = ""
+        st.session_state.tm_capture_class = ""
+    if st.session_state.tm_camera_permission_class == class_name:
+        st.session_state.tm_camera_permission_class = ""
+        st.session_state.tm_camera_permission_note = ""
+        st.session_state.tm_camera_permission_status = ""
+    if st.session_state.tm_pending_class == class_name:
+        st.session_state.tm_pending_class = None
+        st.session_state.tm_pending_image = None
+
+
+def _import_classified_into_workspace(imported: ImportedData, rename: Dict[str, str]) -> List[str]:
+    dataset_root = _tm_dataset_dir()
+    export_classified_dataset(imported.class_to_images, rename, dataset_root)
+    labels: List[str] = []
+    for class_name in imported.class_to_images.keys():
+        labels.append(sanitize_class_name(rename.get(class_name, class_name)))
+    if labels:
+        _tm_save_classes_meta(labels)
+    return labels
+
+
+def _tm_dataset_stats() -> Tuple[int, int]:
+    dataset_dir = _tm_dataset_dir()
+    if not dataset_dir.exists():
+        return 0, 0
+    class_dirs = sorted([p for p in dataset_dir.iterdir() if p.is_dir()])
+    sample_count = 0
+    for class_dir in class_dirs:
+        sample_count += len(_tm_class_image_files(class_dir))
+    return len(class_dirs), sample_count
+
+
+def _tm_class_image_files(class_dir: Path) -> List[Path]:
+    if not class_dir.exists():
+        return []
+    return sorted(
+        [p for p in class_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _tm_train_latest_path() -> Path:
+    return _tm_dataset_dir().parent / "tm_train_latest.json"
+
+
+def _tm_load_train_latest() -> Optional[Dict[str, Any]]:
+    p = _tm_train_latest_path()
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _tm_classes_meta_path() -> Path:
+    return _tm_dataset_dir().parent / "tm_classes.json"
+
+
+def _tm_load_classes_meta() -> Optional[List[str]]:
+    p = _tm_classes_meta_path()
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        classes = raw.get("classes") if isinstance(raw, dict) else None
+        if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
+            return [str(x) for x in classes]
+    except Exception:
+        return None
+    return None
+
+
+def _tm_save_classes_meta(classes: List[str]) -> None:
+    p = _tm_classes_meta_path()
+    p.write_text(json.dumps({"classes": list(classes)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _status_style(status: str) -> str:
+    if status in {"granted", "not_required", "trained", "ready"}:
+        return "tm-status tm-status-ok"
+    if status in {"denied", "restricted", "open_failed", "timeout"}:
+        return "tm-status tm-status-bad"
+    if status in {"not_determined"}:
+        return "tm-status tm-status-warn"
+    return "tm-status tm-status-idle"
+
+
+def _render_tm_workspace_header() -> None:
+    class_count, sample_count = _tm_dataset_stats()
+    meta = _tm_load_train_latest()
+    metrics = dict(meta.get("metrics") or {}) if isinstance(meta, dict) else {}
+    trained_label = f"{float(metrics.get('val_accuracy', 0.0)):.1%}" if metrics else "Not trained"
+    trained_status = "trained" if metrics else "idle"
+    capture_label = st.session_state.tm_capture_source.upper() if st.session_state.tm_capture_open else "Idle"
+    camera_status = get_camera_access_status()
+    st.markdown(
+        f"""
+<div class="tm-hero">
+  <div class="tm-hero-compact">
+    <div class="tm-hero-copy">
+      <div class="tm-eyebrow">AI Training Platform</div>
+      <h2>Image Training Workspace</h2>
+      <p>Collect samples, train, preview, and export in a single workspace.</p>
+    </div>
+    <div class="tm-hero-stats">
+      <div class="tm-stat">
+        <div class="tm-stat-label">Classes</div>
+        <div class="tm-stat-value">{class_count}</div>
+      </div>
+      <div class="tm-stat">
+        <div class="tm-stat-label">Samples</div>
+        <div class="tm-stat-value">{sample_count}</div>
+      </div>
+      <div class="tm-stat">
+        <div class="tm-stat-label">Model</div>
+        <div class="tm-stat-value">{html_escape(trained_label)}</div>
+        <div class="tm-stat-note"><span class="{_status_style(trained_status)}">{'Ready' if metrics else 'Waiting'}</span></div>
+      </div>
+      <div class="tm-stat">
+        <div class="tm-stat-label">Capture</div>
+        <div class="tm-stat-value">{html_escape(capture_label)}</div>
+        <div class="tm-stat-note"><span class="{_status_style(camera_status.status)}">{html_escape(camera_status.status.replace('_', ' ').title())}</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_tm_flow_lane() -> None:
+    c1, a1, c2, a2, c3 = st.columns([2.2, 0.22, 1.0, 0.22, 1.75], gap="small")
+    with c1:
+        st.markdown('<div class="tm-flow-step"><span>1</span><strong>Classes</strong><small>Add samples and rename classes</small></div>', unsafe_allow_html=True)
+    with a1:
+        st.markdown('<div class="tm-flow-arrow">→</div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="tm-flow-step"><span>2</span><strong>Training</strong><small>Train a lightweight model</small></div>', unsafe_allow_html=True)
+    with a2:
+        st.markdown('<div class="tm-flow-arrow">→</div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown('<div class="tm-flow-step"><span>3</span><strong>Preview / Export</strong><small>Check inputs and export files</small></div>', unsafe_allow_html=True)
+
+
+def _render_camera_permission_card() -> None:
+    status = get_camera_access_status()
+    left, right = st.columns([3, 1.2])
+    with left:
+        st.markdown(
+            f"""
+<div class="tm-inline-note">
+  <strong>Camera</strong>
+  <div style="margin-top:6px;"><span class="{_status_style(status.status)}">{html_escape(status.message)}</span></div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        if st.button("Request", key="tm_request_camera_access", use_container_width=True):
+            result = ensure_camera_access(int(st.session_state.tm_webcam_index))
+            st.session_state.tm_camera_permission_status = result.status
+            st.session_state.tm_camera_permission_note = result.message
+            st.rerun()
+
+    note = st.session_state.tm_camera_permission_note
+    if note:
+        level = st.success if st.session_state.tm_camera_permission_status in {"granted", "not_required"} else st.info
+        level(note)
+
+
 def _render_new_project() -> None:
+    # #region debug-point B:render-new-project
+    _dbg_open_project_layout("B", "pre-fix", "app.py:_render_new_project", "[DEBUG] render new project page", {"session": str(st.session_state.get("session_id", "")), "project_type": str(st.session_state.get("project_type", "")), "query": dict(st.query_params) if hasattr(st, "query_params") else {}})
+    # #endregion
     inject_teachable_style()
-    st.markdown('<div class="tm-title">New Project</div>', unsafe_allow_html=True)
-    st.markdown('<div class="tm-sub">Create a project to teach from your examples.</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+<div class="tm-hero">
+  <div class="tm-hero-grid">
+    <div class="tm-hero-copy">
+      <div class="tm-eyebrow">Desktop AI Trainer</div>
+      <h2>Build classroom-friendly image models without touching code.</h2>
+      <p>Inspired by Google Teachable Machine, with a desktop-first workflow for importing data, training, and exporting TFLite + C sources.</p>
+      <div class="tm-chip-row">
+        <span class="tm-chip">Import local images</span>
+        <span class="tm-chip">Capture from webcam</span>
+        <span class="tm-chip">Train lightweight CNN</span>
+        <span class="tm-chip">Export .tflite + model.cpp</span>
+      </div>
+    </div>
+    <div class="tm-hero-panel">
+      <h4>Recommended flow</h4>
+      <div class="tm-stat-grid">
+        <div class="tm-stat">
+          <div class="tm-stat-label">1</div>
+          <div class="tm-stat-value">Collect</div>
+          <div class="tm-stat-note">Import images or capture samples</div>
+        </div>
+        <div class="tm-stat">
+          <div class="tm-stat-label">2</div>
+          <div class="tm-stat-value">Label</div>
+          <div class="tm-stat-note">Organize data by class</div>
+        </div>
+        <div class="tm-stat">
+          <div class="tm-stat-label">3</div>
+          <div class="tm-stat-value">Train</div>
+          <div class="tm-stat-note">Train and quantize to int8 TFLite</div>
+        </div>
+        <div class="tm-stat">
+          <div class="tm-stat-label">4</div>
+          <div class="tm-stat-value">Export</div>
+          <div class="tm-stat-note">Export files ready for MCU integration</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
             """
 <div class="tm-card">
+  <div class="tm-eyebrow">Ready now</div>
   <h3>Image Project</h3>
-  <p>Teach based on images, from files or your camera.</p>
+  <p>Build an image classification model from images, webcam, or device stream.</p>
+  <div class="tm-card-footnote">Great for classroom demos and local training.</div>
 </div>
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Open Image Project", type="primary"):
-            st.session_state.project_type = "image"
-            st.session_state.step = 0
-            st.rerun()
+        with st.popover("Open Image Project", use_container_width=True):
+            st.markdown("Choose a start mode")
+            if st.button("Start from empty", key="tm_start_empty", type="primary", use_container_width=True):
+                _begin_fresh_tm_session()
+                st.session_state.tm_return_target = "home"
+                st.session_state.project_type = "image"
+                st.session_state.step = 0
+                _tm_set_query_params(tm_project="image", tm_session=st.session_state.session_id)
+                st.rerun()
+            if st.button("Start from classified class", key="tm_start_classified", use_container_width=True):
+                _begin_fresh_tm_session()
+                st.session_state.tm_return_target = "classified-import"
+                st.session_state.project_type = "image_classified_import"
+                st.session_state.step = 0
+                _tm_set_query_params(tm_project="image_classified_import", tm_session=st.session_state.session_id)
+                st.rerun()
+        with st.popover("Open Project", use_container_width=True):
+            st.markdown("Open a saved .tmproj file")
+            if st.button("Open .tmproj", key="tm_open_tmproj", type="primary", use_container_width=True):
+                p = _pick_tmproj_file_dialog()
+                if not p:
+                    st.warning("No file selected.")
+                    st.stop()
+                manifest = _tmproj_read_manifest(p)
+                ptype = _tmproj_detect_project_type(p, manifest)
+                if ptype != "image":
+                    st.error(f"Unsupported project type: {ptype}")
+                    st.stop()
+                # #region debug-point A:home-open-project-click
+                _dbg_open_project_layout("A", "pre-fix", "app.py:_render_new_project", "[DEBUG] home open project selected file", {"picked_path": str(p), "project_type": str(ptype), "session_before_fresh": str(st.session_state.get("session_id", ""))})
+                # #endregion
+                _begin_fresh_tm_session()
+                st.session_state.tm_return_target = "home"
+                controller = _get_record_controller()
+                controller.set_config(
+                    st.session_state.session_id,
+                    SessionConfig(
+                        dataset_root=_tm_dataset_dir(),
+                        serial_port=st.session_state.tm_serial_port,
+                        serial_baud=int(st.session_state.tm_serial_baud),
+                        serial_sync=str(st.session_state.tm_serial_sync),
+                        webcam_index=int(st.session_state.tm_webcam_index),
+                        fps=float(st.session_state.tm_record_fps),
+                        crop_box=st.session_state.tm_record_crop_box,
+                    ),
+                )
+                state = controller._project_open(st.session_state.session_id, p)
+                # #region debug-point A:home-open-project-after-open
+                _dbg_open_project_layout("A", "pre-fix", "app.py:_render_new_project", "[DEBUG] home open project restored state", {"session": str(st.session_state.session_id), "classes": list(state.get("classes") or []), "count_keys": list((state.get("counts") or {}).keys())})
+                # #endregion
+                st.session_state.tm_classes = list(state.get("classes") or ["Class 1", "Class 2"])
+                st.session_state.project_type = "image"
+                _tm_set_query_params(tm_project="image", tm_session=st.session_state.session_id)
+                st.rerun()
     with c2:
         st.markdown(
             """
 <div class="tm-card">
+  <div class="tm-eyebrow">Roadmap</div>
   <h3>Audio Project <span class="tm-badge">Coming soon</span></h3>
-  <p>Teach based on sound samples from microphone.</p>
+  <p>Planned: microphone sampling and audio classification for voice commands.</p>
 </div>
             """,
             unsafe_allow_html=True,
@@ -417,8 +944,9 @@ def _render_new_project() -> None:
         st.markdown(
             """
 <div class="tm-card">
+  <div class="tm-eyebrow">Roadmap</div>
   <h3>Pose Project <span class="tm-badge">Coming soon</span></h3>
-  <p>Teach based on poses from images.</p>
+  <p>Planned: pose and gesture projects for interactive demos.</p>
 </div>
             """,
             unsafe_allow_html=True,
@@ -456,22 +984,4278 @@ def _render_train_config(cfg: TrainConfig) -> TrainConfig:
     )
 
 
+def _tm_get_query_param(key: str) -> str:
+    try:
+        v = st.query_params.get(key)
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return str(v[0]) if v else ""
+        return str(v)
+    except Exception:
+        v = st.experimental_get_query_params().get(key, [""])
+        return str(v[0]) if v else ""
+
+
+def _tm_set_query_params(**params: str) -> None:
+    try:
+        st.query_params.clear()
+        for k, v in params.items():
+            if v is not None and str(v) != "":
+                st.query_params[k] = str(v)
+    except Exception:
+        st.experimental_set_query_params(**{k: v for k, v in params.items() if v is not None and str(v) != ""})
+
+
+def _tm_clear_query_params() -> None:
+    try:
+        st.query_params.clear()
+    except Exception:
+        st.experimental_set_query_params()
+
+
+def _tm_render_page_scroll_reset() -> None:
+    components.html(
+        """
+        <script>
+        function resetFrameBox(node) {
+          try {
+            if (!node || !node.style) return;
+            node.style.height = '';
+            node.style.minHeight = '';
+            node.style.maxHeight = '';
+            node.style.overflow = '';
+            node.style.overflowY = '';
+            node.style.overflowX = '';
+          } catch (e) {}
+        }
+        try {
+          window.scrollTo(0, 0);
+          document.documentElement.scrollTop = 0;
+          document.body.scrollTop = 0;
+        } catch (e) {}
+        try {
+          if (window.parent) {
+            window.parent.scrollTo(0, 0);
+            if (window.parent.document) {
+              window.parent.document.documentElement.scrollTop = 0;
+              window.parent.document.body.scrollTop = 0;
+              try {
+                const frames = window.parent.document.querySelectorAll('iframe');
+                frames.forEach((frame) => {
+                  resetFrameBox(frame);
+                  resetFrameBox(frame.parentElement);
+                });
+              } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
+    safe_reason = html_escape(str(reason or "image-project-mount"))
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const reason = "{safe_reason}";
+          function ping(tag) {{
+            try {{
+              const targets = [window, window.parent, window.top];
+              for (const target of targets) {{
+                try {{
+                  if (target) target.dispatchEvent(new Event('resize'));
+                }} catch (e) {{}}
+                try {{
+                  if (target) target.dispatchEvent(new Event('orientationchange'));
+                }} catch (e) {{}}
+                try {{
+                  if (target && target.pywebview && target.pywebview.api && typeof target.pywebview.api.request_reflow === 'function') {{
+                    target.pywebview.api.request_reflow(String(reason + ':' + tag));
+                  }}
+                }} catch (e) {{}}
+              }}
+            }} catch (e) {{}}
+          }}
+          ping('now');
+          window.setTimeout(() => ping('t120'), 120);
+          window.setTimeout(() => ping('t360'), 360);
+          window.setTimeout(() => ping('t900'), 900);
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _list_camera_options(max_count: int = 6) -> List[Dict[str, str]]:
+    options: List[Dict[str, str]] = []
+    if sys.platform == "darwin":
+        try:
+            from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+
+            devices = list(AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo) or [])
+            for idx, dev in enumerate(devices[:max_count]):
+                name = str(dev.localizedName() or f"Camera {idx}")
+                options.append({"index": idx, "label": name})
+            #region debug-point E:camera-enumeration
+            _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera options enumerated via AVFoundation", {"platform": sys.platform, "options": options})
+            #endregion
+        except Exception:
+            options = []
+            #region debug-point E:camera-enumeration-failed
+            _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera enumeration via AVFoundation failed", {"platform": sys.platform})
+            #endregion
+    if not options:
+        for idx in range(max_count):
+            options.append({"index": idx, "label": f"Camera {idx}"})
+        #region debug-point E:camera-fallback
+        _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera options fallback used", {"platform": sys.platform, "options": options})
+        #endregion
+    options = sorted(options, key=lambda item: (1 if _is_virtual_camera_label(str(item.get("label", ""))) else 0, int(item.get("index", 0))))
+    return options
+
+
+def _tm_sample_previews(classes: List[str], limit_per_class: Optional[int] = None) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    root = _tm_dataset_dir()
+    for name in classes:
+        class_dir = root / sanitize_class_name(name)
+        previews: List[Dict[str, str]] = []
+        if class_dir.exists():
+            files = _tm_class_image_files(class_dir)
+            if limit_per_class is not None:
+                files = files[:limit_per_class]
+            for p in files:
+                try:
+                    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+                    previews.append(
+                        {
+                            "src": f"data:image/png;base64,{b64}",
+                            "filename": str(p.name),
+                        }
+                    )
+                except Exception:
+                    continue
+        out[name] = previews
+    return out
+
+
+def _is_likely_user_serial_port(device: str, description: str) -> bool:
+    d = (device or "").strip().lower()
+    desc = (description or "").strip().lower()
+    blocked = {
+        "/dev/cu.bluetooth-incoming-port",
+        "/dev/cu.debug-console",
+        "/dev/tty.bluetooth-incoming-port",
+        "/dev/tty.debug-console",
+    }
+    if d in blocked:
+        return False
+    if "bluetooth" in desc and "serial" not in desc:
+        return False
+    return bool(d)
+
+
+def _is_virtual_camera_label(label: str) -> bool:
+    s = (label or "").strip().lower()
+    markers = ("iriun", "virtual", "obs", "camo", "epoccam", "ndi", "droidcam")
+    return any(m in s for m in markers)
+
+
+def _preferred_webcam_index(options: List[Dict[str, str]]) -> int:
+    for item in options:
+        label = str(item.get("label", ""))
+        if not _is_virtual_camera_label(label):
+            try:
+                return int(item.get("index", 0))
+            except Exception:
+                continue
+    try:
+        return int(options[0].get("index", 0)) if options else 0
+    except Exception:
+        return 0
+
+
+def _render_tm_old_frontend_html(
+    *,
+    port: int,
+    session_id: str,
+    classes: List[str],
+    counts: Dict[str, int],
+    train_enabled: bool,
+    export_enabled: bool,
+    notice: str,
+    train_cfg: TrainConfig,
+    serial_ports: List[Dict[str, str]],
+    current_serial_port: str,
+    current_serial_baud: int,
+    current_serial_sync: str,
+    webcam_options: List[Dict[str, str]],
+    current_webcam_index: int,
+    sample_previews: Dict[str, List[Dict[str, str]]],
+    initial_open_source_class: str,
+    initial_open_source_kind: str,
+) -> None:
+    import json as _json
+
+    payload = {
+        "port": int(port),
+        "session": str(session_id),
+        "return_target": str(st.session_state.get("tm_return_target", "home") or "home"),
+        "classes": classes,
+        "counts": {k: int(v) for k, v in counts.items()},
+        "train_enabled": bool(train_enabled),
+        "export_enabled": bool(export_enabled),
+        "notice": str(notice or ""),
+        "serial_ports": serial_ports,
+        "current_serial_port": str(current_serial_port or ""),
+        "current_serial_baud": int(current_serial_baud),
+        "current_serial_sync": str(current_serial_sync or "AA 55 AA"),
+        "webcam_options": webcam_options,
+        "current_webcam_index": int(current_webcam_index),
+        "sample_previews": sample_previews,
+        "initial_open_source_class": str(initial_open_source_class or ""),
+        "initial_open_source_kind": str(initial_open_source_kind or ""),
+        "train_cfg": {
+            "batch_size": int(train_cfg.batch_size),
+            "epochs": int(train_cfg.epochs),
+            "validation_split": float(train_cfg.validation_split),
+            "learning_rate": float(train_cfg.learning_rate),
+            "conv1_filters": int(train_cfg.conv1_filters),
+            "conv2_filters": int(train_cfg.conv2_filters),
+            "dense_units": int(train_cfg.dense_units),
+        },
+    }
+    debug_server_url = "http://127.0.0.1:7777/event"
+    debug_session_id = "capture-webcam-source"
+    try:
+        for env_path in (Path(".dbg/open-project-layout.env"), Path(".dbg/open-project-page-stuck.env"), Path(".dbg/packaged-webcam-bounce.env"), Path(".dbg/capture-webcam-source.env")):
+            if env_path.exists():
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("DEBUG_SERVER_URL="):
+                        debug_server_url = line.split("=", 1)[1].strip() or debug_server_url
+                    elif line.startswith("DEBUG_SESSION_ID="):
+                        debug_session_id = line.split("=", 1)[1].strip() or debug_session_id
+                break
+    except Exception:
+        pass
+    payload["debug_server_url"] = debug_server_url
+    payload["debug_session_id"] = debug_session_id
+    data = _json.dumps(payload)
+    components.html(
+        f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root {{
+      --bg: #f5f7fa;
+      --card: #ffffff;
+      --shadow: 0 2px 8px rgba(0,0,0,0.08);
+      --blue: #1a73e8;
+      --blue-bg: #e8f0fe;
+      --blue-bg-hover: #d2e3fc;
+      --text: #202124;
+      --muted: #5f6368;
+      --line: #c5c8cc;
+      --radius: 12px;
+    }}
+    html, body {{
+      height: 100%;
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      color: var(--text);
+      background: transparent;
+    }}
+    .wrap {{
+      position: relative;
+      background: var(--bg);
+      border-radius: 12px;
+      padding: 80px 18px 92px 18px;
+      min-height: 620px;
+      overflow-x: clip;
+      overflow-y: clip;
+    }}
+    .topnav {{
+      position: absolute;
+      top: 12px;
+      left: 18px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      border-radius: 8px;
+      padding: 12px 18px;
+      color: var(--blue);
+      font-weight: 700;
+      font-size: 18px;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      user-select: none;
+      z-index: 1000;
+    }}
+    .navmenu {{
+      position: absolute;
+      top: 56px;
+      left: 18px;
+      width: 220px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      border-radius: 10px;
+      border: 1px solid rgba(0,0,0,0.06);
+      padding: 8px;
+      z-index: 1001;
+      display: none;
+    }}
+    .navmenu.open {{ display: block; }}
+    .navmenu button {{
+      width: 100%;
+      border: 0;
+      background: transparent;
+      text-align: left;
+      padding: 10px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: var(--text);
+      font-weight: 600;
+      font-size: 13px;
+    }}
+    .navmenu button:hover {{ background: rgba(0,0,0,0.05); }}
+    .navmenu .danger {{ color: #b42318; }}
+    .navmenu .divider {{
+      height: 1px;
+      background: rgba(0,0,0,0.08);
+      margin: 6px 0;
+    }}
+    .layout {{
+      position: relative;
+      display: flex;
+      width: 100%;
+      box-sizing: border-box;
+      justify-content: space-between;
+      align-items: center;
+      gap: 28px;
+      z-index: 2;
+    }}
+    .col-classes {{ width: 500px; display: flex; flex-direction: column; gap: 24px; }}
+    .col-train {{
+      width: 270px;
+      flex: 0 0 270px;
+      min-width: 270px;
+    }}
+    .col-preview {{ width: 320px; }}
+    @media (max-width: 1320px) {{
+      .wrap {{
+        padding: 72px 16px 92px 16px;
+      }}
+      .layout {{
+        gap: 16px;
+      }}
+      .col-classes {{
+        width: 440px;
+      }}
+      .col-train {{
+        width: 230px;
+        flex: 0 0 230px;
+        min-width: 230px;
+      }}
+      .col-preview {{
+        width: 260px;
+      }}
+    }}
+    @media (max-width: 860px) {{
+      .wrap {{
+        padding: 72px 12px 92px 12px;
+      }}
+      .source-panel {{
+        grid-template-columns: 1fr;
+      }}
+      .source-right {{
+        border-top: 1px solid rgba(0,0,0,0.08);
+      }}
+    }}
+    .card {{
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      border: none;
+    }}
+    .class-card {{ padding: 0; position: relative; overflow: hidden; }}
+    .class-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+    }}
+    .class-title {{
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 600;
+    }}
+    .iconbtn {{
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .iconbtn:hover {{ background: rgba(0,0,0,0.05); color: var(--text); }}
+    .more {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+    }}
+    .divider {{ height: 1px; background: rgba(0,0,0,0.08); margin: 0; }}
+    .subhead {{ font-size: 12px; color: var(--muted); margin: 0 0 10px 0; }}
+    .btnrow {{
+      display: flex;
+      gap: 12px;
+      padding: 10px 16px 14px 16px;
+      flex-wrap: wrap;
+      align-items: flex-start;
+    }}
+    .sample {{
+      width: 80px;
+      height: 80px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--blue-bg);
+      color: var(--blue);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .sample:hover {{ background: var(--blue-bg-hover); }}
+    .sample svg {{ width: 22px; height: 22px; stroke: var(--blue); fill: none; stroke-width: 2; }}
+    .note {{ margin-top: 12px; font-size: 12px; color: var(--muted); line-height: 1.35; }}
+    .preview-pane {{
+      margin-top: 14px;
+      min-height: 180px;
+      border-radius: 16px;
+      background: rgba(26,115,232,0.07);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }}
+    .preview-controls {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 6px;
+    }}
+    .preview-controls-right {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .preview-toggle {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      user-select: none;
+    }}
+    .preview-toggle input {{
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: var(--blue);
+    }}
+    .preview-select {{
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text);
+      background: white;
+    }}
+    .preview-pane img {{
+      width: 100%;
+      height: 100%;
+      max-height: 260px;
+      object-fit: contain;
+      display: block;
+      background: #f4f7fb;
+    }}
+    .preview-empty {{
+      padding: 18px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .preview-output {{
+      margin-top: 12px;
+      display: grid;
+      gap: 10px;
+    }}
+    .out-row {{
+      display: grid;
+      grid-template-columns: 1fr 140px;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .out-bar {{
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.08);
+      overflow: hidden;
+      position: relative;
+    }}
+    .out-fill {{
+      height: 100%;
+      width: 0%;
+      background: rgba(26,115,232,0.55);
+      border-radius: 999px;
+      transition: width 120ms linear;
+    }}
+    .out-pct {{
+      position: absolute;
+      right: 6px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 10px;
+      color: rgba(0,0,0,0.55);
+      font-weight: 800;
+      pointer-events: none;
+    }}
+    .addclass {{
+      border: 2px dashed rgba(0,0,0,0.15);
+      background: transparent;
+      border-radius: 10px;
+      padding: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: var(--muted);
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .train-card, .preview-card {{ padding: 16px 18px 18px 18px; position: relative; }}
+    .card-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    .card-head h3 {{ margin: 0; font-size: 14px; font-weight: 700; }}
+    .train-status {{
+      width: 100%;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.06);
+      color: rgba(0,0,0,0.55);
+      padding: 10px 10px;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      box-sizing: border-box;
+      max-width: 100%;
+      font-size: 13px;
+    }}
+    .train-adv-panel {{
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(0,0,0,0.08);
+      display: none;
+    }}
+    .train-adv-grid {{
+      display: grid;
+      gap: 10px;
+    }}
+    .train-adv-row {{
+      display: grid;
+      grid-template-columns: 1fr 128px;
+      gap: 12px;
+      align-items: center;
+      font-size: 13px;
+      color: rgba(0,0,0,0.62);
+      font-weight: 600;
+    }}
+    .train-adv-row span {{
+      line-height: 1.2;
+      word-break: normal;
+      overflow-wrap: normal;
+      white-space: normal;
+    }}
+    .train-adv-row input {{
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid rgba(0,0,0,0.18);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--blue);
+      background: white;
+      text-align: right;
+      min-width: 128px;
+    }}
+    .trainbtn {{
+      width: 100%;
+      border: 0;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.08);
+      color: rgba(0,0,0,0.38);
+      padding: 12px 10px;
+      font-weight: 700;
+      cursor: not-allowed;
+      white-space: normal;
+      line-height: 1.2;
+    }}
+    .trainbtn.enabled {{
+      background: rgba(26,115,232,0.12);
+      color: var(--blue);
+      cursor: pointer;
+    }}
+    .train-progress {{
+      margin-top: 10px;
+      display: none;
+    }}
+    .train-progress-bar {{
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.08);
+      overflow: hidden;
+    }}
+    .train-progress-fill {{
+      height: 100%;
+      width: 0%;
+      background: rgba(26,115,232,0.55);
+      border-radius: 999px;
+      transition: width 120ms linear;
+    }}
+    .train-progress-text {{
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.25;
+    }}
+    .advanced {{
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+      padding: 6px 8px;
+      border-radius: 6px;
+    }}
+    .advanced:hover {{ background: rgba(0,0,0,0.04); }}
+    .advanced-row {{
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .adv-reset {{
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 6px 8px;
+      border-radius: 6px;
+      user-select: none;
+    }}
+    .adv-reset:hover {{ background: rgba(0,0,0,0.04); color: var(--text); }}
+    .exportbtn {{
+      border: 0;
+      border-radius: 4px;
+      background: #f1f3f4;
+      padding: 8px 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-weight: 700;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .exportbtn:disabled {{
+      opacity: 0.55;
+      cursor: not-allowed;
+    }}
+    .exportbtn svg {{ width: 16px; height: 16px; stroke: var(--muted); fill: none; stroke-width: 2; }}
+    .footer {{
+      position: fixed;
+      right: 18px;
+      bottom: 12px;
+      font-size: 12px;
+      color: rgba(0,0,0,0.45);
+      pointer-events: none;
+      z-index: 1000;
+    }}
+    .flow {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 1;
+      pointer-events: none;
+    }}
+    .flow path {{ stroke: var(--line); stroke-width: 2; fill: none; }}
+    .toast {{
+      position: fixed;
+      left: 50%;
+      top: 18px;
+      transform: translateX(-50%);
+      background: rgba(32,33,36,0.92);
+      color: white;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 12px;
+      z-index: 2001;
+      max-width: 720px;
+      display: none;
+    }}
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(32,33,36,0.56);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 2200;
+      padding: 20px;
+    }}
+    .modal {{
+      width: min(820px, 92vw);
+      background: var(--card);
+      border-radius: 14px;
+      box-shadow: 0 14px 40px rgba(0,0,0,0.28);
+      overflow: hidden;
+    }}
+    .modal-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+    }}
+    .modal-head strong {{
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    .modal-body {{
+      padding: 12px 14px 14px 14px;
+    }}
+    .modal-actions {{
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 12px;
+    }}
+    .btn {{
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-weight: 700;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .btn-secondary {{
+      background: rgba(0,0,0,0.06);
+      color: var(--muted);
+    }}
+    .btn-secondary:hover {{
+      background: rgba(0,0,0,0.09);
+      color: var(--text);
+    }}
+    .btn-primary {{
+      background: var(--blue);
+      color: white;
+    }}
+    .btn-primary:hover {{
+      background: #1669d4;
+    }}
+    .source-panel {{
+      margin-top: 16px;
+      margin-left: 0;
+      margin-right: 0;
+      border-top: 1px solid rgba(0,0,0,0.08);
+      display: grid;
+      grid-template-columns: 1.05fr 1fr;
+      min-height: 360px;
+      overflow: hidden;
+      border-radius: 0 0 12px 12px;
+    }}
+    .source-left {{
+      background: #dfe9f7;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }}
+    .source-right {{
+      background: white;
+      padding: 22px 24px;
+      display: flex;
+      flex-direction: column;
+      max-height: none;
+      overflow: hidden;
+    }}
+    .source-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--blue);
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    .source-tools {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .source-preview-wrap {{
+      flex: 1;
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.4);
+      min-height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .preview-frame {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #dfe3e8;
+      object-fit: contain;
+      image-rendering: auto;
+    }}
+    .source-note {{
+      min-height: 18px;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .source-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: auto;
+    }}
+    .source-settings {{
+      color: var(--blue);
+      font-size: 26px;
+      line-height: 1;
+      cursor: pointer;
+    }}
+    .source-settings-panel {{
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(26,115,232,0.16);
+      box-shadow: 0 6px 18px rgba(0,0,0,0.05);
+      box-sizing: border-box;
+      max-width: 100%;
+    }}
+    .source-settings-grid {{
+      display: grid;
+      gap: 10px;
+      width: 100%;
+    }}
+    .source-settings-grid label {{
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+      width: 100%;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }}
+    .source-settings-grid input,
+    .source-settings-grid select {{
+      width: 100%;
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font-size: 13px;
+      color: var(--text);
+      background: #fff;
+      box-sizing: border-box;
+      min-width: 0;
+    }}
+    .source-settings-actions {{
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .source-settings-actions button {{
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .source-settings-save {{
+      background: rgba(26,115,232,0.14);
+      color: var(--blue);
+    }}
+    .source-settings-cancel {{
+      background: rgba(0,0,0,0.06);
+      color: var(--text);
+    }}
+    .source-right h4 {{
+      margin: 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .source-count {{
+      margin-top: 6px;
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .source-count small {{
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--muted);
+      margin-left: 4px;
+    }}
+    .device-select {{
+      margin-top: 12px;
+      width: 100%;
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      color: var(--text);
+      background: white;
+    }}
+    .device-help {{
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }}
+    .upload-pick {{
+      width: 100%;
+      min-height: 144px;
+      border: 0;
+      border-radius: 12px;
+      background: #d6e4f8;
+      color: var(--blue);
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 18px;
+      text-align: center;
+    }}
+    .upload-hint {{
+      margin-top: 12px;
+      color: #7e93b0;
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .samples-grid {{
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      align-content: start;
+      min-height: 180px;
+      padding-right: 4px;
+    }}
+    .sample-item {{
+      position: relative;
+    }}
+    .sample-thumb {{
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      border-radius: 10px;
+      background: #eef2f6;
+      border: 1px solid rgba(0,0,0,0.06);
+    }}
+    .sample-delete {{
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 22px;
+      height: 22px;
+      border: 0;
+      border-radius: 999px;
+      background: rgba(32, 33, 36, 0.82);
+      color: #fff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      line-height: 1;
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+    }}
+    .sample-item:hover .sample-delete,
+    .sample-item:focus-within .sample-delete {{
+      opacity: 1;
+      pointer-events: auto;
+    }}
+    .sample-delete:hover {{
+      background: rgba(180, 35, 24, 0.92);
+    }}
+    .samples-empty {{
+      margin-top: 14px;
+      border: 1px dashed rgba(0,0,0,0.12);
+      border-radius: 12px;
+      min-height: 180px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .summary-title {{
+      padding: 10px 16px;
+      font-size: 13px;
+      font-weight: 700;
+      color: rgba(0,0,0,0.7);
+    }}
+    .summary-row {{
+      padding: 10px 16px 14px 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }}
+    .summary-actions {{
+      display: flex;
+      gap: 10px;
+    }}
+    .summary-actions .sample {{
+      width: 78px;
+      height: 62px;
+      flex: 0 0 78px;
+      border-radius: 6px;
+      gap: 4px;
+      font-size: 11px;
+    }}
+    .summary-samples {{
+      min-height: 62px;
+      display: flex;
+      align-items: center;
+      overflow: hidden;
+    }}
+    .samples-strip {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }}
+    .samples-strip .sample-thumb {{
+      width: 54px;
+      min-width: 54px;
+      aspect-ratio: 1 / 1;
+    }}
+    .samples-strip .sample-item {{
+      width: 54px;
+      min-width: 54px;
+    }}
+    .samples-strip .sample-delete {{
+      width: 18px;
+      height: 18px;
+      top: 4px;
+      right: 4px;
+      font-size: 11px;
+    }}
+    .samples-strip-empty {{
+      width: 100%;
+      min-height: 62px;
+      border: 1px dashed rgba(0,0,0,0.12);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .form-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }}
+    .field {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .field label {{
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }}
+    .field input {{
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      color: var(--text);
+      background: white;
+    }}
+  </style>
+</head>
+<body>
+<div class="toast" id="toast"></div>
+<div class="topnav" id="goHome">☰ <span>Teachable Machine</span></div>
+<div class="navmenu" id="navMenu">
+  <button type="button" id="navOpenProject">Open project</button>
+  <button type="button" id="navSaveProject">Save project</button>
+  <button type="button" id="navExportDataset">Export dataset</button>
+  <button type="button" id="navReturn">Return</button>
+  <div class="divider"></div>
+  <button type="button" class="danger" id="navResetProject">Reset project</button>
+</div>
+<div class="modal-backdrop" id="advancedModal">
+  <div class="modal">
+    <div class="modal-head">
+      <strong>Advanced</strong>
+      <button class="iconbtn" id="advancedClose" type="button">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field"><label>Batch Size</label><input id="advBatch" type="number" min="1" step="1"/></div>
+        <div class="field"><label>Epochs</label><input id="advEpochs" type="number" min="1" step="1"/></div>
+        <div class="field"><label>Validation Split</label><input id="advVal" type="number" min="0.05" max="0.5" step="0.05"/></div>
+        <div class="field"><label>Learning Rate</label><input id="advLr" type="number" min="0.00001" step="0.0001"/></div>
+        <div class="field"><label>Conv1 Filters</label><input id="advConv1" type="number" min="1" step="1"/></div>
+        <div class="field"><label>Conv2 Filters</label><input id="advConv2" type="number" min="1" step="1"/></div>
+        <div class="field"><label>Dense Units</label><input id="advDense" type="number" min="1" step="1"/></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="advancedCancel" type="button">Close</button>
+        <button class="btn btn-primary" id="advancedSave" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="wrap">
+  <svg class="flow" viewBox="0 0 1200 700" preserveAspectRatio="none" aria-hidden="true">
+    <path id="flowClass1" d="" />
+    <path id="flowClass2" d="" />
+    <path id="flowTrainPreview" d="" />
+  </svg>
+  <div class="layout">
+    <div class="col-classes" id="classes"></div>
+    <div class="col-train">
+      <div class="card train-card" id="trainCard">
+        <div class="card-head"><h3>Training</h3></div>
+        <div class="train-status" id="trainStatus">Not trained</div>
+        <button class="trainbtn" id="trainBtn">Train Embedded Model</button>
+        <div class="train-progress" id="trainProgress">
+          <div class="train-progress-bar"><div class="train-progress-fill" id="trainProgressFill"></div></div>
+          <div class="train-progress-text" id="trainProgressText"></div>
+        </div>
+        <div class="advanced-row">
+          <div class="advanced" id="advBtn">Advanced <span id="advChevron">▾</span></div>
+          <button class="adv-reset" id="advReset" type="button">Reset</button>
+        </div>
+        <div class="train-adv-panel" id="trainAdvPanel">
+          <div class="train-adv-grid">
+            <div class="train-adv-row"><span>Batch Size</span><input id="advBatchInline" type="number" min="1" step="1"/></div>
+            <div class="train-adv-row"><span>Epochs</span><input id="advEpochsInline" type="number" min="1" step="1"/></div>
+            <div class="train-adv-row"><span>Validation Split</span><input id="advValInline" type="number" min="0" max="0.5" step="0.05"/></div>
+            <div class="train-adv-row"><span>Learning Rate</span><input id="advLrInline" type="number" min="0" step="0.0001"/></div>
+            <div class="train-adv-row"><span>Conv1 Filters</span><input id="advConv1Inline" type="number" min="1" step="1"/></div>
+            <div class="train-adv-row"><span>Conv2 Filters</span><input id="advConv2Inline" type="number" min="1" step="1"/></div>
+            <div class="train-adv-row"><span>Dense Units</span><input id="advDenseInline" type="number" min="1" step="1"/></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col-preview">
+      <div class="card preview-card" id="previewCard">
+        <div class="card-head">
+          <h3>Preview</h3>
+          <button class="exportbtn" id="exportBtn"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg><span>Export Model</span></button>
+        </div>
+        <div class="preview-controls">
+          <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
+          <div class="preview-controls-right">
+            <select class="preview-select" id="previewSourceSelect">
+              <option value="webcam">Webcam</option>
+              <option value="device">Device</option>
+            </select>
+            <button class="iconbtn source-settings" type="button" id="previewSettingsToggle" title="Input settings">⚙</button>
+          </div>
+        </div>
+        <div id="previewSettingsHost"></div>
+        <div class="preview-pane" id="previewPane"></div>
+        <div class="preview-output" id="previewOutput"></div>
+        <div class="note" id="previewNote"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="footer">English | release-2-4-14 - 2.4.14</div>
+
+<script>
+(function() {{
+  function setStageLabel(text) {{
+    try {{
+      var id = 'tmBootStageBadge';
+      var box = document.getElementById(id);
+      if (!box) {{
+        box = document.createElement('div');
+        box.id = id;
+        box.style.position = 'fixed';
+        box.style.right = '16px';
+        box.style.top = '16px';
+        box.style.zIndex = '99998';
+        box.style.padding = '8px 10px';
+        box.style.borderRadius = '999px';
+        box.style.background = 'rgba(32,33,36,0.88)';
+        box.style.color = '#fff';
+        box.style.font = '11px/1.2 system-ui, -apple-system, Segoe UI, sans-serif';
+        box.style.whiteSpace = 'pre-wrap';
+        document.body.appendChild(box);
+      }}
+      box.textContent = 'stage: ' + String(text || 'unknown');
+    }} catch (e) {{}}
+  }}
+  function showBootError(message) {{
+    try {{
+      var id = 'tmBootErrorBanner';
+      var box = document.getElementById(id);
+      if (!box) {{
+        box = document.createElement('div');
+        box.id = id;
+        box.style.position = 'fixed';
+        box.style.left = '16px';
+        box.style.right = '16px';
+        box.style.bottom = '16px';
+        box.style.zIndex = '99999';
+        box.style.padding = '12px 14px';
+        box.style.borderRadius = '10px';
+        box.style.background = '#fff1f3';
+        box.style.border = '1px solid #fda4af';
+        box.style.color = '#9f1239';
+        box.style.font = '12px/1.45 system-ui, -apple-system, Segoe UI, sans-serif';
+        box.style.whiteSpace = 'pre-wrap';
+        document.body.appendChild(box);
+      }}
+      box.textContent = 'Frontend boot error: ' + String(message || 'unknown error');
+    }} catch (e) {{}}
+  }}
+  window.__tmStageMark = function(stage) {{
+    setStageLabel(stage);
+  }};
+  setStageLabel('boot-probe-ready');
+  window.addEventListener('error', function(event) {{
+    showBootError(event && event.message ? event.message : event);
+  }});
+  window.addEventListener('unhandledrejection', function(event) {{
+    var reason = event && event.reason ? event.reason : 'Unhandled promise rejection';
+    if (reason && reason.message) reason = reason.message;
+    showBootError(reason);
+  }});
+}})();
+</script>
+
+<script>
+const STATE = {data};
+const baseUrl = `http://127.0.0.1:${{STATE.port}}`;
+if (window.__tmStageMark) window.__tmStageMark('script-start');
+function dbgEvent(hypothesisId, location, msg, data) {{
+  try {{
+    fetch(STATE.debug_server_url || 'http://127.0.0.1:7777/event', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        sessionId: String(STATE.debug_session_id || 'open-project-page-stuck'),
+        runId: 'pre-fix',
+        hypothesisId,
+        location,
+        msg,
+        data,
+        ts: Date.now()
+      }})
+    }}).catch(() => null);
+  }} catch (e) {{}}
+}}
+function logScrollLayers(tag) {{
+  try {{
+    const frame = window.frameElement || null;
+    const frameParent = frame && frame.parentElement ? frame.parentElement : null;
+    const frameGrand = frameParent && frameParent.parentElement ? frameParent.parentElement : null;
+    let parentIframeCount = -1;
+    try {{
+      parentIframeCount = window.parent && window.parent.document ? window.parent.document.querySelectorAll('iframe').length : -1;
+    }} catch (e) {{}}
+    dbgEvent('H6', 'app.py:logScrollLayers', '[DEBUG] scroll layer snapshot', {{
+      tag: String(tag || ''),
+      parentIframeCount,
+      docEl: {{
+        clientWidth: document.documentElement ? document.documentElement.clientWidth : 0,
+        clientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
+        scrollWidth: document.documentElement ? document.documentElement.scrollWidth : 0,
+        scrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
+        overflow: document.documentElement && document.documentElement.style ? String(document.documentElement.style.overflow || '') : '',
+        overflowX: document.documentElement && document.documentElement.style ? String(document.documentElement.style.overflowX || '') : '',
+        overflowY: document.documentElement && document.documentElement.style ? String(document.documentElement.style.overflowY || '') : '',
+      }},
+      body: {{
+        clientWidth: document.body ? document.body.clientWidth : 0,
+        clientHeight: document.body ? document.body.clientHeight : 0,
+        scrollWidth: document.body ? document.body.scrollWidth : 0,
+        scrollHeight: document.body ? document.body.scrollHeight : 0,
+        overflow: document.body && document.body.style ? String(document.body.style.overflow || '') : '',
+        overflowX: document.body && document.body.style ? String(document.body.style.overflowX || '') : '',
+        overflowY: document.body && document.body.style ? String(document.body.style.overflowY || '') : '',
+      }},
+      frame: frame ? {{
+        clientWidth: frame.clientWidth || 0,
+        clientHeight: frame.clientHeight || 0,
+        scrollWidth: frame.scrollWidth || 0,
+        scrollHeight: frame.scrollHeight || 0,
+        overflow: frame.style ? String(frame.style.overflow || '') : '',
+        overflowX: frame.style ? String(frame.style.overflowX || '') : '',
+        overflowY: frame.style ? String(frame.style.overflowY || '') : '',
+      }} : null,
+      frameParent: frameParent ? {{
+        clientWidth: frameParent.clientWidth || 0,
+        clientHeight: frameParent.clientHeight || 0,
+        scrollWidth: frameParent.scrollWidth || 0,
+        scrollHeight: frameParent.scrollHeight || 0,
+        overflow: frameParent.style ? String(frameParent.style.overflow || '') : '',
+        overflowX: frameParent.style ? String(frameParent.style.overflowX || '') : '',
+        overflowY: frameParent.style ? String(frameParent.style.overflowY || '') : '',
+      }} : null,
+      frameGrand: frameGrand ? {{
+        clientWidth: frameGrand.clientWidth || 0,
+        clientHeight: frameGrand.clientHeight || 0,
+        scrollWidth: frameGrand.scrollWidth || 0,
+        scrollHeight: frameGrand.scrollHeight || 0,
+        overflow: frameGrand.style ? String(frameGrand.style.overflow || '') : '',
+        overflowX: frameGrand.style ? String(frameGrand.style.overflowX || '') : '',
+        overflowY: frameGrand.style ? String(frameGrand.style.overflowY || '') : '',
+      }} : null,
+    }});
+  }} catch (e) {{}}
+}}
+function sendStreamlitMessage(type, data) {{
+  if (window.__tmNavigatingAway) return;
+  try {{
+    window.parent.postMessage(Object.assign({{
+      isStreamlitMessage: true,
+      type: type,
+    }}, data || {{}}), '*');
+  }} catch (e) {{}}
+}}
+function initStreamlitFrame() {{
+  if (window.__tmNavigatingAway) return;
+  if (window.__tmStreamlitReady) return;
+  window.__tmStreamlitReady = true;
+  sendStreamlitMessage('streamlit:componentReady', {{apiVersion: 1}});
+}}
+let frameHeightRaf = 0;
+let layoutResyncTimers = [];
+let mountReflowTimers = [];
+let homeNavigateTimer = 0;
+function syncFrameHeight() {{
+  if (window.__tmNavigatingAway) return;
+  initStreamlitFrame();
+  let nextHeight = 0;
+  let nextWidth = 0;
+  let metrics = {{}};
+  try {{
+    const body = document.body;
+    const doc = document.documentElement;
+    const wrap = document.querySelector('.wrap');
+    nextHeight = Math.max(
+      body ? body.scrollHeight : 0,
+      body ? body.offsetHeight : 0,
+      doc ? doc.scrollHeight : 0,
+      doc ? doc.offsetHeight : 0,
+      doc ? doc.clientHeight : 0,
+    );
+    nextWidth = Math.max(
+      body ? body.scrollWidth : 0,
+      body ? body.offsetWidth : 0,
+      doc ? doc.scrollWidth : 0,
+      doc ? doc.offsetWidth : 0,
+      doc ? doc.clientWidth : 0,
+      wrap ? Math.round(wrap.getBoundingClientRect().width) : 0,
+    );
+    metrics = {{
+      nextHeight,
+      nextWidth,
+      bodyScrollHeight: body ? body.scrollHeight : 0,
+      bodyOffsetHeight: body ? body.offsetHeight : 0,
+      bodyScrollWidth: body ? body.scrollWidth : 0,
+      bodyOffsetWidth: body ? body.offsetWidth : 0,
+      docScrollHeight: doc ? doc.scrollHeight : 0,
+      docOffsetHeight: doc ? doc.offsetHeight : 0,
+      docScrollWidth: doc ? doc.scrollWidth : 0,
+      docOffsetWidth: doc ? doc.offsetWidth : 0,
+      docClientHeight: doc ? doc.clientHeight : 0,
+      docClientWidth: doc ? doc.clientWidth : 0,
+      wrapWidth: wrap ? Math.round(wrap.getBoundingClientRect().width) : 0,
+      wrapHeight: wrap ? Math.round(wrap.getBoundingClientRect().height) : 0,
+      windowInnerHeight: window.innerHeight || 0,
+      windowInnerWidth: window.innerWidth || 0,
+      classCount: Array.isArray(STATE.classes) ? STATE.classes.length : 0,
+    }};
+  }} catch (e) {{}}
+  if (!nextHeight || !Number.isFinite(nextHeight)) return;
+  try {{
+    const frame = window.frameElement;
+    if (frame && frame.style) {{
+      frame.style.height = `${{Math.ceil(nextHeight + 12)}}px`;
+      frame.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
+      frame.style.width = '100%';
+      frame.style.maxWidth = '100%';
+      if (frame.parentElement && frame.parentElement.style) {{
+        frame.parentElement.style.width = '100%';
+        frame.parentElement.style.maxWidth = '100%';
+        frame.parentElement.style.height = `${{Math.ceil(nextHeight + 12)}}px`;
+        frame.parentElement.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
+        frame.parentElement.style.overflow = 'hidden';
+      }}
+    }}
+    if (nextWidth && Number.isFinite(nextWidth) && document.body && document.body.style) {{
+      document.body.style.width = '100%';
+      document.body.style.maxWidth = '100%';
+    }}
+  }} catch (e) {{}}
+  // #region debug-point A:sync-frame-height
+  dbgEvent('A', 'app.py:syncFrameHeight', '[DEBUG] syncFrameHeight posting iframe height', metrics);
+  // #endregion
+  sendStreamlitMessage('streamlit:setFrameHeight', {{height: Math.ceil(nextHeight + 12)}});
+}}
+function queueFrameHeightSync() {{
+  if (window.__tmNavigatingAway) return;
+  if (frameHeightRaf) {{
+    try {{ cancelAnimationFrame(frameHeightRaf); }} catch (e) {{}}
+  }}
+  frameHeightRaf = requestAnimationFrame(() => {{
+    frameHeightRaf = 0;
+    syncFrameHeight();
+  }});
+}}
+function scheduleLayoutResync() {{
+  if (window.__tmNavigatingAway) return;
+  // #region debug-point B:schedule-layout-resync
+  dbgEvent('B', 'app.py:scheduleLayoutResync', '[DEBUG] scheduleLayoutResync queued', {{
+    classCount: Array.isArray(STATE.classes) ? STATE.classes.length : 0,
+    sampleCounts: Object.assign({{}}, STATE.counts || {{}}),
+    previewReady: !!document.getElementById('previewImage'),
+    windowInnerHeight: window.innerHeight || 0,
+  }});
+  // #endregion
+  queueFrameHeightSync();
+  try {{
+    window.requestAnimationFrame(() => {{
+      if (window.__tmNavigatingAway) return;
+      updateFlow();
+      queueFrameHeightSync();
+      const t120 = window.setTimeout(() => {{
+        if (window.__tmNavigatingAway) return;
+        updateFlow();
+        queueFrameHeightSync();
+      }}, 120);
+      const t320 = window.setTimeout(() => {{
+        if (window.__tmNavigatingAway) return;
+        updateFlow();
+        queueFrameHeightSync();
+      }}, 320);
+      layoutResyncTimers.push(t120, t320);
+    }});
+  }} catch (e) {{}}
+}}
+function bindLayoutImageObservers(scope) {{
+  const root = scope || document;
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll('img.sample-thumb, #previewImage').forEach((img) => {{
+    if (!img || img.dataset.layoutBound === '1') return;
+    img.dataset.layoutBound = '1';
+    const onDone = () => scheduleLayoutResync();
+    img.addEventListener('load', onDone, {{once: true}});
+    img.addEventListener('error', onDone, {{once: true}});
+  }});
+}}
+function requestShellLayoutRefresh(reason) {{
+  if (window.__tmNavigatingAway) return;
+  // #region debug-point C:request-shell-layout-refresh
+  dbgEvent('C', 'app.py:requestShellLayoutRefresh', '[DEBUG] requestShellLayoutRefresh called', {{
+    reason: String(reason || ''),
+    hasPywebviewWindow: !!(window && window.pywebview && window.pywebview.api),
+    hasPywebviewParent: !!(window.parent && window.parent.pywebview && window.parent.pywebview.api),
+    hasPywebviewTop: !!(window.top && window.top.pywebview && window.top.pywebview.api),
+    innerWidth: window.innerWidth || 0,
+    innerHeight: window.innerHeight || 0,
+  }});
+  // #endregion
+  try {{
+    const candidates = [window, window.parent, window.top];
+    for (const target of candidates) {{
+      if (target && target.pywebview && target.pywebview.api && typeof target.pywebview.api.request_reflow === 'function') {{
+        target.pywebview.api.request_reflow(String(reason || 'ui-refresh'));
+        return;
+      }}
+    }}
+  }} catch (e) {{}}
+}}
+let openSourceClass = STATE.initial_open_source_class || '';
+let openSourceKind = STATE.initial_open_source_kind || '';
+// #region debug-point B:initial-open-source
+dbgEvent('B', 'app.py:initialOpenSource', '[DEBUG] initial open source from payload', {{
+  session: String(STATE.session || ''),
+  openSourceClass,
+  openSourceKind,
+}});
+// #endregion
+let previewTimer = null;
+let previewBlobUrl = '';
+let previewRequestInFlight = false;
+let captureInFlight = false;
+let holdRecording = false;
+let holdRecordClass = '';
+let holdRecordSource = '';
+let holdSyncTimer = null;
+let holdSeq = 0;
+let holdNextToken = 0;
+let sourceSwitchInFlight = false;
+let sourceSwitchClass = '';
+let sourceSwitchKind = '';
+let trainInFlight = false;
+let trainPollToken = 0;
+let sourceSettingsOpen = false;
+let previewIntervalMs = 80;
+let currentSerialPort = STATE.current_serial_port || '';
+let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
+let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
+let currentSerialSync = String(STATE.current_serial_sync || 'AA 55 AA');
+let previewInputOn = false;
+let previewSource = 'webcam';
+let previewPredictTimer = null;
+let previewPredictInFlight = false;
+let previewPredictToken = 0;
+let previewSettingsOpen = false;
+let navMenuOpen = false;
+let navMenuBound = false;
+let resizeBound = false;
+STATE.counts = STATE.counts || {{}};
+STATE.sample_previews = STATE.sample_previews || {{}};
+const openSourceStorageKey = `tm-open-source-${{STATE.session}}`;
+const trainCfgStorageKey = `tm-train-cfg-${{STATE.session}}`;
+const previewStorageKey = `tm-preview-${{STATE.session}}`;
+const exportDirStorageKey = `tm-export-dir-${{STATE.session}}`;
+const exportNameStorageKey = `tm-export-name-${{STATE.session}}`;
+const exportArrayStorageKey = `tm-export-array-${{STATE.session}}`;
+let exportDir = '';
+let exportModelName = 'tm';
+let exportArrayName = '';
+function readOpenSourceStorage() {{
+  try {{
+    const raw = window.localStorage.getItem(openSourceStorageKey);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !data.className || !data.kind) return null;
+    return {{
+      className: String(data.className || ''),
+      kind: String(data.kind || '')
+    }};
+  }} catch (e) {{
+    return null;
+  }}
+}}
+function persistOpenSourceState() {{
+  try {{
+    if (!openSourceClass || !openSourceKind) {{
+      window.localStorage.removeItem(openSourceStorageKey);
+      return;
+    }}
+    window.localStorage.setItem(openSourceStorageKey, JSON.stringify({{
+      className: openSourceClass,
+      kind: openSourceKind
+    }}));
+  }} catch (e) {{}}
+}}
+function clearOpenSourceState() {{
+  try {{
+    window.localStorage.removeItem(openSourceStorageKey);
+  }} catch (e) {{}}
+}}
+if ((!openSourceClass || !openSourceKind) && typeof window !== 'undefined' && window.localStorage) {{
+  const restoredOpenSource = readOpenSourceStorage();
+  if (restoredOpenSource) {{
+    openSourceClass = restoredOpenSource.className;
+    openSourceKind = restoredOpenSource.kind;
+    // #region debug-point B:restore-open-source-storage
+    dbgEvent('B', 'app.py:restoreOpenSourceStorage', '[DEBUG] restored open source from localStorage', {{
+      session: String(STATE.session || ''),
+      openSourceClass,
+      openSourceKind,
+    }});
+    // #endregion
+  }}
+}}
+if (window.__tmStageMark) window.__tmStageMark('open-source-restored');
+function restoreTrainCfgFromStorage() {{
+  try {{
+    const raw = window.localStorage.getItem(trainCfgStorageKey);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return;
+    const prev = Object.assign({{}}, STATE.train_cfg || {{}});
+    const next = Object.assign({{}}, prev);
+    const clampInt = (v, lo, hi, fallback) => {{
+      const n = parseInt(String(v), 10);
+      if (!isFinite(n)) return fallback;
+      return Math.max(lo, Math.min(hi, n));
+    }};
+    const clampFloat = (v, lo, hi, fallback) => {{
+      const n = Number(v);
+      if (!isFinite(n)) return fallback;
+      return Math.max(lo, Math.min(hi, n));
+    }};
+    if ('batch_size' in data) next.batch_size = clampInt(data.batch_size, 1, 512, nullish(prev.batch_size, 16));
+    if ('epochs' in data) next.epochs = clampInt(data.epochs, 1, 1000, nullish(prev.epochs, 10));
+    if ('validation_split' in data) next.validation_split = clampFloat(data.validation_split, 0, 0.5, nullish(prev.validation_split, 0.2));
+    if ('learning_rate' in data) next.learning_rate = clampFloat(data.learning_rate, 0.000001, 1.0, nullish(prev.learning_rate, 0.001));
+    if ('conv1_filters' in data) next.conv1_filters = clampInt(data.conv1_filters, 1, 256, nullish(prev.conv1_filters, 8));
+    if ('conv2_filters' in data) next.conv2_filters = clampInt(data.conv2_filters, 1, 512, nullish(prev.conv2_filters, 16));
+    if ('dense_units' in data) next.dense_units = clampInt(data.dense_units, 1, 2048, nullish(prev.dense_units, 32));
+    STATE.train_cfg = next;
+  }} catch (e) {{}}
+}}
+function persistTrainCfgStorage() {{
+  try {{
+    window.localStorage.setItem(trainCfgStorageKey, JSON.stringify(STATE.train_cfg || {{}}));
+  }} catch (e) {{}}
+}}
+restoreTrainCfgFromStorage();
+if (window.__tmStageMark) window.__tmStageMark('train-cfg-restored');
+function restorePreviewState() {{
+  try {{
+    const raw = window.localStorage.getItem(previewStorageKey);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return;
+    previewInputOn = !!data.inputOn;
+    if (data.source === 'webcam' || data.source === 'device') previewSource = String(data.source);
+  }} catch (e) {{}}
+}}
+function persistPreviewState() {{
+  try {{
+    window.localStorage.setItem(previewStorageKey, JSON.stringify({{inputOn: !!previewInputOn, source: String(previewSource || 'webcam')}}));
+  }} catch (e) {{}}
+}}
+restorePreviewState();
+if (window.__tmStageMark) window.__tmStageMark('preview-restored');
+function restoreExportDir() {{
+  try {{
+    const raw = window.localStorage.getItem(exportDirStorageKey);
+    if (raw) exportDir = String(raw || '');
+  }} catch (e) {{}}
+}}
+function persistExportDir() {{
+  try {{
+    if (exportDir) window.localStorage.setItem(exportDirStorageKey, String(exportDir));
+  }} catch (e) {{}}
+}}
+restoreExportDir();
+function restoreExportSettings() {{
+  try {{
+    const rawName = window.localStorage.getItem(exportNameStorageKey);
+    const rawArray = window.localStorage.getItem(exportArrayStorageKey);
+    if (rawName) exportModelName = String(rawName || '').trim() || exportModelName;
+    if (rawArray !== null && rawArray !== undefined) exportArrayName = String(rawArray || '').trim();
+  }} catch (e) {{}}
+}}
+function persistExportSettings() {{
+  try {{
+    window.localStorage.setItem(exportNameStorageKey, String(exportModelName || 'tm'));
+    window.localStorage.setItem(exportArrayStorageKey, String(exportArrayName || ''));
+  }} catch (e) {{}}
+}}
+restoreExportSettings();
+if (window.__tmStageMark) window.__tmStageMark('export-restored');
+function parentUrl() {{
+  try {{
+    return new URL(window.parent.location.href);
+  }} catch (e) {{
+    return new URL(window.location.href);
+  }}
+}}
+function navigateParent(url) {{
+  try {{
+    window.parent.location.href = url;
+    return;
+  }} catch (e) {{}}
+  window.location.href = url;
+}}
+function cleanupWorkspaceFrameBeforeNavigate(reason) {{
+  if (window.__tmNavigatingAway) return;
+  try {{
+    if (frameHeightRaf) {{
+      try {{ cancelAnimationFrame(frameHeightRaf); }} catch (e) {{}}
+      frameHeightRaf = 0;
+    }}
+  }} catch (e) {{}}
+  try {{
+    layoutResyncTimers.forEach((t) => {{
+      try {{ clearTimeout(t); }} catch (e) {{}}
+    }});
+    layoutResyncTimers = [];
+    mountReflowTimers.forEach((t) => {{
+      try {{ clearTimeout(t); }} catch (e) {{}}
+    }});
+    mountReflowTimers = [];
+    if (homeNavigateTimer) {{
+      try {{ clearTimeout(homeNavigateTimer); }} catch (e) {{}}
+      homeNavigateTimer = 0;
+    }}
+  }} catch (e) {{}}
+  try {{
+    sendStreamlitMessage('streamlit:setFrameHeight', {{height: 1}});
+  }} catch (e) {{}}
+  window.__tmNavigatingAway = true;
+  try {{
+    const targets = [];
+    if (window.frameElement) targets.push(window.frameElement);
+    if (window.frameElement && window.frameElement.parentElement) targets.push(window.frameElement.parentElement);
+    if (window.frameElement && window.frameElement.parentElement && window.frameElement.parentElement.parentElement) {{
+      targets.push(window.frameElement.parentElement.parentElement);
+    }}
+    for (const el of targets) {{
+      if (!el || !el.style) continue;
+      el.style.height = '';
+      el.style.minHeight = '';
+      el.style.maxHeight = '';
+      el.style.width = '';
+      el.style.minWidth = '';
+      el.style.maxWidth = '';
+      el.style.overflow = '';
+      el.style.overflowX = '';
+      el.style.overflowY = '';
+      el.style.position = '';
+      el.style.inset = '';
+    }}
+  }} catch (e) {{}}
+  try {{
+    for (const el of [document.documentElement, document.body]) {{
+      if (!el || !el.style) continue;
+      el.style.minHeight = '';
+      el.style.maxHeight = '';
+      el.style.overflow = '';
+      el.style.overflowX = '';
+      el.style.overflowY = '';
+    }}
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    window.scrollTo(0, 0);
+  }} catch (e) {{}}
+  try {{
+    requestShellLayoutRefresh(String(reason || 'navigate-away'));
+  }} catch (e) {{}}
+  // #region debug-point B:return-home-cleanup
+  dbgEvent('B', 'app.py:cleanupWorkspaceFrameBeforeNavigate', '[DEBUG] cleanup workspace frame before navigate', {{
+    reason: String(reason || ''),
+    hasFrameElement: !!window.frameElement,
+    parentHref: parentUrl().toString(),
+    innerWidth: window.innerWidth || 0,
+    innerHeight: window.innerHeight || 0,
+  }});
+  // #endregion
+}}
+async function returnHome() {{
+  // #region debug-point B:return-home-start
+  dbgEvent('B', 'app.py:returnHome', '[DEBUG] returnHome start', {{
+    session: String(STATE.session || ''),
+    returnTarget: String(STATE.return_target || 'home'),
+    openSourceClass,
+    openSourceKind,
+    href: parentUrl().toString(),
+    innerWidth: window.innerWidth || 0,
+    innerHeight: window.innerHeight || 0,
+  }});
+  // #endregion
+  try {{
+    await closeSourcePanel(false);
+  }} catch (e) {{}}
+  stopPreviewPredictLoop();
+  previewInputOn = false;
+  persistPreviewState();
+  const u = parentUrl();
+  const target = String(STATE.return_target || 'home');
+  const keys = [
+    'tm_action', 'open_class', 'open_kind', 'notice',
+    'idx', 'name', 'serial_port', 'webcam_index'
+  ];
+  for (const key of keys) {{
+    u.searchParams.delete(key);
+  }}
+  if (target === 'classified-import') {{
+    u.searchParams.set('tm_project', 'image_classified_import');
+    u.searchParams.set('tm_session', String(STATE.session || ''));
+  }} else {{
+    u.searchParams.delete('tm_project');
+    u.searchParams.delete('tm_session');
+  }}
+  // #region debug-point B:return-home-navigate
+  dbgEvent('B', 'app.py:returnHome', '[DEBUG] returnHome navigating to home URL', {{
+    session: String(STATE.session || ''),
+    returnTarget: target,
+    targetUrl: u.toString(),
+  }});
+  // #endregion
+  cleanupWorkspaceFrameBeforeNavigate('return-home');
+  homeNavigateTimer = window.setTimeout(() => navigateParent(u.toString()), 40);
+}}
+function reloadParent() {{
+  try {{
+    window.parent.location.reload();
+    return;
+  }} catch (e) {{}}
+  window.location.reload();
+}}
+function stopPreviewLoop() {{
+  if (previewTimer) {{
+    clearInterval(previewTimer);
+    previewTimer = null;
+  }}
+}}
+function startPreviewLoop() {{
+  stopPreviewLoop();
+  refreshPreviewImage();
+  previewTimer = window.setInterval(refreshPreviewImage, Math.max(40, Number(previewIntervalMs || 80)));
+}}
+function stopHoldSyncLoop() {{
+  holdNextToken += 1;
+  if (holdSyncTimer) {{
+    clearInterval(holdSyncTimer);
+    holdSyncTimer = null;
+  }}
+}}
+function clearPreviewBlob() {{
+  if (previewBlobUrl) {{
+    try {{ URL.revokeObjectURL(previewBlobUrl); }} catch (e) {{}}
+    previewBlobUrl = '';
+  }}
+}}
+function syncSourceActionButtons(className) {{
+  if (!className) return;
+  const safe = cssSafe(className);
+  const capBtn = document.getElementById(`sourceCapture-${{safe}}`);
+  const holdBtn = document.getElementById(`sourceHold-${{safe}}`);
+  const switching = sourceSwitchInFlight && sourceSwitchClass === className && (sourceSwitchKind === 'webcam' || sourceSwitchKind === 'device');
+  const capturing = captureInFlight && openSourceClass === className;
+  const holding = holdRecording && holdRecordClass === className;
+  if (capBtn) {{
+    capBtn.disabled = switching || capturing || holding;
+    capBtn.textContent = switching ? 'Switching...' : (capturing ? 'Capturing...' : 'Capture');
+  }}
+  if (holdBtn) {{
+    holdBtn.disabled = switching || capturing;
+    holdBtn.textContent = switching ? 'Switching...' : (holding ? 'Recording...' : 'Hold to Capture');
+  }}
+}}
+async function closeSourcePanel(shouldRender = true) {{
+  stopPreviewLoop();
+  clearPreviewBlob();
+  sourceSettingsOpen = false;
+  const prevClass = openSourceClass;
+  const prevKind = openSourceKind;
+  if (holdRecording) {{
+    try {{
+      await fetch(`${{baseUrl}}/stop?session=${{encodeURIComponent(STATE.session)}}`);
+    }} catch (e) {{}}
+    stopHoldSyncLoop();
+    holdRecording = false;
+    holdRecordClass = '';
+    holdRecordSource = '';
+  }}
+  openSourceClass = '';
+  openSourceKind = '';
+  clearOpenSourceState();
+  if (prevKind) {{
+    try {{
+      await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(prevKind)}}`);
+    }} catch (e) {{}}
+  }}
+  if (shouldRender && prevClass) render();
+}}
+function refreshPreviewImage() {{
+  if (!openSourceKind || !openSourceClass || openSourceKind === 'upload') return;
+  if (previewRequestInFlight) return;
+  const img = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
+  const note = document.getElementById(`sourceNote-${{cssSafe(openSourceClass)}}`);
+  if (!img || !note) return;
+  const url = `${{baseUrl}}/live/frame?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&_ts=${{Date.now()}}`;
+  previewRequestInFlight = true;
+  fetch(url).then(async (res) => {{
+    if (!res.ok) {{
+      throw new Error(openSourceKind === 'device'
+        ? 'Unable to read from serial device. Check serial port and baudrate.'
+        : 'Unable to open webcam. Check permission or whether the camera is in use.');
+    }}
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('image/png')) {{
+      throw new Error('Preview returned invalid data.');
+    }}
+    const blob = await res.blob();
+    clearPreviewBlob();
+    previewBlobUrl = URL.createObjectURL(blob);
+    img.src = previewBlobUrl;
+    note.textContent = '';
+  }}).catch((err) => {{
+    clearPreviewBlob();
+    img.removeAttribute('src');
+    note.textContent = String(err && err.message ? err.message : err);
+  }}).finally(() => {{
+    previewRequestInFlight = false;
+  }});
+}}
+async function openSourcePanel(kind, className) {{
+  // #region debug-point B:open-source-panel
+  dbgEvent('B', 'app.py:openSourcePanel', '[DEBUG] openSourcePanel requested', {{kind, className, openSourceClass, openSourceKind}});
+  // #endregion
+  if (openSourceClass === className && openSourceKind === kind) return;
+  await closeSourcePanel(false);
+  openSourceClass = className;
+  openSourceKind = kind;
+  sourceSettingsOpen = false;
+  persistOpenSourceState();
+  render();
+  await syncClassState(className);
+  if (openSourceClass === className) updateOpenSamplesPanel(className);
+  if (kind === 'webcam' || kind === 'device') {{
+    try {{
+      await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(kind)}}`);
+    }} catch (e) {{}}
+    startPreviewLoop();
+  }}
+}}
+async function ensureOpenSourceLive() {{
+  // #region debug-point B:ensure-open-source-live
+  dbgEvent('B', 'app.py:ensureOpenSourceLive', '[DEBUG] ensureOpenSourceLive enter', {{openSourceClass, openSourceKind}});
+  // #endregion
+  if (!openSourceKind || !openSourceClass) return;
+  if (openSourceKind !== 'webcam' && openSourceKind !== 'device') return;
+  try {{
+    await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
+  }} catch (e) {{}}
+  startPreviewLoop();
+}}
+async function captureSource() {{
+  if (!openSourceKind || !openSourceClass) return;
+  if (captureInFlight) {{
+    dbgEvent('A', 'app.py:captureSource', '[DEBUG] duplicate capture ignored', {{openSourceKind, openSourceClass}});
+    return;
+  }}
+  captureInFlight = true;
+  syncSourceActionButtons(openSourceClass);
+  dbgEvent('A', 'app.py:captureSource', '[DEBUG] capture clicked', {{openSourceKind, openSourceClass, captureInFlight}});
+  const url = `${{baseUrl}}/live/capture?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&class=${{encodeURIComponent(openSourceClass)}}`;
+  try {{
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({{ok:'0', error:'capture failed'}}));
+    if (!res.ok || data.ok !== '1') {{
+      toast(data.error || 'Capture failed.');
+      return;
+    }}
+    if (data.image_b64) {{
+      prependSamplePreview(openSourceClass, {{
+        src: `data:image/png;base64,${{data.image_b64}}`,
+        filename: String(data.filename || '')
+      }});
+    }}
+    incrementSampleCount(openSourceClass, 1);
+    recomputeTrainEnabled();
+    updateOpenSamplesPanel(openSourceClass);
+    toast('1 sample captured.');
+  }} finally {{
+    captureInFlight = false;
+    syncSourceActionButtons(openSourceClass);
+  }}
+}}
+function toast(msg) {{
+  const el = document.getElementById('toast');
+  if (!msg) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => {{ el.style.display = 'none'; }}, 2400);
+}}
+function showOverwriteConfirmDialog(conflicts) {{
+  return new Promise((resolve) => {{
+    let hostWindow = window;
+    let hostDocument = document;
+    try {{
+      if (window.parent && window.parent !== window && window.parent.document && window.parent.document.body) {{
+        hostWindow = window.parent;
+        hostDocument = window.parent.document;
+      }}
+    }} catch (e) {{}}
+    const overlay = hostDocument.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.inset = '0';
+    overlay.style.background = 'rgba(32,33,36,0.56)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '2400';
+    overlay.style.padding = '20px';
+
+    const card = hostDocument.createElement('div');
+    card.style.width = 'min(560px, 92vw)';
+    card.style.background = '#fff';
+    card.style.borderRadius = '14px';
+    card.style.boxShadow = '0 14px 40px rgba(0,0,0,0.28)';
+    card.style.padding = '16px';
+    card.style.color = '#202124';
+
+    const title = hostDocument.createElement('div');
+    title.style.fontSize = '16px';
+    title.style.fontWeight = '700';
+    title.style.marginBottom = '10px';
+    title.textContent = 'Overwrite existing export files?';
+
+    const body = hostDocument.createElement('div');
+    body.style.fontSize = '13px';
+    body.style.lineHeight = '1.5';
+    body.style.whiteSpace = 'pre-wrap';
+    let msg = 'Files already exist in this export folder and will be overwritten.';
+    const nl = String.fromCharCode(10);
+    if (Array.isArray(conflicts) && conflicts.length) {{
+      msg += nl + nl + 'Existing files:' + nl + '- ' + conflicts.join(nl + '- ');
+    }}
+    body.textContent = msg;
+
+    const actions = hostDocument.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '10px';
+    actions.style.marginTop = '14px';
+
+    const cancelBtn = hostDocument.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.border = '0';
+    cancelBtn.style.borderRadius = '8px';
+    cancelBtn.style.padding = '10px 12px';
+    cancelBtn.style.fontWeight = '700';
+    cancelBtn.style.cursor = 'pointer';
+    cancelBtn.style.background = '#eef1f5';
+    cancelBtn.style.color = '#202124';
+
+    const okBtn = hostDocument.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = 'Overwrite';
+    okBtn.style.border = '0';
+    okBtn.style.borderRadius = '8px';
+    okBtn.style.padding = '10px 12px';
+    okBtn.style.fontWeight = '700';
+    okBtn.style.cursor = 'pointer';
+    okBtn.style.background = '#1a73e8';
+    okBtn.style.color = '#fff';
+
+    let done = false;
+    function finish(value) {{
+      if (done) return;
+      done = true;
+      try {{ overlay.remove(); }} catch (e) {{}}
+      resolve(!!value);
+    }}
+
+    cancelBtn.onclick = () => finish(false);
+    okBtn.onclick = () => finish(true);
+    overlay.onclick = (e) => {{
+      if (e.target === overlay) finish(false);
+    }};
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    card.appendChild(title);
+    card.appendChild(body);
+    card.appendChild(actions);
+    overlay.appendChild(card);
+    try {{
+      if (hostWindow && typeof hostWindow.scrollTo === 'function') hostWindow.scrollTo(0, 0);
+    }} catch (e) {{}}
+    hostDocument.body.appendChild(overlay);
+  }});
+}}
+function renderNavMenu() {{
+  const menu = document.getElementById('navMenu');
+  if (!menu) return;
+  if (navMenuOpen) menu.classList.add('open');
+  else menu.classList.remove('open');
+  try {{
+    window.requestAnimationFrame(() => updateFlow());
+  }} catch (e) {{}}
+}}
+function closeNavMenu() {{
+  navMenuOpen = false;
+  renderNavMenu();
+}}
+function toggleNavMenu() {{
+  navMenuOpen = !navMenuOpen;
+  renderNavMenu();
+}}
+function applyProjectState(state) {{
+  const s = state && typeof state === 'object' ? state : {{}};
+  // #region debug-point C:apply-project-state
+  dbgEvent('C', 'app.py:applyProjectState', '[DEBUG] applyProjectState received state payload', {{
+    classes: Array.isArray(s.classes) ? s.classes.slice() : [],
+    countKeys: s.counts && typeof s.counts === 'object' ? Object.keys(s.counts) : [],
+    previewKeys: s.sample_previews && typeof s.sample_previews === 'object' ? Object.keys(s.sample_previews) : [],
+    exportEnabled: String(s.export_enabled || '0'),
+  }});
+  // #endregion
+  stopHoldSyncLoop();
+  stopPreviewPredictLoop();
+  stopPreviewLoop();
+  clearPreviewBlob();
+  previewSettingsOpen = false;
+  sourceSettingsOpen = false;
+  navMenuOpen = false;
+  renderNavMenu();
+  holdRecording = false;
+  holdRecordClass = '';
+  holdRecordSource = '';
+  openSourceClass = '';
+  openSourceKind = '';
+  clearOpenSourceState();
+  previewInputOn = false;
+  persistPreviewState();
+  trainInFlight = false;
+  const cls = Array.isArray(s.classes) ? s.classes.slice() : [];
+  STATE.classes = cls;
+  const cnt = s.counts && typeof s.counts === 'object' ? s.counts : {{}};
+  const nextCounts = {{}};
+  for (const [k, v] of Object.entries(cnt)) nextCounts[String(k)] = Number(v || 0);
+  STATE.counts = nextCounts;
+  const prev = s.sample_previews && typeof s.sample_previews === 'object' ? s.sample_previews : {{}};
+  const nextPrev = {{}};
+  for (const [k, v] of Object.entries(prev)) nextPrev[String(k)] = normalizePreviewList(v);
+  STATE.sample_previews = nextPrev;
+  STATE.export_enabled = String(s.export_enabled || '0') === '1';
+  recomputeTrainEnabled();
+  try {{
+    document.documentElement.scrollTop = 0;
+    document.documentElement.scrollLeft = 0;
+    document.body.scrollTop = 0;
+    document.body.scrollLeft = 0;
+    window.scrollTo(0, 0);
+  }} catch (e) {{}}
+  scheduleLayoutResync();
+}}
+async function exportDataset() {{
+  try {{
+    const pickRes = await fetch(`${{baseUrl}}/export/pick_dir?session=${{encodeURIComponent(STATE.session)}}`);
+    const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
+    if (!pickRes.ok || pick.ok !== '1') {{
+      if (pick && pick.canceled === '1') return;
+      throw new Error(pick.error || 'Unable to choose folder.');
+    }}
+    const exportDir = String(pick.export_dir || '').trim();
+    if (!exportDir) return;
+    const res = await fetch(`${{baseUrl}}/dataset/export`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session, export_dir: exportDir}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Dataset export failed.');
+    toast(`Dataset exported to: ${{String(data.export_dir || exportDir)}}`);
+  }} catch (e) {{
+    toast(String(e && e.message ? e.message : e));
+  }}
+}}
+async function saveProject() {{
+  try {{
+    const pickRes = await fetch(`${{baseUrl}}/project/pick_save?session=${{encodeURIComponent(STATE.session)}}`);
+    const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
+    if (!pickRes.ok || pick.ok !== '1') {{
+      if (pick && pick.canceled === '1') return;
+      throw new Error(pick.error || 'Unable to choose file.');
+    }}
+    const savePath = String(pick.save_path || '').trim();
+    if (!savePath) return;
+    const res = await fetch(`${{baseUrl}}/project/save`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session, save_path: savePath}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Save failed.');
+    toast(`Saved: ${{String(data.save_path || savePath)}}`);
+  }} catch (e) {{
+    toast(String(e && e.message ? e.message : e));
+  }}
+}}
+async function openProject() {{
+  try {{
+    // #region debug-point A:open-project-start
+    dbgEvent('A', 'app.py:openProject', '[DEBUG] openProject start', {{
+      session: String(STATE.session || ''),
+      href: parentUrl().toString(),
+      innerWidth: window.innerWidth || 0,
+      innerHeight: window.innerHeight || 0,
+      classes: Array.isArray(STATE.classes) ? STATE.classes.slice() : [],
+    }});
+    // #endregion
+    const pickRes = await fetch(`${{baseUrl}}/project/pick_open?session=${{encodeURIComponent(STATE.session)}}`);
+    const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
+    if (!pickRes.ok || pick.ok !== '1') {{
+      if (pick && pick.canceled === '1') return;
+      throw new Error(pick.error || 'Unable to choose file.');
+    }}
+    const openPath = String(pick.open_path || '').trim();
+    if (!openPath) return;
+    const res = await fetch(`${{baseUrl}}/project/open`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session, open_path: openPath}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Open failed.');
+    const statePayload = data && data.state && typeof data.state === 'object' ? data.state : {{}};
+    // #region debug-point D:open-project-response
+    dbgEvent('D', 'app.py:openProject', '[DEBUG] openProject response received', {{
+      openPath,
+      stateClasses: Array.isArray(statePayload.classes) ? statePayload.classes.slice() : [],
+      statePreviewKeys: statePayload.sample_previews && typeof statePayload.sample_previews === 'object' ? Object.keys(statePayload.sample_previews) : [],
+      stateCounts: statePayload.counts || {{}},
+    }});
+    // #endregion
+    applyProjectState(data.state || {{}});
+    render();
+    scheduleLayoutResync();
+    requestShellLayoutRefresh('open-project');
+    window.setTimeout(() => {{
+      // #region debug-point A:open-project-post-render-1
+      dbgEvent('A', 'app.py:openProject', '[DEBUG] openProject post-render metrics (120ms)', {{
+        innerWidth: window.innerWidth || 0,
+        innerHeight: window.innerHeight || 0,
+        docClientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
+        docScrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
+        bodyScrollHeight: document.body ? document.body.scrollHeight : 0,
+      }});
+      // #endregion
+    }}, 120);
+    window.setTimeout(() => {{
+      // #region debug-point A:open-project-post-render-2
+      dbgEvent('A', 'app.py:openProject', '[DEBUG] openProject post-render metrics (500ms)', {{
+        innerWidth: window.innerWidth || 0,
+        innerHeight: window.innerHeight || 0,
+        docClientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
+        docScrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
+        bodyScrollHeight: document.body ? document.body.scrollHeight : 0,
+      }});
+      // #endregion
+    }}, 500);
+  }} catch (e) {{
+    toast(String(e && e.message ? e.message : e));
+  }}
+}}
+async function resetProject() {{
+  const ok = window.confirm('Reset project? This will delete samples, classes, and trained model.');
+  if (!ok) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/project/reset`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session, confirm: '1'}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Reset failed.');
+    applyProjectState(data.state || {{}});
+    render();
+    scheduleLayoutResync();
+    requestShellLayoutRefresh('reset-project');
+  }} catch (e) {{
+    toast(String(e && e.message ? e.message : e));
+  }}
+}}
+function defaultExportDir() {{
+  if (exportDir) return exportDir;
+  return `~/Documents/TFLiteTraining/exports`;
+}}
+async function exportRunWithOverwriteConfirm(exportDirValue, modelNameValue, arrayNameValue) {{
+  const payload = {{
+    session: STATE.session,
+    export_dir: String(exportDirValue || '').trim(),
+    model_name: String(modelNameValue || 'tm'),
+    array_name: String(arrayNameValue || '')
+  }};
+  let res = await fetch(`${{baseUrl}}/export/run`, {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify(payload)
+  }});
+  let data = await res.json().catch(() => ({{ok:'0'}}));
+  if (res.ok && data.ok === '1') return data;
+  if (data && data.needs_confirm === '1') {{
+    const files = Array.isArray(data.conflicts) ? data.conflicts.slice(0, 8) : [];
+    const confirmed = await showOverwriteConfirmDialog(files);
+    if (!confirmed) {{
+      toast('Export canceled.');
+      return {{ok:'0', canceled:'1'}};
+    }}
+    const overwritePayload = {{
+      session: payload.session,
+      export_dir: payload.export_dir,
+      model_name: payload.model_name,
+      array_name: payload.array_name,
+      overwrite: true
+    }};
+    res = await fetch(`${{baseUrl}}/export/run`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify(overwritePayload)
+    }});
+    data = await res.json().catch(() => ({{ok:'0'}}));
+    if (res.ok && data.ok === '1') {{
+      toast('Existing export files were overwritten.');
+      return data;
+    }}
+  }}
+  throw new Error((data && data.error) || ('Export failed (status ' + String(res && res.status ? res.status : 0) + ').'));
+}}
+async function exportModel() {{
+  if (!STATE.export_enabled) return;
+  const suggested = defaultExportDir();
+  const picked = window.prompt('Export folder', suggested);
+  if (picked == null) return;
+  exportDir = String(picked || '').trim();
+  if (!exportDir) return;
+  persistExportDir();
+  try {{
+    const data = await exportRunWithOverwriteConfirm(exportDir, 'model', 'g_model');
+    if (!data || data.canceled === '1') return;
+    toast(`Exported to: ${{data.export_dir || exportDir}}`);
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+function showTrainProgress(show, pct, text) {{
+  const wrap = document.getElementById('trainProgress');
+  const fill = document.getElementById('trainProgressFill');
+  const label = document.getElementById('trainProgressText');
+  if (!wrap || !fill || !label) return;
+  wrap.style.display = show ? 'block' : 'none';
+  const clamped = Math.max(0, Math.min(1, Number(pct || 0)));
+  fill.style.width = `${{Math.round(clamped * 1000) / 10}}%`;
+  label.textContent = String(text || '');
+}}
+function syncTrainUi() {{
+  const trainBtn = document.getElementById('trainBtn');
+  if (!trainBtn) return;
+  trainBtn.classList.toggle('enabled', !!STATE.train_enabled);
+  trainBtn.disabled = !STATE.train_enabled || !!trainInFlight;
+}}
+async function startTrain() {{
+  if (trainInFlight) return;
+  if (!STATE.train_enabled) return;
+  trainInFlight = true;
+  syncTrainUi();
+  trainPollToken += 1;
+  const token = trainPollToken;
+  showTrainProgress(true, 0.01, 'Starting...');
+  try {{
+    const res = await fetch(`${{baseUrl}}/train/start`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        cfg: STATE.train_cfg || {{}}
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') {{
+      throw new Error(data.error || 'Unable to start training.');
+    }}
+    while (token === trainPollToken) {{
+      const stRes = await fetch(`${{baseUrl}}/train/status?session=${{encodeURIComponent(STATE.session)}}`);
+      const stData = await stRes.json().catch(() => ({{ok:'0'}}));
+      if (!stRes.ok || stData.ok !== '1') {{
+        throw new Error(stData.error || 'Unable to read training status.');
+      }}
+      const p = Number(stData.progress || 0);
+      const msg = String(stData.message || '');
+      showTrainProgress(true, p, msg);
+      if (String(stData.done || '0') === '1') {{
+        const err = String(stData.error || '');
+        if (err) {{
+          toast(err);
+          showTrainProgress(true, 1.0, 'Failed.');
+        }} else {{
+          STATE.export_enabled = true;
+          renderTrainStatus();
+          renderPreviewCard();
+          showTrainProgress(true, 1.0, 'Done.');
+          toast('Training complete.');
+          const exportBtn = document.getElementById('exportBtn');
+          if (exportBtn) exportBtn.disabled = false;
+        }}
+        break;
+      }}
+      await new Promise((r) => setTimeout(r, 250));
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+    showTrainProgress(false, 0, '');
+  }} finally {{
+    if (token === trainPollToken) {{
+      trainInFlight = false;
+      syncTrainUi();
+    }}
+  }}
+}}
+function setAction(action, params) {{
+  dbgEvent(action === 'open_source' ? 'B' : (action === 'set_webcam_index' ? 'D' : 'A'), 'app.py:setAction', '[DEBUG] setAction navigation', {{action, params, href: parentUrl().toString()}});
+  const u = parentUrl();
+  u.searchParams.set('tm_action', action);
+  if (action !== 'home') {{
+    u.searchParams.set('tm_project', 'image');
+    u.searchParams.set('tm_session', String(STATE.session || ''));
+  }} else {{
+    u.searchParams.delete('tm_project');
+    u.searchParams.delete('tm_session');
+  }}
+  for (const [k,v] of Object.entries(params || {{}})) {{
+    u.searchParams.set(k, String(v));
+  }}
+  navigateParent(u.toString());
+}}
+async function uploadFiles(className, files) {{
+  if (!files || files.length === 0) return;
+  let uploaded = 0;
+  for (const f of files) {{
+    const buf = await f.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i=0; i<bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin);
+    const res = await fetch(`${{baseUrl}}/upload`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session, class: className, image_b64: b64}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (res.ok && data.ok === '1') {{
+      uploaded += 1;
+      if (data.image_b64) prependSamplePreview(className, {{src: `data:image/png;base64,${{data.image_b64}}`, filename: String(data.filename || '')}});
+      else prependSamplePreview(className, {{src: `data:image/*;base64,${{b64}}`, filename: String(data.filename || '')}});
+      incrementSampleCount(className, 1);
+      recomputeTrainEnabled();
+    }}
+  }}
+  syncTrainUi();
+  if (openSourceClass === className) updateOpenSamplesPanel(className);
+  toast(uploaded > 0 ? `Uploaded ${{uploaded}} image(s).` : 'Upload failed.');
+}}
+function cssSafe(name) {{
+  return String(name).replace(/[^a-zA-Z0-9_-]/g, '_');
+}}
+function normalizePreviewItem(item) {{
+  if (!item) return null;
+  if (typeof item === 'string') {{
+    return {{src: String(item), filename: ''}};
+  }}
+  if (typeof item === 'object') {{
+    const src = String(item.src || item.image || '');
+    if (!src) return null;
+    return {{
+      src,
+      filename: String(item.filename || '')
+    }};
+  }}
+  return null;
+}}
+function normalizePreviewList(items) {{
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (const item of items) {{
+    const normalized = normalizePreviewItem(item);
+    if (normalized) out.push(normalized);
+  }}
+  return out;
+}}
+function previewSrc(item) {{
+  const normalized = normalizePreviewItem(item);
+  return normalized ? String(normalized.src || '') : '';
+}}
+function previewFilename(item) {{
+  const normalized = normalizePreviewItem(item);
+  return normalized ? String(normalized.filename || '') : '';
+}}
+function escapeHtml(value) {{
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}}
+function nullish(value, fallback) {{
+  return value === null || value === undefined ? fallback : value;
+}}
+function prependSamplePreview(className, item) {{
+  const normalized = normalizePreviewItem(item);
+  if (!className || !normalized) return;
+  const items = Array.isArray(STATE.sample_previews[className]) ? STATE.sample_previews[className].slice() : [];
+  items.unshift(normalized);
+  STATE.sample_previews[className] = items;
+}}
+function removePreviewItemLocal(className, filename) {{
+  if (!className || !filename) return;
+  const items = normalizePreviewList(STATE.sample_previews[className]);
+  STATE.sample_previews[className] = items.filter((item) => previewFilename(item) !== filename);
+}}
+function incrementSampleCount(className, delta) {{
+  const next = Math.max(0, Number(STATE.counts[className] || 0) + Number(delta || 0));
+  STATE.counts[className] = next;
+}}
+function recomputeTrainEnabled() {{
+  const classes = Array.isArray(STATE.classes) ? STATE.classes : [];
+  const counts = STATE.counts || {{}};
+  const nonEmpty = classes.filter((name) => Number(counts[name] || 0) > 0).length;
+  const total = classes.reduce((sum, name) => sum + Number(counts[name] || 0), 0);
+  STATE.train_enabled = classes.length >= 2 && nonEmpty >= 2 && nonEmpty === classes.length && total > 0;
+}}
+async function syncClassState(className) {{
+  if (!className) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/class_state?session=${{encodeURIComponent(STATE.session)}}&class=${{encodeURIComponent(className)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to refresh class state.');
+    STATE.counts[className] = Number(data.count || 0);
+    STATE.sample_previews[className] = normalizePreviewList(data.previews);
+    recomputeTrainEnabled();
+    syncTrainUi();
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function startHoldCapture() {{
+  if (holdRecording || !openSourceClass || !openSourceKind || openSourceKind === 'upload') return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/start?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&class=${{encodeURIComponent(openSourceClass)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to start hold capture.');
+    holdRecording = true;
+    holdRecordClass = openSourceClass;
+    holdRecordSource = openSourceKind;
+    syncSourceActionButtons(openSourceClass);
+    stopHoldSyncLoop();
+    holdSeq = 0;
+    const token = holdNextToken + 1;
+    holdNextToken = token;
+    (async () => {{
+      while (holdRecording && holdRecordClass && holdNextToken === token) {{
+        try {{
+          const nextRes = await fetch(`${{baseUrl}}/record/next?session=${{encodeURIComponent(STATE.session)}}&since=${{encodeURIComponent(String(holdSeq))}}`);
+          const nextData = await nextRes.json().catch(() => ({{ok:'0'}}));
+          if (!holdRecording || holdNextToken !== token) break;
+          if (!nextRes.ok || nextData.ok !== '1') throw new Error(nextData.error || 'Unable to read hold capture updates.');
+          const seq = Number(nextData.seq || holdSeq || 0);
+          if (seq > holdSeq && nextData.image_b64) {{
+            holdSeq = seq;
+            prependSamplePreview(holdRecordClass, {{
+              src: `data:image/png;base64,${{nextData.image_b64}}`,
+              filename: String(nextData.filename || '')
+            }});
+            STATE.counts[holdRecordClass] = Number(nextData.count || STATE.counts[holdRecordClass] || 0);
+            recomputeTrainEnabled();
+            if (openSourceClass === holdRecordClass) updateOpenSamplesPanel(holdRecordClass);
+          }} else {{
+            holdSeq = seq;
+          }}
+          if (String(nextData.recording || '1') !== '1') break;
+        }} catch (err) {{
+          toast(String(err && err.message ? err.message : err));
+          await new Promise((r) => setTimeout(r, 250));
+        }}
+      }}
+    }})().catch(() => {{}});
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function stopHoldCapture() {{
+  if (!holdRecording) return;
+  const className = holdRecordClass;
+  const sourceKind = holdRecordSource;
+  stopHoldSyncLoop();
+  holdRecording = false;
+  holdRecordClass = '';
+  holdRecordSource = '';
+  syncSourceActionButtons(className);
+  try {{
+    await fetch(`${{baseUrl}}/stop?session=${{encodeURIComponent(STATE.session)}}`);
+  }} catch (e) {{}}
+  await syncClassState(className);
+  if (openSourceClass === className) updateOpenSamplesPanel(className);
+  toast('Hold capture stopped.');
+}}
+function buildDeviceOptions(selected) {{
+  const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
+  const opts = ['<option value="">Select device port</option>'];
+  for (const p of ports) {{
+    const device = String(p.device || '');
+    const label = String(p.label || device);
+    const sel = device === selected ? ' selected' : '';
+    opts.push(`<option value="${{device.replace(/"/g, '&quot;')}}"${{sel}}>${{label}}</option>`);
+  }}
+  return opts.join('');
+}}
+function buildWebcamOptions(selected) {{
+  const cams = Array.isArray(STATE.webcam_options) ? STATE.webcam_options : [];
+  dbgEvent('E', 'app.py:buildWebcamOptions', '[DEBUG] frontend webcam options', {{selected, cams}});
+  const opts = ['<option value="">Select camera</option>'];
+  for (const c of cams) {{
+    const idx = Number(c.index);
+    const label = String(c.label || `Camera ${{idx}}`);
+    const sel = idx === Number(selected) ? ' selected' : '';
+    opts.push(`<option value="${{idx}}"${{sel}}>${{label}}</option>`);
+  }}
+  return opts.join('');
+}}
+function buildSerialBaudOptions(selected) {{
+  const values = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
+  return values.map((baud) => `<option value="${{baud}}"${{Number(selected) === baud ? ' selected' : ''}}>${{baud}}</option>`).join('');
+}}
+function deviceHelpText() {{
+  const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
+  if (!ports.length) return 'No compatible serial UART device is currently detected. Connect the board or install the required USB serial driver first.';
+  return 'Choose the serial port connected to your device before capturing. Sync is the hex frame header used to find the start of each serial image packet, for example AA 55 AA.';
+}}
+function webcamHelpText() {{
+  return 'Use the settings button (⚙) to choose the camera source for live capture.';
+}}
+function buildSourceSettingsMarkup(className) {{
+  if (openSourceClass !== className || !sourceSettingsOpen || openSourceKind === 'upload') return '';
+  if (openSourceKind === 'device') {{
+    return `
+      <div class="source-settings-panel" id="sourceSettingsPanel-${{cssSafe(className)}}">
+        <div class="source-settings-grid">
+          <label>
+            Baud Rate
+            <select id="sourceBaud-${{cssSafe(className)}}">${{buildSerialBaudOptions(currentSerialBaud)}}</select>
+          </label>
+          <label>
+            Sync Header
+            <input id="sourceSync-${{cssSafe(className)}}" value="${{escapeHtml(String(currentSerialSync || 'AA 55 AA'))}}" placeholder="AA 55 AA"/>
+          </label>
+        </div>
+        <div class="source-settings-actions">
+          <button class="source-settings-cancel" type="button" id="sourceSettingsCancel-${{cssSafe(className)}}">Close</button>
+          <button class="source-settings-save" type="button" id="sourceSettingsSave-${{cssSafe(className)}}">Apply</button>
+        </div>
+      </div>
+    `;
+  }}
+  return `
+    <div class="source-settings-panel" id="sourceSettingsPanel-${{cssSafe(className)}}">
+      <div class="source-settings-grid">
+        <label>
+          Camera
+          <select id="sourceCamera-${{cssSafe(className)}}">${{buildWebcamOptions(currentWebcamIndex)}}</select>
+        </label>
+        <label>
+          Preview Refresh
+          <select id="sourcePreviewRate-${{cssSafe(className)}}">
+            <option value="60"${{Number(previewIntervalMs) === 60 ? ' selected' : ''}}>Fast</option>
+            <option value="80"${{Number(previewIntervalMs) === 80 ? ' selected' : ''}}>Balanced</option>
+            <option value="120"${{Number(previewIntervalMs) === 120 ? ' selected' : ''}}>Stable</option>
+            <option value="180"${{Number(previewIntervalMs) === 180 ? ' selected' : ''}}>Low CPU</option>
+          </select>
+        </label>
+      </div>
+      <div class="source-settings-actions">
+        <button class="source-settings-cancel" type="button" id="sourceSettingsCancel-${{cssSafe(className)}}">Close</button>
+        <button class="source-settings-save" type="button" id="sourceSettingsSave-${{cssSafe(className)}}">Apply</button>
+      </div>
+    </div>
+  `;
+}}
+async function changeSerialBaud(className, value) {{
+  const nextBaud = Number(value || currentSerialBaud || 115200);
+  currentSerialBaud = nextBaud;
+  STATE.current_serial_baud = currentSerialBaud;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'device';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_baud=${{encodeURIComponent(String(currentSerialBaud))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update baud rate.');
+    if (openSourceClass === className && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
+async function changeSerialSync(className, value) {{
+  const nextSync = String(value || currentSerialSync || 'AA 55 AA').trim() || 'AA 55 AA';
+  currentSerialSync = nextSync;
+  STATE.current_serial_sync = currentSerialSync;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'device';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_sync=${{encodeURIComponent(currentSerialSync)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update sync header.');
+    currentSerialSync = String(data.serial_sync || currentSerialSync || 'AA 55 AA');
+    STATE.current_serial_sync = currentSerialSync;
+    if (openSourceClass === className && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
+function toggleSourceSettings(className) {{
+  if (openSourceClass !== className || !openSourceKind || openSourceKind === 'upload') return;
+  sourceSettingsOpen = !sourceSettingsOpen;
+  render();
+}}
+async function applySourceSettings(className) {{
+  if (openSourceClass !== className) return;
+  try {{
+    if (openSourceKind === 'device') {{
+      const baudEl = document.getElementById(`sourceBaud-${{cssSafe(className)}}`);
+      const syncEl = document.getElementById(`sourceSync-${{cssSafe(className)}}`);
+      await changeSerialBaud(className, baudEl ? baudEl.value : String(currentSerialBaud));
+      await changeSerialSync(className, syncEl ? syncEl.value : String(currentSerialSync));
+    }} else if (openSourceKind === 'webcam') {{
+      const camEl = document.getElementById(`sourceCamera-${{cssSafe(className)}}`);
+      const rateEl = document.getElementById(`sourcePreviewRate-${{cssSafe(className)}}`);
+      const nextCam = camEl ? camEl.value : String(currentWebcamIndex);
+      if (String(nextCam) !== String(currentWebcamIndex)) {{
+        await changeWebcamIndex(className, nextCam);
+      }}
+      previewIntervalMs = Number(rateEl ? rateEl.value : previewIntervalMs || 80);
+      if (openSourceClass === className && openSourceKind === 'webcam') startPreviewLoop();
+    }}
+    sourceSettingsOpen = false;
+    render();
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function changeDevicePort(className, value) {{
+  if (captureInFlight && openSourceClass === className) {{
+    toast('Wait for the current capture to finish before switching device.');
+    syncSourceActionButtons(className);
+    return;
+  }}
+  if (holdRecording && holdRecordClass === className && holdRecordSource === 'device') {{
+    await stopHoldCapture();
+  }}
+  currentSerialPort = String(value || '');
+  STATE.current_serial_port = currentSerialPort;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'device';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_port=${{encodeURIComponent(currentSerialPort)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update serial port.');
+    if (openSourceClass === className && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
+async function changeWebcamIndex(className, value) {{
+  if (captureInFlight && openSourceClass === className) {{
+    toast('Wait for the current capture to finish before switching camera.');
+    syncSourceActionButtons(className);
+    return;
+  }}
+  if (holdRecording && holdRecordClass === className && holdRecordSource === 'webcam') {{
+    await stopHoldCapture();
+  }}
+  currentWebcamIndex = Number(value || 0);
+  STATE.current_webcam_index = currentWebcamIndex;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'webcam';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update webcam.');
+    if (openSourceClass === className && openSourceKind === 'webcam') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=webcam`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
+function sourceLabel(kind) {{
+  if (kind === 'device') return 'Device';
+  if (kind === 'upload') return 'Upload';
+  return 'Webcam';
+}}
+function sourceSamplesTitle(kind) {{
+  if (kind === 'upload') return 'Uploaded Samples';
+  if (kind === 'device') return 'Device Samples';
+  return 'Camera Samples';
+}}
+function buildSampleTileMarkup(item, idx) {{
+  const src = escapeHtml(previewSrc(item));
+  const filename = escapeHtml(previewFilename(item));
+  return `
+    <div class="sample-item">
+      <img class="sample-thumb" src="${{src}}" alt="Sample ${{idx+1}}"/>
+      <button class="sample-delete" type="button" data-filename="${{filename}}" aria-label="Delete sample">✕</button>
+    </div>
+  `;
+}}
+function buildSamplesMarkup(className) {{
+  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  if (!items.length) return '<div class="samples-empty">No samples yet.</div>';
+  return `<div class="samples-grid">${{items.map((item, idx) => buildSampleTileMarkup(item, idx)).join('')}}</div>`;
+}}
+function buildSamplesStripMarkup(className) {{
+  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  if (!items.length) return '<div class="samples-strip-empty">No samples yet.</div>';
+  return `<div class="samples-strip">${{items.map((item, idx) => buildSampleTileMarkup(item, idx)).join('')}}</div>`;
+}}
+function createIcon(kind) {{
+  if (kind === 'webcam') return `<svg viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"></rect><path d="M22 8l-6 4 6 4V8z"></path></svg>`;
+  if (kind === 'upload') return `<svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>`;
+  return `<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"></rect><line x1="9" y1="9" x2="15" y2="9"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>`;
+}}
+function setFlowPath(id, d) {{
+  const p = document.getElementById(id);
+  if (p) p.setAttribute('d', d);
+}}
+function setClassSampleCountLabel(className) {{
+  const count = Number(STATE.counts[className] || 0);
+  const summary = document.getElementById(`summaryTitle-${{cssSafe(className)}}`);
+  if (summary) summary.textContent = `${{count}} ${{count === 1 ? 'Image Sample' : 'Image Samples'}}`;
+  const sourceCount = document.getElementById(`sourceCount-${{cssSafe(className)}}`);
+  if (sourceCount) sourceCount.innerHTML = `${{count}}<small>${{count === 1 ? 'Image Sample' : 'Image Samples'}}</small>`;
+}}
+function latestPreviewImage() {{
+  if (openSourceClass) {{
+    const items = normalizePreviewList(STATE.sample_previews && STATE.sample_previews[openSourceClass]);
+    if (items.length) return previewSrc(items[0]);
+  }}
+  for (const name of (Array.isArray(STATE.classes) ? STATE.classes : [])) {{
+    const items = normalizePreviewList(STATE.sample_previews && STATE.sample_previews[name]);
+    if (items.length) return previewSrc(items[0]);
+  }}
+  return '';
+}}
+function stopPreviewPredictLoop() {{
+  previewPredictToken += 1;
+  if (previewPredictTimer) {{
+    clearInterval(previewPredictTimer);
+    previewPredictTimer = null;
+  }}
+}}
+function renderOutputBars(labels, probs) {{
+  const host = document.getElementById('previewOutput');
+  if (!host) return;
+  const ls = Array.isArray(labels) ? labels : [];
+  const ps = Array.isArray(probs) ? probs : [];
+  if (!ls.length || !ps.length) {{
+    host.innerHTML = '';
+    return;
+  }}
+  host.innerHTML = ls.map((label, idx) => {{
+    const p = Math.max(0, Math.min(1, Number(ps[idx] || 0)));
+    const pct = Math.round(p * 1000) / 10;
+    return `
+      <div class="out-row">
+        <div>${{String(label)}}</div>
+        <div class="out-bar">
+          <div class="out-fill" style="width:${{pct}}%"></div>
+          <div class="out-pct">${{pct}}%</div>
+        </div>
+      </div>
+    `;
+  }}).join('');
+}}
+async function refreshPreviewPrediction(token) {{
+  if (!previewInputOn || !STATE.export_enabled) return;
+  if (previewPredictInFlight) return;
+  if (token !== previewPredictToken) return;
+  previewPredictInFlight = true;
+  const pane = document.getElementById('previewPane');
+  const note = document.getElementById('previewNote');
+  const imgId = 'previewImage';
+  try {{
+    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&_ts=${{Date.now()}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
+    const src = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+    if (pane) {{
+      if (!pane.dataset.ready) {{
+        pane.innerHTML = `<img id="${{imgId}}" alt="Preview"/>`;
+        pane.dataset.ready = '1';
+      }}
+      const img = document.getElementById(imgId);
+      if (img && src) img.src = src;
+    }}
+    if (openSourceClass && openSourceKind === previewSource) {{
+      const sImg = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
+      if (sImg && src) sImg.src = src;
+    }}
+    renderOutputBars(data.labels || [], data.probs || []);
+    if (note) {{
+      const top = data.top_label ? `${{String(data.top_label)}}` : '';
+      const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
+      note.textContent = top ? `Top: ${{top}} (${{p}}%)` : '';
+    }}
+  }} catch (err) {{
+    if (note) note.textContent = String(err && err.message ? err.message : err);
+  }} finally {{
+    previewPredictInFlight = false;
+  }}
+}}
+function startPreviewPredictLoop() {{
+  stopPreviewPredictLoop();
+  previewPredictToken += 1;
+  const token = previewPredictToken;
+  stopPreviewLoop();
+  refreshPreviewPrediction(token);
+  previewPredictTimer = window.setInterval(
+    () => refreshPreviewPrediction(token),
+    Math.max(50, Number(previewIntervalMs || 80))
+  );
+}}
+async function setWebcamIndexGlobal(value) {{
+  const next = Number(value || 0);
+  currentWebcamIndex = next;
+  STATE.current_webcam_index = currentWebcamIndex;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update webcam.');
+    if (openSourceKind === 'webcam') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=webcam`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function setDevicePortGlobal(value) {{
+  currentSerialPort = String(value || '');
+  STATE.current_serial_port = currentSerialPort;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_port=${{encodeURIComponent(currentSerialPort)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update serial port.');
+    if (openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function setSerialBaudGlobal(value) {{
+  currentSerialBaud = Number(value || currentSerialBaud || 115200);
+  STATE.current_serial_baud = currentSerialBaud;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_baud=${{encodeURIComponent(String(currentSerialBaud))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update baud rate.');
+    if (openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function setSerialSyncGlobal(value) {{
+  currentSerialSync = String(value || currentSerialSync || 'AA 55 AA').trim() || 'AA 55 AA';
+  STATE.current_serial_sync = currentSerialSync;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_sync=${{encodeURIComponent(currentSerialSync)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update sync header.');
+    currentSerialSync = String(data.serial_sync || currentSerialSync || 'AA 55 AA');
+    STATE.current_serial_sync = currentSerialSync;
+    if (openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+function buildPreviewSettingsMarkup() {{
+  if (!previewSettingsOpen || !STATE.export_enabled) return '';
+  const exportFields = `
+    <label>
+      Export Name
+      <input id="previewExportName" value="${{String(exportModelName || 'tm')}}" placeholder="person_detect"/>
+    </label>
+    <label>
+      Array Name (optional)
+      <input id="previewExportArray" value="${{String(exportArrayName || '')}}" placeholder="g_person_detect_model_data"/>
+    </label>
+  `;
+  if (previewSource === 'device') {{
+    return `
+      <div class="source-settings-panel" id="previewSettingsPanel">
+        <div class="source-settings-grid">
+          ${{exportFields}}
+          <label>
+            Device Port
+            <select id="previewDevicePort">${{buildDeviceOptions(currentSerialPort)}}</select>
+          </label>
+          <label>
+            Baud Rate
+            <select id="previewDeviceBaud">${{buildSerialBaudOptions(currentSerialBaud)}}</select>
+          </label>
+          <label>
+            Sync Header
+            <input id="previewDeviceSync" value="${{escapeHtml(String(currentSerialSync || 'AA 55 AA'))}}" placeholder="AA 55 AA"/>
+          </label>
+        </div>
+        <div class="source-settings-actions">
+          <button class="source-settings-cancel" type="button" id="previewSettingsCancel">Close</button>
+          <button class="source-settings-save" type="button" id="previewSettingsSave">Apply</button>
+        </div>
+      </div>
+    `;
+  }}
+  return `
+    <div class="source-settings-panel" id="previewSettingsPanel">
+      <div class="source-settings-grid">
+        ${{exportFields}}
+        <label>
+          Camera
+          <select id="previewCamera">${{buildWebcamOptions(currentWebcamIndex)}}</select>
+        </label>
+        <label>
+          Preview Refresh
+          <select id="previewPreviewRate">
+            <option value="60"${{Number(previewIntervalMs) === 60 ? ' selected' : ''}}>Fast</option>
+            <option value="80"${{Number(previewIntervalMs) === 80 ? ' selected' : ''}}>Balanced</option>
+            <option value="120"${{Number(previewIntervalMs) === 120 ? ' selected' : ''}}>Stable</option>
+            <option value="180"${{Number(previewIntervalMs) === 180 ? ' selected' : ''}}>Low CPU</option>
+          </select>
+        </label>
+      </div>
+      <div class="source-settings-actions">
+        <button class="source-settings-cancel" type="button" id="previewSettingsCancel">Close</button>
+        <button class="source-settings-save" type="button" id="previewSettingsSave">Apply</button>
+      </div>
+    </div>
+  `;
+}}
+function renderPreviewSettings() {{
+  const host = document.getElementById('previewSettingsHost');
+  if (!host) return;
+  host.innerHTML = buildPreviewSettingsMarkup();
+  updateFlow();
+  const cancel = document.getElementById('previewSettingsCancel');
+  const save = document.getElementById('previewSettingsSave');
+  if (cancel) cancel.onclick = () => {{
+    previewSettingsOpen = false;
+    renderPreviewSettings();
+  }};
+  if (save) save.onclick = async () => {{
+    try {{
+      const nameEl = document.getElementById('previewExportName');
+      const arrayEl = document.getElementById('previewExportArray');
+      exportModelName = String(nameEl ? nameEl.value : exportModelName || 'tm').trim() || 'tm';
+      exportArrayName = String(arrayEl ? arrayEl.value : exportArrayName || '').trim();
+      persistExportSettings();
+      if (previewSource === 'device') {{
+        const portEl = document.getElementById('previewDevicePort');
+        const baudEl = document.getElementById('previewDeviceBaud');
+        const syncEl = document.getElementById('previewDeviceSync');
+        await setDevicePortGlobal(portEl ? portEl.value : currentSerialPort);
+        await setSerialBaudGlobal(baudEl ? baudEl.value : String(currentSerialBaud));
+        await setSerialSyncGlobal(syncEl ? syncEl.value : String(currentSerialSync));
+      }} else {{
+        const camEl = document.getElementById('previewCamera');
+        const rateEl = document.getElementById('previewPreviewRate');
+        if (camEl && String(camEl.value) !== String(currentWebcamIndex)) await setWebcamIndexGlobal(camEl.value);
+        if (rateEl) previewIntervalMs = Number(rateEl.value || previewIntervalMs || 80);
+      }}
+      previewSettingsOpen = false;
+      renderPreviewSettings();
+      if (previewInputOn) {{
+        if (previewPredictTimer) stopPreviewPredictLoop();
+        startPreviewPredictLoop();
+      }} else {{
+        startPreviewLoop();
+      }}
+    }} catch (err) {{
+      toast(String(err && err.message ? err.message : err));
+    }}
+  }};
+}}
+function renderTrainStatus() {{
+  const el = document.getElementById('trainStatus');
+  if (!el) return;
+  el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
+}}
+function renderPreviewCard() {{
+  const pane = document.getElementById('previewPane');
+  const note = document.getElementById('previewNote');
+  const output = document.getElementById('previewOutput');
+  const toggle = document.getElementById('previewInputToggle');
+  const select = document.getElementById('previewSourceSelect');
+  const settingsBtn = document.getElementById('previewSettingsToggle');
+  if (!pane || !note || !output || !toggle || !select || !settingsBtn) return;
+  if (!STATE.export_enabled) {{
+    stopPreviewPredictLoop();
+    previewSettingsOpen = false;
+    renderPreviewSettings();
+    pane.removeAttribute('data-ready');
+    pane.innerHTML = '<div class="preview-empty">Train a model on the left to enable preview.</div>';
+    output.innerHTML = '';
+    note.textContent = 'You must train a model on the left before you can preview it here.';
+    toggle.checked = false;
+    toggle.disabled = true;
+    select.disabled = true;
+    settingsBtn.disabled = true;
+    return;
+  }}
+  toggle.disabled = false;
+  select.disabled = false;
+  settingsBtn.disabled = false;
+  toggle.checked = !!previewInputOn;
+  select.value = previewSource;
+  renderPreviewSettings();
+  if (!pane.dataset.ready) {{
+    const src = latestPreviewImage();
+    pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Turn on Input to preview live predictions.</div>';
+    pane.dataset.ready = '1';
+  }}
+  bindLayoutImageObservers(pane);
+  scheduleLayoutResync();
+  if (previewInputOn) {{
+    if (!previewPredictTimer) startPreviewPredictLoop();
+  }} else {{
+    if (previewPredictTimer) stopPreviewPredictLoop();
+    output.innerHTML = '';
+    note.textContent = 'Model ready. Turn on Input to preview it here.';
+    if (openSourceClass && (openSourceKind === 'webcam' || openSourceKind === 'device')) startPreviewLoop();
+  }}
+}}
+function bindPreviewControls() {{
+  const toggle = document.getElementById('previewInputToggle');
+  const select = document.getElementById('previewSourceSelect');
+  const settings = document.getElementById('previewSettingsToggle');
+  if (!toggle || !select || !settings) return;
+  if (toggle.dataset.bound === '1') return;
+  toggle.dataset.bound = '1';
+  toggle.onchange = () => {{
+    previewInputOn = !!toggle.checked;
+    persistPreviewState();
+    renderPreviewCard();
+  }};
+  select.onchange = () => {{
+    const v = String(select.value || 'webcam');
+    previewSource = (v === 'device') ? 'device' : 'webcam';
+    persistPreviewState();
+    if (previewPredictTimer) stopPreviewPredictLoop();
+    previewSettingsOpen = false;
+    renderPreviewSettings();
+    renderPreviewCard();
+  }};
+  settings.onclick = () => {{
+    previewSettingsOpen = !previewSettingsOpen;
+    renderPreviewSettings();
+  }};
+}}
+function updateOpenSamplesPanel(className) {{
+  const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
+  if (!host) return;
+  host.innerHTML = buildSamplesMarkup(className);
+  bindSampleDeleteButtons(host, className);
+  bindLayoutImageObservers(host);
+  setClassSampleCountLabel(className);
+  renderPreviewCard();
+  syncTrainUi();
+  scheduleLayoutResync();
+}}
+function applyClassesState(nextClasses, oldClasses) {{
+  const prevClasses = Array.isArray(oldClasses) ? oldClasses.slice() : STATE.classes.slice();
+  const oldCounts = Object.assign({{}}, STATE.counts || {{}});
+  const oldPreviews = Object.assign({{}}, STATE.sample_previews || {{}});
+  const nextCounts = {{}};
+  const nextPreviews = {{}};
+  (Array.isArray(nextClasses) ? nextClasses : []).forEach((name, idx) => {{
+    const prevName = prevClasses[idx];
+    nextCounts[name] = Number(nullish(oldCounts[name], nullish(oldCounts[prevName], 0)));
+    nextPreviews[name] = normalizePreviewList(
+      Array.isArray(oldPreviews[name]) ? oldPreviews[name] : oldPreviews[prevName]
+    );
+  }});
+  STATE.classes = Array.isArray(nextClasses) ? nextClasses.slice() : [];
+  STATE.counts = nextCounts;
+  STATE.sample_previews = nextPreviews;
+}}
+async function deleteSample(className, filename) {{
+  if (!className || !filename) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/samples/delete`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        class: className,
+        filename
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to delete sample.');
+    const next = data.state || {{}};
+    STATE.counts[className] = Number(next.count || 0);
+    STATE.sample_previews[className] = normalizePreviewList(next.previews);
+    recomputeTrainEnabled();
+    syncTrainUi();
+    const openHost = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
+    if (openHost) {{
+      updateOpenSamplesPanel(className);
+    }} else {{
+      render();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+function bindSampleDeleteButtons(scope, className) {{
+  if (!scope || !className) return;
+  const buttons = scope.querySelectorAll('.sample-delete[data-filename]');
+  buttons.forEach((btn) => {{
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.onclick = async (e) => {{
+      e.preventDefault();
+      e.stopPropagation();
+      const filename = String(btn.dataset.filename || '');
+      await deleteSample(className, filename);
+    }};
+  }});
+}}
+async function renameClass(oldName) {{
+  const nextNameRaw = window.prompt('Rename class', oldName);
+  if (nextNameRaw == null) return;
+  const nextName = String(nextNameRaw).trim();
+  if (!nextName || nextName === oldName) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/classes/rename`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        old_name: oldName,
+        new_name: nextName
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to rename class.');
+    applyClassesState(Array.isArray(data.classes) ? data.classes : STATE.classes, STATE.classes);
+    if (openSourceClass === oldName) openSourceClass = nextName;
+    if (holdRecordClass === oldName) holdRecordClass = nextName;
+    persistOpenSourceState();
+    recomputeTrainEnabled();
+    render();
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function addClass() {{
+  try {{
+    const prev = STATE.classes.slice();
+    const res = await fetch(`${{baseUrl}}/classes/add`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{session: STATE.session}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to add class.');
+    applyClassesState(Array.isArray(data.classes) ? data.classes : prev, prev);
+    recomputeTrainEnabled();
+    render();
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function deleteClass(name) {{
+  if (STATE.classes.length <= 2) return;
+  const ok = window.confirm('Delete this class?');
+  if (!ok) return;
+  try {{
+    const prev = STATE.classes.slice();
+    const res = await fetch(`${{baseUrl}}/classes/delete`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        name
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to delete class.');
+    applyClassesState(Array.isArray(data.classes) ? data.classes : prev.filter((x) => x !== name), prev);
+    if (openSourceClass === name) {{
+      openSourceClass = '';
+      openSourceKind = '';
+      clearOpenSourceState();
+    }}
+    if (holdRecordClass === name) {{
+      holdRecording = false;
+      holdRecordClass = '';
+      holdRecordSource = '';
+    }}
+    recomputeTrainEnabled();
+    render();
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+function updateFlow() {{
+  const wrap = document.querySelector('.wrap');
+  const svg = document.querySelector('svg.flow');
+  const train = document.getElementById('trainCard');
+  const preview = document.getElementById('previewCard');
+  const cards = Array.from(document.querySelectorAll('.class-card'));
+  if (!wrap || !svg || !train || !preview || cards.length < 1) return;
+  const wr = wrap.getBoundingClientRect();
+  // #region debug-point E:update-flow
+  dbgEvent('E', 'app.py:updateFlow', '[DEBUG] updateFlow geometry snapshot', {{
+    wrapWidth: Math.round(wr.width || 0),
+    wrapHeight: Math.round(wr.height || 0),
+    cardCount: cards.length,
+    trainHeight: Math.round((train.getBoundingClientRect().height || 0)),
+    previewHeight: Math.round((preview.getBoundingClientRect().height || 0)),
+  }});
+  // #endregion
+  svg.setAttribute('viewBox', `0 0 ${{Math.max(1, Math.round(wr.width))}} ${{Math.max(1, Math.round(wr.height))}}`);
+  const t = train.getBoundingClientRect();
+  const p = preview.getBoundingClientRect();
+  const tx = t.left - wr.left;
+  const ty = t.top + t.height * 0.5 - wr.top;
+  const tr = t.right - wr.left;
+  const py = p.top + p.height * 0.5 - wr.top;
+  const px = p.left - wr.left;
+  const trainPreviewPath = document.getElementById('flowTrainPreview');
+  const existing = Array.from(svg.querySelectorAll('path[id^="flowClass"]'));
+  for (const p of existing) {{
+    const m = String(p.id || '').match(/^flowClass(\d+)$/);
+    if (!m) continue;
+    const idx = Number(m[1] || 0);
+    if (idx > cards.length) p.remove();
+  }}
+  for (let i = 0; i < cards.length; i++) {{
+    const id = `flowClass${{i + 1}}`;
+    let path = document.getElementById(id);
+    if (!path) {{
+      path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('id', id);
+      path.setAttribute('stroke', 'rgba(0,0,0,0.16)');
+      path.setAttribute('stroke-width', '2');
+      path.setAttribute('fill', 'none');
+      if (trainPreviewPath && trainPreviewPath.parentNode === svg) {{
+        svg.insertBefore(path, trainPreviewPath);
+      }} else {{
+        svg.appendChild(path);
+      }}
+    }}
+    const cr = cards[i].getBoundingClientRect();
+    const cx = cr.right - wr.left;
+    const cy = cr.top + cr.height * 0.5 - wr.top;
+    const offset = (i - (cards.length - 1) / 2) * 14;
+    setFlowPath(id, `M ${{cx}} ${{cy}} C ${{cx + 44}} ${{cy}}, ${{tx - 44}} ${{ty + offset}}, ${{tx}} ${{ty}}`);
+  }}
+  setFlowPath('flowTrainPreview', `M ${{tr}} ${{ty}} C ${{tr + 34}} ${{ty}}, ${{px - 34}} ${{py}}, ${{px}} ${{py}}`);
+}}
+let trainAdvancedOpen = false;
+function syncAdvancedInlineInputs() {{
+  const cfg = STATE.train_cfg || {{}};
+  const set = (id, value) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.value = nullish(value, nullish(el.value, ''));
+  }};
+  set('advBatchInline', nullish(cfg.batch_size, 16));
+  set('advEpochsInline', nullish(cfg.epochs, 10));
+  set('advValInline', nullish(cfg.validation_split, 0.2));
+  set('advLrInline', nullish(cfg.learning_rate, 0.001));
+  set('advConv1Inline', nullish(cfg.conv1_filters, 8));
+  set('advConv2Inline', nullish(cfg.conv2_filters, 16));
+  set('advDenseInline', nullish(cfg.dense_units, 32));
+}}
+function setTrainCfgField(key, rawValue) {{
+  const cfg = STATE.train_cfg || {{}};
+  let v = rawValue;
+  if (key === 'validation_split' || key === 'learning_rate') {{
+    v = Number(v);
+    if (!isFinite(v)) return;
+  }} else {{
+    v = parseInt(String(v), 10);
+    if (!isFinite(v)) return;
+  }}
+  const next = Object.assign({{}}, cfg);
+  next[key] = v;
+  STATE.train_cfg = next;
+  persistTrainCfgStorage();
+}}
+function renderAdvancedPanel() {{
+  const panel = document.getElementById('trainAdvPanel');
+  const chev = document.getElementById('advChevron');
+  if (!panel) return;
+  panel.style.display = trainAdvancedOpen ? 'block' : 'none';
+  if (chev) chev.textContent = trainAdvancedOpen ? '▴' : '▾';
+  if (trainAdvancedOpen) syncAdvancedInlineInputs();
+  updateFlow();
+}}
+function toggleAdvancedInline() {{
+  trainAdvancedOpen = !trainAdvancedOpen;
+  renderAdvancedPanel();
+}}
+function bindAdvancedInlineHandlers() {{
+  const panel = document.getElementById('trainAdvPanel');
+  if (!panel || panel.dataset.bound === '1') return;
+  panel.dataset.bound = '1';
+  const bindNum = (id, key) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('input', (e) => setTrainCfgField(key, e.target.value));
+    el.addEventListener('change', (e) => setTrainCfgField(key, e.target.value));
+  }};
+  bindNum('advBatchInline', 'batch_size');
+  bindNum('advEpochsInline', 'epochs');
+  bindNum('advValInline', 'validation_split');
+  bindNum('advLrInline', 'learning_rate');
+  bindNum('advConv1Inline', 'conv1_filters');
+  bindNum('advConv2Inline', 'conv2_filters');
+  bindNum('advDenseInline', 'dense_units');
+}}
+function resetTrainCfg() {{
+  STATE.train_cfg = {{
+    batch_size: 16,
+    epochs: 10,
+    validation_split: 0.2,
+    learning_rate: 0.001,
+    conv1_filters: 8,
+    conv2_filters: 16,
+    dense_units: 32
+  }};
+  persistTrainCfgStorage();
+  syncAdvancedInlineInputs();
+  toast('Advanced settings reset.');
+}}
+function render() {{
+  // #region debug-point B:render-entry
+  dbgEvent('B', 'app.py:render', '[DEBUG] render start', {{classes: STATE.classes, openSourceClass, openSourceKind, initial_open_source_class: STATE.initial_open_source_class, initial_open_source_kind: STATE.initial_open_source_kind}});
+  // #endregion
+  const root = document.getElementById('classes');
+  root.innerHTML = '';
+  for (let i=0; i<STATE.classes.length; i++) {{
+    const name = STATE.classes[i];
+    const card = document.createElement('div');
+    card.className = 'card class-card';
+    const head = document.createElement('div');
+    head.className = 'class-head';
+    const title = document.createElement('div');
+    title.className = 'class-title';
+    title.textContent = name;
+    const edit = document.createElement('button');
+    edit.className = 'iconbtn';
+    edit.textContent = '✎';
+    edit.onclick = () => renameClass(name);
+    title.appendChild(edit);
+    head.appendChild(title);
+    const more = document.createElement('button');
+    more.className = 'iconbtn more';
+    more.textContent = '⋮';
+    more.onclick = () => deleteClass(name);
+    card.appendChild(more);
+    card.appendChild(head);
+    const div = document.createElement('div');
+    div.className = 'divider';
+    card.appendChild(div);
+    const c = Number(STATE.counts[name] || 0);
+    const sh = document.createElement('div');
+    sh.className = 'summary-title';
+    sh.id = `summaryTitle-${{cssSafe(name)}}`;
+    sh.textContent = `${{c}} ${{c === 1 ? 'Image Sample' : 'Image Samples'}}`;
+    card.appendChild(sh);
+
+    const row = document.createElement('div');
+    row.className = openSourceClass === name ? 'btnrow' : 'summary-actions';
+
+    const upWebcam = document.createElement('button');
+    upWebcam.className = 'sample';
+    upWebcam.innerHTML = createIcon('webcam') + '<div>Webcam</div>';
+    upWebcam.onclick = () => openSourcePanel('webcam', name);
+
+    const upDevice = document.createElement('button');
+    upDevice.className = 'sample';
+    upDevice.innerHTML = createIcon('device') + '<div>Device</div>';
+    upDevice.onclick = () => openSourcePanel('device', name);
+
+    const upUpload = document.createElement('button');
+    upUpload.className = 'sample';
+    upUpload.innerHTML = createIcon('upload') + '<div>Upload</div>';
+    upUpload.onclick = () => openSourcePanel('upload', name);
+
+    row.appendChild(upWebcam);
+    row.appendChild(upUpload);
+    row.appendChild(upDevice);
+
+    if (openSourceClass === name) {{
+      // #region debug-point B:render-open-panel
+      dbgEvent('B', 'app.py:render', '[DEBUG] rendering expanded source panel', {{name, openSourceKind, sampleCount: c}});
+      // #endregion
+      card.appendChild(row);
+      const selectedPort = currentSerialPort || '';
+      const selectedCam = Number(currentWebcamIndex);
+      const sampleCount = c;
+      const panel = document.createElement('div');
+      panel.className = 'source-panel';
+      panel.innerHTML = `
+        <div class="source-left">
+          <div class="source-head">
+            <span>${{sourceLabel(openSourceKind)}}</span>
+            <div class="source-tools">
+              <button class="iconbtn" type="button" title="Close" id="sourceClose-${{cssSafe(name)}}">✕</button>
+            </div>
+          </div>
+          ${{
+            openSourceKind === 'upload'
+              ? `<button class="upload-pick" type="button" id="uploadPick-${{cssSafe(name)}}">Choose images from your files</button>
+                 <div class="upload-hint">Images are added to this class and appear immediately on the right.</div>`
+              : (
+                openSourceKind === 'device'
+                  ? `<select class="device-select" id="deviceSelect-${{cssSafe(name)}}">
+                       ${{buildDeviceOptions(selectedPort)}}
+                     </select>
+                     <div class="device-help">${{deviceHelpText()}}</div>
+                     <div class="source-preview-wrap">
+                       <img id="sourcePreview-${{cssSafe(name)}}" class="preview-frame" alt="Preview"/>
+                     </div>
+                     <div class="source-note" id="sourceNote-${{cssSafe(name)}}"></div>
+                     ${{buildSourceSettingsMarkup(name)}}
+                     <div class="source-actions">
+                       <button class="btn btn-primary" type="button" id="sourceCapture-${{cssSafe(name)}}">Capture</button>
+                       <button class="btn" type="button" id="sourceHold-${{cssSafe(name)}}">${{holdRecording && holdRecordClass === name ? 'Recording...' : 'Hold to Capture'}}</button>
+                       <button class="iconbtn source-settings" type="button" id="sourceSettingsToggle-${{cssSafe(name)}}" title="Source settings">⚙</button>
+                     </div>`
+                  : `<div class="device-help">${{webcamHelpText()}}</div>
+                     <div class="source-preview-wrap">
+                       <img id="sourcePreview-${{cssSafe(name)}}" class="preview-frame" alt="Preview"/>
+                     </div>
+                     <div class="source-note" id="sourceNote-${{cssSafe(name)}}"></div>
+                     ${{buildSourceSettingsMarkup(name)}}
+                     <div class="source-actions">
+                       <button class="btn btn-primary" type="button" id="sourceCapture-${{cssSafe(name)}}">Capture</button>
+                       <button class="btn" type="button" id="sourceHold-${{cssSafe(name)}}">${{holdRecording && holdRecordClass === name ? 'Recording...' : 'Hold to Capture'}}</button>
+                       <button class="iconbtn source-settings" type="button" id="sourceSettingsToggle-${{cssSafe(name)}}" title="Source settings">⚙</button>
+                     </div>`
+              )
+          }}
+        </div>
+        <div class="source-right">
+          <h4>${{sourceSamplesTitle(openSourceKind)}}</h4>
+          <div class="source-count" id="sourceCount-${{cssSafe(name)}}">${{sampleCount}}<small>${{sampleCount === 1 ? 'Image Sample' : 'Image Samples'}}</small></div>
+          <div id="samplesHost-${{cssSafe(name)}}">${{buildSamplesMarkup(name)}}</div>
+        </div>
+      `;
+      card.appendChild(panel);
+    }} else {{
+      const summary = document.createElement('div');
+      summary.className = 'summary-row';
+      const samples = document.createElement('div');
+      samples.className = 'summary-samples';
+      samples.innerHTML = buildSamplesStripMarkup(name);
+      summary.appendChild(row);
+      summary.appendChild(samples);
+      card.appendChild(summary);
+    }}
+    root.appendChild(card);
+  }}
+  const add = document.createElement('div');
+  add.className = 'addclass';
+  add.innerHTML = '<span style="font-size:18px;">⊞</span><span>Add a class</span>';
+  add.onclick = () => addClass();
+  root.appendChild(add);
+
+  const trainBtn = document.getElementById('trainBtn');
+  recomputeTrainEnabled();
+  syncTrainUi();
+  trainBtn.onclick = () => {{
+    if (!STATE.train_enabled) return;
+    startTrain();
+  }};
+
+  const exportBtn = document.getElementById('exportBtn');
+  exportBtn.disabled = !STATE.export_enabled;
+  exportBtn.onclick = async () => {{
+    if (!STATE.export_enabled) return;
+    exportBtn.disabled = true;
+    try {{
+      const pickRes = await fetch(`${{baseUrl}}/export/pick_dir?session=${{encodeURIComponent(STATE.session)}}`);
+      const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
+      if (!pickRes.ok || pick.ok !== '1') {{
+        if (pick && pick.canceled === '1') return;
+        throw new Error(pick.error || 'Unable to choose folder.');
+      }}
+      const exportDir = String(pick.export_dir || '').trim();
+      if (!exportDir) return;
+      const runData = await exportRunWithOverwriteConfirm(
+        exportDir,
+        String(exportModelName || 'tm'),
+        String(exportArrayName || '')
+      );
+      if (!runData || runData.canceled === '1') return;
+      toast(`Exported to: ${{String(runData.export_dir || exportDir)}}`);
+    }} catch (e) {{
+      toast(String(e && e.message ? e.message : e));
+    }} finally {{
+      exportBtn.disabled = !STATE.export_enabled;
+    }}
+  }};
+  renderPreviewCard();
+  renderTrainStatus();
+  bindPreviewControls();
+
+  document.getElementById('advBtn').onclick = toggleAdvancedInline;
+  const advReset = document.getElementById('advReset');
+  if (advReset) advReset.onclick = () => resetTrainCfg();
+  bindAdvancedInlineHandlers();
+  renderAdvancedPanel();
+  const nav = document.getElementById('goHome');
+  const navOpen = document.getElementById('navOpenProject');
+  const navSave = document.getElementById('navSaveProject');
+  const navExportDataset = document.getElementById('navExportDataset');
+  const navReturn = document.getElementById('navReturn');
+  const navReset = document.getElementById('navResetProject');
+  if (nav) nav.onclick = (e) => {{
+    if (e) e.stopPropagation();
+    toggleNavMenu();
+  }};
+  if (navOpen) navOpen.onclick = async (e) => {{
+    if (e) e.stopPropagation();
+    closeNavMenu();
+    await openProject();
+  }};
+  if (navSave) navSave.onclick = async (e) => {{
+    if (e) e.stopPropagation();
+    closeNavMenu();
+    await saveProject();
+  }};
+  if (navExportDataset) navExportDataset.onclick = async (e) => {{
+    if (e) e.stopPropagation();
+    closeNavMenu();
+    await exportDataset();
+  }};
+  if (navReturn) navReturn.onclick = async (e) => {{
+    if (e) e.stopPropagation();
+    closeNavMenu();
+    await returnHome();
+  }};
+  if (navReset) navReset.onclick = async (e) => {{
+    if (e) e.stopPropagation();
+    closeNavMenu();
+    await resetProject();
+  }};
+  if (!navMenuBound) {{
+    document.addEventListener('click', () => closeNavMenu());
+    navMenuBound = true;
+  }}
+  if (openSourceClass) {{
+    const safe = cssSafe(openSourceClass);
+    const closeBtn = document.getElementById(`sourceClose-${{safe}}`);
+    const capBtn = document.getElementById(`sourceCapture-${{safe}}`);
+    const holdBtn = document.getElementById(`sourceHold-${{safe}}`);
+    const devSel = document.getElementById(`deviceSelect-${{safe}}`);
+    const uploadPick = document.getElementById(`uploadPick-${{safe}}`);
+    const settingsToggle = document.getElementById(`sourceSettingsToggle-${{safe}}`);
+    const settingsSave = document.getElementById(`sourceSettingsSave-${{safe}}`);
+    const settingsCancel = document.getElementById(`sourceSettingsCancel-${{safe}}`);
+    if (closeBtn) closeBtn.onclick = () => closeSourcePanel();
+    if (capBtn) capBtn.onclick = captureSource;
+    if (holdBtn) {{
+      holdBtn.onpointerdown = (e) => {{
+        try {{ holdBtn.setPointerCapture(e.pointerId); }} catch (err) {{}}
+        e.preventDefault();
+        startHoldCapture();
+      }};
+      holdBtn.onpointerup = (e) => {{
+        e.preventDefault();
+        stopHoldCapture();
+      }};
+      holdBtn.onpointercancel = () => stopHoldCapture();
+      holdBtn.onpointerleave = () => stopHoldCapture();
+    }}
+    if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
+    if (settingsToggle) settingsToggle.onclick = () => toggleSourceSettings(openSourceClass);
+    if (settingsSave) settingsSave.onclick = () => applySourceSettings(openSourceClass);
+    if (settingsCancel) settingsCancel.onclick = () => {{
+      sourceSettingsOpen = false;
+      render();
+    }};
+    if (uploadPick) uploadPick.onclick = () => {{
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.multiple = true;
+      input.onchange = () => uploadFiles(openSourceClass, input.files);
+      input.click();
+    }};
+    syncSourceActionButtons(openSourceClass);
+  }}
+  root.querySelectorAll('.class-card').forEach((card, idx) => {{
+    const className = STATE.classes[idx];
+    bindSampleDeleteButtons(card, className);
+  }});
+  bindLayoutImageObservers(root);
+
+  ensureOpenSourceLive();
+  updateFlow();
+  scheduleLayoutResync();
+  if (!resizeBound) {{
+    window.addEventListener('resize', () => {{
+      // #region debug-point C:window-resize
+      dbgEvent('C', 'app.py:window.resize', '[DEBUG] window resize event', {{
+        session: String(STATE.session || ''),
+        innerWidth: window.innerWidth || 0,
+        innerHeight: window.innerHeight || 0,
+        docClientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
+        docScrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
+      }});
+      // #endregion
+      scheduleLayoutResync();
+    }});
+    resizeBound = true;
+  }}
+  window.onpointerup = () => stopHoldCapture();
+  toast(STATE.notice);
+}}
+window.addEventListener('load', () => {{
+  // #region debug-point A:window-load
+  dbgEvent('A', 'app.py:window.load', '[DEBUG] window load event', {{
+    session: String(STATE.session || ''),
+    innerWidth: window.innerWidth || 0,
+    innerHeight: window.innerHeight || 0,
+    href: parentUrl().toString(),
+  }});
+  // #endregion
+  queueFrameHeightSync();
+  requestShellLayoutRefresh('image-project-mount:load');
+}});
+window.addEventListener('pagehide', () => {{
+  cleanupWorkspaceFrameBeforeNavigate('pagehide');
+}});
+window.addEventListener('beforeunload', () => {{
+  cleanupWorkspaceFrameBeforeNavigate('beforeunload');
+}});
+window.addEventListener('orientationchange', () => {{
+  // #region debug-point C:orientation-change
+  dbgEvent('C', 'app.py:orientationchange', '[DEBUG] orientationchange event', {{
+    session: String(STATE.session || ''),
+    innerWidth: window.innerWidth || 0,
+    innerHeight: window.innerHeight || 0,
+  }});
+  // #endregion
+  queueFrameHeightSync();
+  logScrollLayers('window-load');
+}});
+if (window.__tmStageMark) window.__tmStageMark('before-render');
+render();
+if (window.__tmStageMark) window.__tmStageMark('after-render');
+logScrollLayers('after-render');
+requestShellLayoutRefresh('image-project-mount');
+mountReflowTimers.push(window.setTimeout(() => {{
+  if (window.__tmNavigatingAway) return;
+  requestShellLayoutRefresh('image-project-mount:t120');
+  logScrollLayers('mount-t120');
+}}, 120));
+mountReflowTimers.push(window.setTimeout(() => {{
+  if (window.__tmNavigatingAway) return;
+  requestShellLayoutRefresh('image-project-mount:t360');
+  logScrollLayers('mount-t360');
+}}, 360));
+</script>
+</body>
+</html>
+        """,
+        height=1600,
+        scrolling=False,
+    )
+
+
 def _render_image_project() -> None:
+    # #region debug-point A:render-image-project
+    _dbg_open_project_layout("A", "pre-fix", "app.py:_render_image_project", "[DEBUG] render image project page", {"session": str(st.session_state.get("session_id", "")), "project_type": str(st.session_state.get("project_type", "")), "query": dict(st.query_params) if hasattr(st, "query_params") else {}, "workspace": str(_session_workspace())})
+    # #endregion
     inject_teachable_style()
-    st.markdown('<div class="tm-title">Image Project</div>', unsafe_allow_html=True)
-    nav_left, nav_right = st.columns([1, 4])
-    with nav_left:
-        if st.button("← Back"):
-            _reset_session_workspace()
+    controller = _get_record_controller()
+    webcam_options = _list_camera_options()
+    preferred_webcam_index = _preferred_webcam_index(webcam_options)
+    current_webcam_label = next((str(item.get("label", "")) for item in webcam_options if int(item.get("index", 0)) == int(st.session_state.tm_webcam_index)), "")
+    if (not st.session_state.get("tm_webcam_user_selected", False)) and webcam_options:
+        st.session_state.tm_webcam_index = int(preferred_webcam_index)
+    elif webcam_options and _is_virtual_camera_label(current_webcam_label):
+        st.session_state.tm_webcam_index = int(preferred_webcam_index)
+    serial_ports = [
+        {
+            "device": p.device,
+            "label": f"{p.device} - {p.description}" if p.description else p.device,
+        }
+        for p in list_serial_ports()
+        if _is_likely_user_serial_port(p.device, p.description)
+    ]
+    controller.set_config(
+        st.session_state.session_id,
+        SessionConfig(
+            dataset_root=_tm_dataset_dir(),
+            serial_port=st.session_state.tm_serial_port,
+            serial_baud=int(st.session_state.tm_serial_baud),
+            serial_sync=str(st.session_state.tm_serial_sync),
+            webcam_index=int(st.session_state.tm_webcam_index),
+            fps=float(st.session_state.tm_record_fps),
+            crop_box=st.session_state.tm_record_crop_box,
+        ),
+    )
+
+    classes = list(st.session_state.tm_classes) if st.session_state.tm_classes else ["Class 1", "Class 2"]
+    if len(classes) == 1:
+        classes = classes + ["Class 2"]
+    disk_classes = _tm_load_classes_meta()
+    if disk_classes:
+        classes = disk_classes
+    else:
+        _tm_save_classes_meta(classes)
+    st.session_state.tm_classes = classes
+
+    action = _tm_get_query_param("tm_action").strip()
+    notice = ""
+    #region debug-point B:action-entry
+    _dbg_capture_webcam_source("B", "pre-fix", "app.py:_render_image_project", "[DEBUG] tm_action received", {"action": action, "query": dict(st.query_params) if hasattr(st, "query_params") else {}, "tm_open_source_class": st.session_state.get("tm_open_source_class", ""), "tm_open_source_kind": st.session_state.get("tm_open_source_kind", ""), "tm_webcam_index": st.session_state.get("tm_webcam_index", 0)})
+    #endregion
+    if action:
+        if action == "home":
+            # #region debug-point B:action-home
+            _dbg_open_project_layout("B", "pre-fix", "app.py:_render_image_project", "[DEBUG] action home triggered", {"session": str(st.session_state.get("session_id", "")), "query_before_clear": dict(st.query_params) if hasattr(st, "query_params") else {}, "project_type_before": str(st.session_state.get("project_type", ""))})
+            # #endregion
+            st.session_state.tm_open_source_class = ""
+            st.session_state.tm_open_source_kind = ""
+            st.session_state.tm_frontend_notice = ""
+            st.session_state.project_type = None
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "addclass":
+            st.session_state.tm_classes = classes + [_next_class_name(classes)]
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "delete":
+            try:
+                idx = int(_tm_get_query_param("idx") or "-1")
+            except Exception:
+                idx = -1
+            if 0 <= idx < len(classes) and len(classes) > 1:
+                _remove_tm_class(classes[idx])
+                st.session_state.tm_classes = [c for i, c in enumerate(classes) if i != idx]
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "rename":
+            try:
+                idx = int(_tm_get_query_param("idx") or "-1")
+            except Exception:
+                idx = -1
+            new_name = _tm_get_query_param("name").strip()
+            if 0 <= idx < len(classes) and new_name:
+                edited = list(classes)
+                edited[idx] = new_name
+                updated = _apply_tm_class_names(classes, edited)
+                st.session_state.tm_classes = updated
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "set_serial_port":
+            st.session_state.tm_serial_port = _tm_get_query_param("serial_port").strip()
+            st.session_state.tm_open_source_class = _tm_get_query_param("open_class").strip()
+            st.session_state.tm_open_source_kind = _tm_get_query_param("open_kind").strip()
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "set_webcam_index":
+            try:
+                st.session_state.tm_webcam_index = int(float(_tm_get_query_param("webcam_index") or st.session_state.tm_webcam_index))
+                st.session_state.tm_webcam_user_selected = True
+            except Exception:
+                pass
+            st.session_state.tm_open_source_class = _tm_get_query_param("open_class").strip()
+            st.session_state.tm_open_source_kind = _tm_get_query_param("open_kind").strip()
+            #region debug-point D:set-webcam-index
+            _dbg_capture_webcam_source("D", "pre-fix", "app.py:_render_image_project", "[DEBUG] webcam index updated from action", {"tm_webcam_index": st.session_state.tm_webcam_index, "tm_open_source_class": st.session_state.tm_open_source_class, "tm_open_source_kind": st.session_state.tm_open_source_kind})
+            #endregion
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "open_source":
+            st.session_state.tm_open_source_class = _tm_get_query_param("open_class").strip()
+            st.session_state.tm_open_source_kind = _tm_get_query_param("open_kind").strip()
+            st.session_state.tm_frontend_notice = _tm_get_query_param("notice").strip()
+            #region debug-point B:open-source-action
+            _dbg_capture_webcam_source("B", "pre-fix", "app.py:_render_image_project", "[DEBUG] open_source action applied", {"tm_open_source_class": st.session_state.tm_open_source_class, "tm_open_source_kind": st.session_state.tm_open_source_kind, "tm_frontend_notice": st.session_state.tm_frontend_notice})
+            #endregion
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "close_source":
+            st.session_state.tm_open_source_class = ""
+            st.session_state.tm_open_source_kind = ""
+            _tm_clear_query_params()
+            st.rerun()
+        if action == "advanced":
+            cfg = st.session_state.train_cfg
+            try:
+                batch_size = max(1, int(float(_tm_get_query_param("batch_size") or cfg.batch_size)))
+                epochs = max(1, int(float(_tm_get_query_param("epochs") or cfg.epochs)))
+                validation_split = float(_tm_get_query_param("validation_split") or cfg.validation_split)
+                learning_rate = float(_tm_get_query_param("learning_rate") or cfg.learning_rate)
+                conv1_filters = max(1, int(float(_tm_get_query_param("conv1_filters") or cfg.conv1_filters)))
+                conv2_filters = max(1, int(float(_tm_get_query_param("conv2_filters") or cfg.conv2_filters)))
+                dense_units = max(1, int(float(_tm_get_query_param("dense_units") or cfg.dense_units)))
+            except Exception:
+                notice = "Invalid advanced settings."
+            else:
+                st.session_state.train_cfg = TrainConfig(
+                    img_size=cfg.img_size,
+                    color_mode=cfg.color_mode,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    validation_split=max(0.05, min(0.5, validation_split)),
+                    seed=cfg.seed,
+                    optimizer=cfg.optimizer,
+                    learning_rate=max(0.00001, learning_rate),
+                    conv1_filters=conv1_filters,
+                    conv2_filters=conv2_filters,
+                    dense_units=dense_units,
+                    representative_samples=cfg.representative_samples,
+                )
+                notice = "Advanced settings updated."
+            _tm_clear_query_params()
             st.rerun()
 
-    left, mid, right = st.columns([2.3, 1.2, 2.1], gap="large")
-    with left:
-        _render_tm_class_panel()
-    with mid:
-        _render_tm_train_panel()
-    with right:
-        _render_tm_preview_export_panel()
+    counts: Dict[str, int] = {}
+    empty_classes: List[str] = []
+    total_samples = 0
+    for name in classes:
+        class_dir = _tm_dataset_dir() / sanitize_class_name(name)
+        n = len(_tm_class_image_files(class_dir)) if class_dir.exists() else 0
+        counts[name] = n
+        total_samples += n
+        if n == 0:
+            empty_classes.append(name)
+    train_ready = len([c for c in classes if counts.get(c, 0) > 0]) >= 2 and not empty_classes and total_samples > 0
+    st.session_state.tm_train_ready = train_ready
+    if not train_ready:
+        if len(classes) < 2:
+            st.session_state.tm_train_block_reason = "Training requires at least 2 classes."
+        elif empty_classes:
+            st.session_state.tm_train_block_reason = "Each class needs at least 1 sample image."
+        else:
+            st.session_state.tm_train_block_reason = "Add sample images before training."
+    else:
+        st.session_state.tm_train_block_reason = ""
+
+    if action == "train":
+        st.session_state.tm_open_source_class = _tm_get_query_param("open_class").strip()
+        st.session_state.tm_open_source_kind = _tm_get_query_param("open_kind").strip()
+        _tm_clear_query_params()
+        notice = "Training starts in-page."
+
+    if action == "export":
+        _tm_clear_query_params()
+        meta = _tm_load_train_latest()
+        tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser().resolve() if isinstance(meta, dict) else Path()
+        labels = list(meta.get("labels") or []) if isinstance(meta, dict) else []
+        if (not meta) or (not tflite_path.exists()):
+            notice = "Train a model first."
+            st.rerun()
+        else:
+            model_name = str(st.session_state.get("tm_model_name", "model")).strip() or "model"
+            array_name = str(st.session_state.get("tm_array_name", "g_model")).strip() or "g_model"
+            export_dir = Path(st.session_state.last_export_dir).expanduser().resolve() if st.session_state.last_export_dir.strip() else _default_export_dir()
+            errors = _validate_export_inputs(export_dir, model_name, array_name, tflite_path)
+            if errors:
+                notice = errors[0]
+            else:
+                export_dir.mkdir(parents=True, exist_ok=True)
+                source_bytes = tflite_path.read_bytes()
+                from trainer import export_tflite_c_sources
+
+                src, hdr = export_tflite_c_sources(source_bytes, array_name=array_name)
+                (export_dir / f"{model_name}.tflite").write_bytes(source_bytes)
+                (export_dir / "model.h").write_text(hdr, encoding="utf-8")
+                (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
+                (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
+                notice = f"Exported to: {export_dir}"
+            st.rerun()
+
+    if action == "export_browse":
+        _tm_clear_query_params()
+        meta = _tm_load_train_latest()
+        tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser().resolve() if isinstance(meta, dict) else Path()
+        labels = list(meta.get("labels") or []) if isinstance(meta, dict) else []
+        if (not meta) or (not tflite_path.exists()):
+            notice = "Train a model first."
+            st.rerun()
+        picked = _pick_directory_dialog(initial_dir=str(st.session_state.last_export_dir or ""))
+        if picked:
+            st.session_state.last_export_dir = str(picked)
+        model_name = str(st.session_state.get("tm_model_name", "model")).strip() or "model"
+        array_name = str(st.session_state.get("tm_array_name", "g_model")).strip() or "g_model"
+        export_dir = Path(st.session_state.last_export_dir).expanduser().resolve() if st.session_state.last_export_dir.strip() else _default_export_dir()
+        errors = _validate_export_inputs(export_dir, model_name, array_name, tflite_path)
+        if errors:
+            notice = errors[0]
+        else:
+            export_dir.mkdir(parents=True, exist_ok=True)
+            source_bytes = tflite_path.read_bytes()
+            from trainer import export_tflite_c_sources
+
+            src, hdr = export_tflite_c_sources(source_bytes, array_name=array_name)
+            (export_dir / f"{model_name}.tflite").write_bytes(source_bytes)
+            (export_dir / "model.h").write_text(hdr, encoding="utf-8")
+            (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
+            (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
+            notice = f"Exported to: {export_dir}"
+        st.rerun()
+
+    export_enabled = _tm_load_train_latest() is not None
+    if not notice:
+        notice = str(st.session_state.get("tm_frontend_notice", "") or "")
+    st.session_state.tm_frontend_notice = ""
+    sample_previews = _tm_sample_previews(classes)
+    initial_open_source_class = str(st.session_state.get("tm_open_source_class", "") or "")
+    initial_open_source_kind = str(st.session_state.get("tm_open_source_kind", "") or "")
+    _render_tm_old_frontend_html(
+        port=int(controller.port),
+        session_id=str(st.session_state.session_id),
+        classes=classes,
+        counts=counts,
+        train_enabled=train_ready,
+        export_enabled=export_enabled,
+        notice=notice,
+        train_cfg=st.session_state.train_cfg,
+        serial_ports=serial_ports,
+        current_serial_port=str(st.session_state.tm_serial_port),
+        current_serial_baud=int(st.session_state.tm_serial_baud),
+        current_serial_sync=str(st.session_state.tm_serial_sync),
+        webcam_options=webcam_options,
+        current_webcam_index=int(st.session_state.tm_webcam_index),
+        sample_previews=sample_previews,
+        initial_open_source_class=initial_open_source_class,
+        initial_open_source_kind=initial_open_source_kind,
+    )
+
+
+def _render_classified_import_page() -> None:
+    # #region debug-point B:render-classified-import
+    _dbg_open_project_layout("B", "pre-fix", "app.py:_render_classified_import_page", "[DEBUG] render classified import page", {"session": str(st.session_state.get("session_id", "")), "project_type": str(st.session_state.get("project_type", "")), "query": dict(st.query_params) if hasattr(st, "query_params") else {}, "local_import_path": str(st.session_state.get("local_import_path", ""))})
+    # #endregion
+    inject_teachable_style()
+    st.markdown(
+        """
+<div class="tm-hero">
+  <div class="tm-hero-copy">
+    <div class="tm-eyebrow">Start from classified class</div>
+    <h2>Import a classified image folder</h2>
+    <p>Supported layouts include <code>label/image</code> and common <code>train|val|test/label/image</code> datasets. Imported images become class samples and each label becomes a class name.</p>
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    top_left, top_right = st.columns([1, 5])
+    with top_left:
+        if st.button("← Back", key="tm_back_from_classified"):
+            _reset_session_workspace()
+            _tm_clear_query_params()
+            st.rerun()
+
+    input_left, input_right = st.columns([5, 1], vertical_alignment="bottom")
+    prior_path = str(st.session_state.local_import_path or "")
+    with input_left:
+        st.markdown('<div class="tm-classified-browse-marker"></div>', unsafe_allow_html=True)
+        path_str = st.text_input(
+            "Classified folder",
+            value=st.session_state.local_import_path,
+            placeholder="Choose a folder like label/image or train/label/image",
+        )
+        st.session_state.local_import_path = path_str
+    path_changed = str(path_str or "").strip() != str(prior_path or "").strip()
+    if path_changed:
+        st.session_state.imported = None
+        st.session_state.class_rename = {}
+    with input_right:
+        if st.button("Browse...", key="tm_pick_classified_dir"):
+            picked = _pick_directory_dialog(initial_dir=st.session_state.local_import_path)
+            if picked:
+                st.session_state.local_import_path = picked
+                st.session_state.imported = None
+                st.session_state.class_rename = {}
+                st.rerun()
+
+    path_value = str(st.session_state.local_import_path or "").strip()
+    if st.button("Load folder", type="primary", key="tm_read_classified_dir", disabled=(not path_value)):
+        p = Path(path_value).expanduser()
+        if not p.exists() or not p.is_dir():
+            st.error("Path does not exist or is not a folder.")
+            st.session_state.imported = None
+        else:
+            imported = infer_imported_data(p)
+            if not imported.class_to_images:
+                st.error("No dataset detected. Put images under label folders, or use train|val|test/label/image.")
+                st.session_state.imported = None
+            elif not imported.classified:
+                st.error("This folder is not a supported classified dataset. Use label/image or train|val|test/label/image.")
+                st.session_state.imported = None
+            else:
+                st.session_state.imported = imported
+                st.session_state.class_rename = {name: name for name in imported.class_to_images.keys()}
+                st.rerun()
+
+    imported = st.session_state.imported
+    if imported is None or not imported.classified:
+        return
+
+    _render_overview(imported)
+    st.markdown("### Rename classes")
+    rename: Dict[str, str] = {}
+    for class_name, images in imported.class_to_images.items():
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            rename[class_name] = st.text_input(
+                f"{class_name} name",
+                value=st.session_state.class_rename.get(class_name, class_name),
+                key=f"tm_classified_rename_{class_name}",
+                label_visibility="collapsed",
+            )
+        with c2:
+            st.markdown(
+                f'<div class="{_status_style("ready")}">{len(images)} samples</div>',
+                unsafe_allow_html=True,
+            )
+    st.session_state.class_rename = rename
+
+    if st.button("Import to workspace", type="primary", key="tm_import_classified_workspace"):
+        try:
+            class_names = _import_classified_into_workspace(imported, rename)
+        except Exception as e:
+            st.error(str(e))
+            return
+        # #region debug-point B:classified-import-to-workspace
+        _dbg_open_project_layout("B", "pre-fix", "app.py:_render_classified_import_page", "[DEBUG] classified import to workspace", {"session": str(st.session_state.get("session_id", "")), "class_names": list(class_names or []), "query_before": dict(st.query_params) if hasattr(st, "query_params") else {}})
+        # #endregion
+        st.session_state.tm_classes = class_names or ["Class 1"]
+        st.session_state.dataset_dir = str(_tm_dataset_dir())
+        st.session_state.imported = None
+        st.session_state.project_type = "image"
+        _tm_set_query_params(tm_project="image", tm_session=st.session_state.session_id)
+        st.rerun()
 
 
 def _tm_dataset_dir() -> Path:
@@ -528,13 +5312,13 @@ def _render_crop_ui() -> None:
     try:
         from streamlit_drawable_canvas import st_canvas
     except Exception:
-        st.error("缺少依赖 streamlit-drawable-canvas，无法使用框选裁剪模式")
+        st.error("Missing dependency streamlit-drawable-canvas. ROI crop mode is unavailable.")
         return
 
     import io
     from PIL import Image
 
-    st.subheader("Crop 区域（框选）")
+    st.subheader("Crop region (ROI)")
     png_bytes = st.session_state.tm_pending_image
     class_name = st.session_state.tm_pending_class
     im = Image.open(io.BytesIO(png_bytes)).convert("RGB")
@@ -563,21 +5347,21 @@ def _render_crop_ui() -> None:
 
     col_a, col_b, col_c = st.columns([1, 1, 3])
     with col_a:
-        if st.button("取消", key="crop_cancel"):
+        if st.button("Cancel", key="crop_cancel"):
             st.session_state.tm_pending_image = None
             st.session_state.tm_pending_class = None
             st.rerun()
     with col_b:
-        if st.button("确认保存", type="primary", key="crop_confirm"):
+        if st.button("Save", type="primary", key="crop_confirm"):
             if rect is None:
-                st.error("请先画一个矩形框")
+                st.error("Draw a rectangle first.")
                 return
             left = int(rect.get("left", 0))
             top = int(rect.get("top", 0))
             rw = int(rect.get("width", 0))
             rh = int(rect.get("height", 0))
             if rw <= 1 or rh <= 1:
-                st.error("框选区域太小")
+                st.error("ROI is too small.")
                 return
             x1 = int(left / scale)
             y1 = int(top / scale)
@@ -593,35 +5377,17 @@ def _render_crop_ui() -> None:
             st.session_state.tm_pending_class = None
             st.rerun()
 
-    st.caption(f"原图：{w}x{h}，输出：96x96x1")
+    st.caption(f"Input: {w}x{h}  →  Output: 96x96x1")
 
 
 def _render_tm_class_panel() -> None:
-    st.markdown("### Classes")
-
-    mode = st.radio("输入模式", ["原图缩放到 96x96x1", "框选 ROI 后缩放到 96x96x1"], horizontal=False)
-    st.session_state.tm_crop_mode = "roi" if "ROI" in mode else "full"
-
-    with st.expander("Bulk import（可选）", expanded=False):
-        _render_import_panel()
-        imported = st.session_state.imported
-        if imported is not None:
-            _render_overview(imported)
-            out: Optional[Path]
-            if imported.classified:
-                out = _render_classified_flow(imported)
-            else:
-                out = _render_unclassified_flow(imported)
-            if out is not None:
-                st.session_state.dataset_dir = str(out)
-
     _render_crop_ui()
-
-    classes_txt = st.text_area("Class 列表（每行一个）", value="\n".join(st.session_state.tm_classes), height=120, key="tm_class_list")
-    classes = [x.strip() for x in classes_txt.splitlines() if x.strip()]
-    if not classes:
-        classes = ["Class 1"]
-    st.session_state.tm_classes = classes
+    classes = list(st.session_state.tm_classes) or ["Class 1"]
+    edited_names: List[str] = []
+    total_samples = 0
+    empty_classes: List[str] = []
+    if "tm_edit_class_idx" not in st.session_state:
+        st.session_state.tm_edit_class_idx = -1
 
     controller = _get_record_controller()
     controller.set_config(
@@ -630,6 +5396,7 @@ def _render_tm_class_panel() -> None:
             dataset_root=_tm_dataset_dir(),
             serial_port=st.session_state.tm_serial_port,
             serial_baud=int(st.session_state.tm_serial_baud),
+            serial_sync=str(st.session_state.tm_serial_sync),
             webcam_index=int(st.session_state.tm_webcam_index),
             fps=float(st.session_state.tm_record_fps),
             crop_box=st.session_state.tm_record_crop_box,
@@ -637,74 +5404,201 @@ def _render_tm_class_panel() -> None:
     )
 
     for idx, name in enumerate(classes):
-        st.markdown(f"#### {name}")
         class_dir = _tm_dataset_dir() / sanitize_class_name(name)
-        samples = sorted([p for p in class_dir.glob("*.png")]) if class_dir.exists() else []
-        st.write({"samples": len(samples)})
+        samples = _tm_class_image_files(class_dir)
+        total_samples += len(samples)
+        if len(samples) == 0:
+            empty_classes.append(name)
+        with st.container():
+            st.markdown('<div class="tm-class-card-marker"></div>', unsafe_allow_html=True)
+            editing = int(st.session_state.tm_edit_class_idx) == idx
+            head_a, head_b, head_c = st.columns([5.6, 0.65, 0.75])
+            with head_a:
+                if editing:
+                    st.markdown('<div class="tm-class-title-field">', unsafe_allow_html=True)
+                    edited_name = st.text_input(
+                        f"class-name-{idx}",
+                        value=name,
+                        key=f"tm_class_name_{idx}",
+                        label_visibility="collapsed",
+                        placeholder=f"Class {idx + 1}",
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        f'<div class="tm-class-title-text"><h3>{html_escape(name)}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
+                    edited_name = name
+                edited_names.append(edited_name)
+            with head_b:
+                if editing:
+                    if st.button("✓", key=f"tm_done_edit_{idx}", use_container_width=True):
+                        st.session_state.tm_edit_class_idx = -1
+                        st.rerun()
+                else:
+                    if st.button("✎", key=f"tm_edit_{idx}", use_container_width=True):
+                        st.session_state.tm_edit_class_idx = idx
+                        st.rerun()
+            with head_c:
+                delete_disabled = len(classes) <= 1
+                st.markdown('<div class="tm-class-menu">', unsafe_allow_html=True)
+                with st.popover("⋮", use_container_width=True):
+                    if st.button("Delete class", key=f"tm_delete_class_{idx}", use_container_width=True, disabled=delete_disabled):
+                        _remove_tm_class(name)
+                        st.session_state.tm_classes = [item for item in classes if item != name]
+                        st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown('<div class="tm-class-divider"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="tm-class-subhead">Add Image Samples:</div>', unsafe_allow_html=True)
 
-        upload = st.file_uploader("Upload", type=["png", "jpg", "jpeg", "bmp", "webp"], accept_multiple_files=True, key=f"tm_up_{idx}")
-        if upload:
-            for f in upload:
-                png = _img_to_png_bytes(f.getvalue())
-                if st.session_state.tm_crop_mode == "roi":
-                    st.session_state.tm_pending_image = png
-                    st.session_state.tm_pending_class = name
-                    st.rerun()
-                out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
-                _save_sample_png(name, out_png)
+            btn_a, btn_b, btn_c = st.columns(3, gap="small")
+            with btn_a:
+                with st.popover("▢\nWebcam", use_container_width=True):
+                    permission = ensure_camera_access(int(st.session_state.tm_webcam_index))
+                    st.session_state.tm_camera_permission_status = permission.status
+                    st.session_state.tm_camera_permission_note = permission.message
+                    st.session_state.tm_camera_permission_class = name
+                    if not permission.allowed:
+                        st.markdown(
+                            f'<div class="tm-camera-note">{html_escape(permission.message)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        cam = st.camera_input("Webcam", key=f"tm_cam_{idx}", label_visibility="collapsed")
+                        if cam is not None:
+                            png = _img_to_png_bytes(cam.getvalue())
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            _save_sample_png(name, out_png)
+                            st.rerun()
+            with btn_b:
+                with st.popover("▦\nDevice", use_container_width=True):
+                    up = st.file_uploader(
+                        "Device image",
+                        type=["png", "jpg", "jpeg", "bmp", "webp"],
+                        accept_multiple_files=True,
+                        key=f"tm_device_up_{idx}",
+                        label_visibility="collapsed",
+                    )
+                    if up:
+                        for f in up:
+                            png = _img_to_png_bytes(f.getvalue())
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            _save_sample_png(name, out_png)
+                        st.rerun()
+            with btn_c:
+                st.markdown('<div class="tm-class-upload">', unsafe_allow_html=True)
+                with st.popover("⇧\nUpload", use_container_width=True):
+                    upload = st.file_uploader(
+                        "Upload",
+                        type=["png", "jpg", "jpeg", "bmp", "webp"],
+                        accept_multiple_files=True,
+                        key=f"tm_up_{idx}",
+                        label_visibility="collapsed",
+                    )
+                    if upload:
+                        for f in upload:
+                            png = _img_to_png_bytes(f.getvalue())
+                            if st.session_state.tm_crop_mode == "roi":
+                                st.session_state.tm_pending_image = png
+                                st.session_state.tm_pending_class = name
+                                st.rerun()
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            _save_sample_png(name, out_png)
+                        st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            if (
+                st.session_state.tm_camera_permission_note
+                and st.session_state.tm_camera_permission_class == name
+                and st.session_state.tm_camera_permission_status
+                not in {"granted", "not_required"}
+            ):
+                st.markdown(
+                    f'<div class="tm-camera-note">{html_escape(st.session_state.tm_camera_permission_note)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    if edited_names != classes:
+        try:
+            updated_names = _apply_tm_class_names(classes, edited_names)
+        except Exception as e:
+            st.error(str(e))
+        else:
+            if updated_names != classes:
+                name_map = {old: new for old, new in zip(classes, updated_names)}
+                st.session_state.tm_classes = updated_names
+                for key in ("tm_capture_class", "tm_camera_permission_class", "tm_pending_class"):
+                    current = st.session_state.get(key)
+                    if current in name_map:
+                        st.session_state[key] = name_map[current]
+                st.rerun()
+
+    with st.container():
+        st.markdown('<div class="tm-add-class-marker"></div>', unsafe_allow_html=True)
+        if st.button("⊞ Add a class", key="tm_add_class", use_container_width=True):
+            st.session_state.tm_classes = classes + [_next_class_name(classes)]
             st.rerun()
+    st.session_state.tm_crop_mode = "full"
 
-        btn_a, btn_b, btn_c, btn_d = st.columns([1, 1, 1, 3])
-        with btn_a:
-            if st.button("Webcam", key=f"tm_open_webcam_{idx}"):
-                st.session_state.tm_capture_open = True
-                st.session_state.tm_capture_source = "webcam"
-                st.session_state.tm_capture_class = name
-                st.rerun()
-        with btn_b:
-            if st.button("Device", key=f"tm_open_device_{idx}"):
-                st.session_state.tm_capture_open = True
-                st.session_state.tm_capture_source = "device"
-                st.session_state.tm_capture_class = name
-                st.rerun()
-        with btn_c:
-            if st.button("Close", key=f"tm_close_capture_{idx}"):
-                if st.session_state.tm_capture_class == name:
-                    st.session_state.tm_capture_open = False
-                    st.session_state.tm_capture_source = ""
-                    st.session_state.tm_capture_class = ""
-                    st.rerun()
-        with btn_d:
-            if samples:
-                st.image([str(p) for p in samples[-6:]], width=64)
-
-        if st.session_state.tm_capture_open and st.session_state.tm_capture_class == name:
-            _render_hold_capture_panel(controller, name)
+    non_empty_classes = [c for c in classes if c not in empty_classes]
+    train_ready = len(non_empty_classes) >= 2 and not empty_classes and total_samples > 0
+    st.session_state.tm_total_classes = len(classes)
+    st.session_state.tm_total_samples = total_samples
+    st.session_state.tm_train_ready = train_ready
+    if not train_ready:
+        if len(classes) < 2:
+            st.session_state.tm_train_block_reason = "Training requires at least 2 classes."
+        elif empty_classes:
+            st.session_state.tm_train_block_reason = "Each class needs at least 1 sample image."
+        else:
+            st.session_state.tm_train_block_reason = "Add sample images before training."
+    else:
+        st.session_state.tm_train_block_reason = ""
 
 
-def _render_hold_capture_panel(controller: RecordController, class_name: str) -> None:
+def _render_hold_capture_panel(controller: RecordController, class_name: str, samples: List[Path]) -> None:
     from urllib.parse import quote
 
     source = st.session_state.tm_capture_source
-    st.markdown('<div class="tm-panel">', unsafe_allow_html=True)
-    st.markdown(f"**{source.upper()}**", unsafe_allow_html=True)
+    st.markdown('<div class="tm-panel tm-capture-panel">', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+<div class="tm-capture-head">
+  <strong>{html_escape(source.title())}</strong>
+  <span class="{_status_style('ready')}">Live</span>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     preview: Optional[bytes] = None
     if source == "device":
-        preview = controller.preview_serial_png(st.session_state.tm_serial_port, int(st.session_state.tm_serial_baud))
+        preview = controller.preview_serial_png(
+            st.session_state.tm_serial_port,
+            int(st.session_state.tm_serial_baud),
+            str(st.session_state.tm_serial_sync),
+        )
         if preview is None:
-            st.warning("无法预览设备画面，请确认串口与波特率")
+            st.warning("Unable to preview device stream. Check serial port and baudrate.")
     elif source == "webcam":
+        permission = ensure_camera_access(int(st.session_state.tm_webcam_index))
+        st.session_state.tm_camera_permission_status = permission.status
+        st.session_state.tm_camera_permission_note = permission.message
+        if not permission.allowed:
+            st.error(permission.message)
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
         preview = controller.preview_webcam_png(int(st.session_state.tm_webcam_index))
         if preview is None:
-            st.warning("无法预览摄像头画面，请检查系统权限/摄像头是否被占用")
+            st.warning("Unable to preview webcam. Check system permission or whether the camera is in use.")
 
     crop_box: Optional[Tuple[int, int, int, int]] = None
     if st.session_state.tm_crop_mode == "roi" and preview is not None:
         try:
             from streamlit_drawable_canvas import st_canvas
         except Exception:
-            st.error("缺少依赖 streamlit-drawable-canvas，无法使用框选裁剪模式")
+            st.error("Missing dependency streamlit-drawable-canvas. ROI crop mode is unavailable.")
         else:
             import io
             from PIL import Image
@@ -744,136 +5638,105 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str) ->
                         crop_box = (x1, y1, x2, y2)
                         st.session_state.tm_record_crop_box = crop_box
 
-    if preview is not None:
-        st.image(preview, use_container_width=True)
+    capture_left, capture_right = st.columns([1.05, 1.05], gap="small")
+    with capture_left:
+        st.markdown('<div class="tm-capture-stage">', unsafe_allow_html=True)
+        if preview is not None:
+            st.image(preview, use_container_width=True)
+        st.session_state.tm_record_fps = st.slider("FPS", min_value=1.0, max_value=20.0, value=float(st.session_state.tm_record_fps), step=1.0)
 
-    st.session_state.tm_record_fps = st.slider("Record FPS", min_value=1.0, max_value=20.0, value=float(st.session_state.tm_record_fps), step=1.0)
-
-    base = f"http://127.0.0.1:{controller.port}"
-    q_class = quote(class_name)
-    q_sess = quote(st.session_state.session_id)
-    q_source = quote(source)
-    start_url = f"{base}/start?session={q_sess}&source={q_source}&class={q_class}"
-    stop_url = f"{base}/stop?session={q_sess}"
-    html = make_hold_button_html("Hold to record", start_url=start_url, stop_url=stop_url)
-    components.html(html, height=110)
+        base = f"http://127.0.0.1:{controller.port}"
+        q_class = quote(class_name)
+        q_sess = quote(st.session_state.session_id)
+        q_source = quote(source)
+        start_url = f"{base}/start?session={q_sess}&source={q_source}&class={q_class}"
+        stop_url = f"{base}/stop?session={q_sess}"
+        html = make_hold_button_html("Hold to Record", start_url=start_url, stop_url=stop_url)
+        components.html(html, height=88)
+        st.markdown("</div>", unsafe_allow_html=True)
+    with capture_right:
+        st.markdown('<div class="tm-capture-side-head">Samples</div>', unsafe_allow_html=True)
+        if samples:
+            st.image([str(p) for p in samples[-6:]], width=72)
+        else:
+            st.markdown('<div class="tm-preview-note">No samples yet.</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_tm_train_panel() -> None:
-    st.markdown("### Training")
-
-    with st.expander("Advanced", expanded=False):
-        st.session_state.train_cfg = _render_train_config(st.session_state.train_cfg)
-
     dataset_dir = _tm_dataset_dir()
-    st.write({"dataset": str(dataset_dir)})
-    if st.button("Train Model", type="primary"):
-        st.session_state.export_validated_token = ""
-        runs_dir = APP_DATA_DIR / "runs"
-        run_dir = new_run_dir(runs_dir)
-        cfg = st.session_state.train_cfg
-        cfg = TrainConfig(
-            img_size=96,
-            color_mode="grayscale",
-            batch_size=cfg.batch_size,
-            epochs=cfg.epochs,
-            validation_split=cfg.validation_split,
-            seed=cfg.seed,
-            optimizer=cfg.optimizer,
-            learning_rate=cfg.learning_rate,
-            conv1_filters=cfg.conv1_filters,
-            conv2_filters=cfg.conv2_filters,
-            dense_units=cfg.dense_units,
-            representative_samples=cfg.representative_samples,
-        )
-        st.session_state.train_cfg = cfg
-        with st.spinner("训练与导出 TFLite（int8）中..."):
-            result = train_and_export(
-                dataset_dir=dataset_dir,
-                run_dir=run_dir,
-                cfg=cfg,
-                model_base_name="model",
-                array_name="g_model",
+    train_ready = bool(st.session_state.get("tm_train_ready", False))
+    train_reason = str(st.session_state.get("tm_train_block_reason", "")).strip()
+    with st.container():
+        st.markdown('<div class="tm-train-card-marker"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="tm-card-head"><h3>Training</h3></div>', unsafe_allow_html=True)
+        if st.button("Train Embedded Model", type="primary", key="tm_train_primary", use_container_width=True, disabled=not train_ready):
+            if not train_ready:
+                return
+            st.session_state.export_validated_token = ""
+            runs_dir = APP_DATA_DIR / "runs"
+            run_dir = new_run_dir(runs_dir)
+            cfg = st.session_state.train_cfg
+            cfg = TrainConfig(
+                img_size=96,
+                color_mode="grayscale",
+                batch_size=cfg.batch_size,
+                epochs=cfg.epochs,
+                validation_split=cfg.validation_split,
+                seed=cfg.seed,
+                optimizer=cfg.optimizer,
+                learning_rate=cfg.learning_rate,
+                conv1_filters=cfg.conv1_filters,
+                conv2_filters=cfg.conv2_filters,
+                dense_units=cfg.dense_units,
+                representative_samples=cfg.representative_samples,
             )
-        st.session_state.train_result = result
-        st.success(f"训练完成：val_acc={result.metrics.get('val_accuracy'):.4f}")
-
+            st.session_state.train_cfg = cfg
+            with st.spinner("Training and exporting int8 TFLite..."):
+                result = train_and_export(
+                    dataset_dir=dataset_dir,
+                    run_dir=run_dir,
+                    cfg=cfg,
+                    model_base_name="model",
+                    array_name="g_model",
+                )
+            st.session_state.train_result = result
+        with st.popover("Advanced ▾", use_container_width=True):
+            st.session_state.train_cfg = _render_train_config(st.session_state.train_cfg)
 
 def _render_tm_preview_export_panel() -> None:
-    st.markdown("### Preview")
-    st.session_state.tm_webcam_index = st.selectbox("Webcam", options=[0, 1, 2], index=[0, 1, 2].index(int(st.session_state.tm_webcam_index)) if int(st.session_state.tm_webcam_index) in [0, 1, 2] else 0)
-    ports = list_serial_ports()
-    port_labels = [f"{p.device} ({p.description})" if p.description else p.device for p in ports]
-    port_values = [p.device for p in ports]
-    selected = st.selectbox(
-        "Serial Port",
-        options=[""] + port_values,
-        format_func=lambda v: "请选择..." if v == "" else port_labels[port_values.index(v)],
-        index=([""] + port_values).index(st.session_state.tm_serial_port) if st.session_state.tm_serial_port in ([""] + port_values) else 0,
-    )
-    st.session_state.tm_serial_port = selected
-    st.session_state.tm_serial_baud = st.selectbox("Baudrate", options=[115200, 921600], index=0 if int(st.session_state.tm_serial_baud) == 115200 else 1)
-
-    if st.button("Test Capture", key="tm_test_capture"):
-        if not st.session_state.tm_serial_port:
-            st.error("请先选择串口")
-        else:
-            try:
-                png = read_frame_png_from_serial(
-                    port=st.session_state.tm_serial_port,
-                    baud=int(st.session_state.tm_serial_baud),
-                    timeout_s=3.0,
-                )
-                st.session_state.tm_last_device_frame = png
-                st.success("捕获成功")
-            except Exception as e:
-                st.error(str(e))
-
-    if st.session_state.tm_last_device_frame:
-        st.image(st.session_state.tm_last_device_frame, caption="Device frame (96x96)", use_container_width=True)
-    else:
-        st.info("选择串口并 Test Capture，或在左侧打开 Webcam/Device 面板录制。")
-
-    st.markdown("### Export")
     result = st.session_state.train_result
+    with st.container():
+        st.markdown('<div class="tm-preview-card-marker"></div>', unsafe_allow_html=True)
+        head_left, head_right = st.columns([1.55, 1.05])
+        with head_left:
+            st.markdown('<div class="tm-card-head"><h3>Preview</h3></div>', unsafe_allow_html=True)
+        with head_right:
+            export_clicked = st.button(
+                "⇪ Export Model",
+                key="tm_export_primary",
+                disabled=result is None,
+                use_container_width=True,
+            )
+
+        if result is None:
+            st.markdown(
+                '<div class="tm-card-note">You must train a model on the left before you can preview it here.</div>',
+                unsafe_allow_html=True,
+            )
+        elif st.session_state.tm_last_device_frame:
+            st.image(st.session_state.tm_last_device_frame, use_container_width=True)
+        else:
+            st.markdown('<div class="tm-card-note">Model ready.</div>', unsafe_allow_html=True)
+
     if result is None:
-        st.info("Train a model before you can export.")
         return
 
-    export_left, export_right = st.columns([4, 1])
-    with export_left:
-        export_dir_str = st.text_input(
-            "导出到目录（默认：Documents/TFLiteTraining/exports）",
-            value=st.session_state.last_export_dir,
-        )
-        st.session_state.last_export_dir = export_dir_str
-    with export_right:
-        if st.button("浏览...", key="tm_browse_export_dir"):
-            picked = _pick_directory_dialog(initial_dir=st.session_state.last_export_dir)
-            if picked:
-                st.session_state.last_export_dir = picked
-                st.rerun()
-
-    model_name = st.text_input("模型文件名前缀", value="model", key="tm_model_name")
-    array_name = st.text_input("C 数组名", value="g_model", key="tm_array_name")
-
+    model_name = str(st.session_state.get("tm_model_name", "model")).strip() or "model"
+    array_name = str(st.session_state.get("tm_array_name", "g_model")).strip() or "g_model"
     export_dir = Path(st.session_state.last_export_dir).expanduser().resolve() if st.session_state.last_export_dir.strip() else _default_export_dir()
     current_token = f"{export_dir}|{model_name}|{array_name}"
-    validated = st.session_state.export_validated_token == current_token
-
-    st.markdown("#### 验证")
-    if st.button("Validate", key="tm_validate"):
-        errors = _validate_export_inputs(export_dir, model_name, array_name, result.tflite_path)
-        if errors:
-            st.session_state.export_validated_token = ""
-            st.error("\n".join(errors))
-        else:
-            st.session_state.export_validated_token = current_token
-            st.success("验证通过，可以导出了")
-            st.rerun()
-
-    if st.button("Export Model", type="primary", key="tm_export", disabled=not validated):
+    if export_clicked:
         errors = _validate_export_inputs(export_dir, model_name, array_name, result.tflite_path)
         if errors:
             st.session_state.export_validated_token = ""
@@ -889,12 +5752,7 @@ def _render_tm_preview_export_panel() -> None:
         (export_dir / "model.h").write_text(hdr, encoding="utf-8")
         (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
         (export_dir / "labels.txt").write_text("\n".join(result.labels) + "\n", encoding="utf-8")
-        st.success(f"已导出到：{export_dir}")
-
-    if st.button("Back to Train", key="tm_back_train"):
-        st.session_state.train_result = None
-        st.session_state.export_validated_token = ""
-        st.rerun()
+        st.success(f"Exported to: {export_dir}")
 
 
 def main() -> None:
@@ -907,8 +5765,10 @@ def main() -> None:
 
     if st.session_state.project_type == "image":
         _render_image_project()
+    elif st.session_state.project_type == "image_classified_import":
+        _render_classified_import_page()
     else:
-        st.warning("该项目类型暂未实现")
+        st.warning("This project type is not implemented yet.")
 
 
 if __name__ == "__main__":

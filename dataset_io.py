@@ -11,6 +11,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
+COMMON_SPLIT_NAMES = {
+    "train",
+    "training",
+    "val",
+    "valid",
+    "validation",
+    "test",
+    "testing",
+}
 
 
 @dataclass(frozen=True)
@@ -91,10 +100,56 @@ def _infer_class_to_images_by_subdirs(root_dir: Path) -> Dict[str, List[Path]]:
     return class_to_images
 
 
+def _infer_class_to_images_by_split_dirs(root_dir: Path) -> Dict[str, List[Path]]:
+    class_to_images: Dict[str, List[Path]] = {}
+    if not root_dir.exists():
+        return class_to_images
+
+    split_dirs = [
+        p for p in sorted(root_dir.iterdir())
+        if p.is_dir() and p.name.strip().lower() in COMMON_SPLIT_NAMES
+    ]
+    for split_dir in split_dirs:
+        for child in sorted([p for p in split_dir.iterdir() if p.is_dir()]):
+            imgs = sorted([p for p in child.rglob("*") if is_image_file(p)])
+            if not imgs:
+                continue
+            existing = class_to_images.setdefault(child.name, [])
+            existing.extend(imgs)
+
+    return {name: sorted(images) for name, images in class_to_images.items() if images}
+
+
+def _infer_class_to_images_by_nested_split_dirs(root_dir: Path) -> Dict[str, List[Path]]:
+    class_to_images: Dict[str, List[Path]] = {}
+    if not root_dir.exists():
+        return class_to_images
+
+    for child in sorted([p for p in root_dir.rglob("*") if p.is_dir()]):
+        parent_name = child.parent.name.strip().lower()
+        if parent_name not in COMMON_SPLIT_NAMES:
+            continue
+        imgs = sorted([p for p in child.rglob("*") if is_image_file(p)])
+        if not imgs:
+            continue
+        existing = class_to_images.setdefault(child.name, [])
+        existing.extend(imgs)
+
+    return {name: sorted(images) for name, images in class_to_images.items() if images}
+
+
 def infer_imported_data(root_dir: Path) -> ImportedData:
     root_dir = root_dir.resolve()
     all_images = scan_images(root_dir)
     class_to_images = _infer_class_to_images_by_subdirs(root_dir)
+    if len(class_to_images) < 2:
+        split_class_map = _infer_class_to_images_by_split_dirs(root_dir)
+        if len(split_class_map) >= 2:
+            class_to_images = split_class_map
+    if len(class_to_images) < 2:
+        nested_split_map = _infer_class_to_images_by_nested_split_dirs(root_dir)
+        if len(nested_split_map) >= 2:
+            class_to_images = nested_split_map
     root_level_images = sorted([p for p in root_dir.iterdir() if is_image_file(p)])
     classified = bool(class_to_images) and len(root_level_images) == 0
     if classified:
@@ -197,4 +252,3 @@ def export_from_assignments(
 def new_output_dir(base_dir: Path, prefix: str = "dataset") -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
     return base_dir / f"{prefix}_{ts}"
-
