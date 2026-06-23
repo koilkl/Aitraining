@@ -4,7 +4,6 @@ datasets/
 dist/
 build/
 __pycache__/
-*.spec
 .DS_Store
 /.vscode
 AItraining.code-workspace
