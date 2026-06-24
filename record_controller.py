@@ -43,6 +43,126 @@ class ExportConflictError(RuntimeError):
         super().__init__(f"Export will overwrite existing files: {preview}")
 
 
+def _pick_directory_dialog(initial_dir: Optional[str] = None) -> Optional[str]:
+    if sys.platform == "darwin":
+        try:
+            start_dir = Path(initial_dir).expanduser().resolve() if initial_dir else Path.home() / "Documents"
+        except Exception:
+            start_dir = Path.home() / "Documents"
+        try:
+            start_posix = str(start_dir).replace("\\", "\\\\").replace('"', '\\"')
+            script = (
+                'POSIX path of (choose folder with prompt "Choose Folder" '
+                f'default location (POSIX file "{start_posix}"))'
+            )
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    return picked
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.askdirectory(initialdir=initial_dir or str(Path.home() / "Documents"))
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    return picked or None
+
+
+def _pick_tmproj_save_dialog(initial_dir: Optional[str] = None, default_name: str = "project.tmproj") -> Optional[Path]:
+    if sys.platform == "darwin":
+        try:
+            script = f'POSIX path of (choose file name with prompt "Save Project" default name "{default_name}")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    p = Path(picked).expanduser()
+                    return p if p.suffix.lower() == ".tmproj" else p.with_suffix(".tmproj")
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.asksaveasfilename(
+            initialdir=initial_dir or str(Path.home() / "Documents"),
+            initialfile=default_name,
+            defaultextension=".tmproj",
+            filetypes=[("Teachable Machine Project", "*.tmproj")],
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    if not picked:
+        return None
+    p = Path(str(picked)).expanduser()
+    return p if p.suffix.lower() == ".tmproj" else p.with_suffix(".tmproj")
+
+
+def _pick_tmproj_open_dialog(initial_dir: Optional[str] = None) -> Optional[Path]:
+    if sys.platform == "darwin":
+        try:
+            script = 'POSIX path of (choose file with prompt "Open Project")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    p = Path(picked).expanduser()
+                    return p if p.suffix.lower() == ".tmproj" else None
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.askopenfilename(
+            initialdir=initial_dir or str(Path.home() / "Documents"),
+            filetypes=[("Teachable Machine Project", "*.tmproj")],
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    if not picked:
+        return None
+    p = Path(str(picked)).expanduser()
+    return p if p.suffix.lower() == ".tmproj" else None
+
+
 def _is_truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -125,8 +245,8 @@ class RecordController:
             import cv2
         except Exception:
             return None
-        cap = cv2.VideoCapture(int(webcam_index))
-        if not cap.isOpened():
+        cap, _actual_index = _open_working_camera(int(webcam_index), max_probe_index=3)
+        if cap is None:
             return None
         ok, frame = cap.read()
         cap.release()
@@ -348,21 +468,8 @@ class RecordController:
             )
             return
         if path == "/export/pick_dir":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose folder with prompt "Export folder")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                picked = (proc.stdout or "").strip()
+                picked = _pick_directory_dialog()
                 if not picked:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
@@ -372,55 +479,24 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
         if path == "/project/pick_save":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose file name with prompt "Save Project" default name "project.tmproj")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
+                picked_path = _pick_tmproj_save_dialog()
+                if picked_path is None:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
-                picked = (proc.stdout or "").strip()
-                if not picked:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                p = Path(picked).expanduser()
-                if p.suffix.lower() != ".tmproj":
-                    p = p.with_suffix(".tmproj")
+                p = Path(picked_path).expanduser()
                 _send_json(req, {"ok": "1", "save_path": str(p)}, cors=True)
                 return
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
         if path == "/project/pick_open":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose file with prompt "Open Project")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
+                picked_path = _pick_tmproj_open_dialog()
+                if picked_path is None:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
-                picked = (proc.stdout or "").strip()
-                if not picked:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                p = Path(picked).expanduser()
-                if p.suffix.lower() != ".tmproj":
-                    _send_json(req, {"ok": "0", "error": "not a .tmproj file"}, status=400, cors=True)
-                    return
+                p = Path(picked_path).expanduser()
                 _send_json(req, {"ok": "1", "open_path": str(p)}, cors=True)
                 return
             except Exception as e:
@@ -1632,16 +1708,21 @@ class RecordController:
             self._live_set(key, error="Unable to open a readable webcam stream.")
             return
         try:
+            frame_failures = 0
             while self._live_running(key):
                 ok, frame = cap.read()
                 if not ok or frame is None:
+                    frame_failures += 1
+                    if frame_failures >= 10:
+                        self._live_set(key, error="Unable to read frames from the selected webcam.")
                     time.sleep(0.08)
                     continue
+                frame_failures = 0
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 preview_frame = frame
                 try:
                     h, w = frame.shape[:2]
-                    max_w = 360
+                    max_w = 320
                     if w > max_w and h > 0:
                         scaled_h = max(1, int(h * (max_w / float(w))))
                         preview_frame = cv2.resize(frame, (max_w, scaled_h), interpolation=cv2.INTER_AREA)
@@ -1654,7 +1735,7 @@ class RecordController:
                     img = img.crop((x1, y1, x2, y2))
                 img = img.resize((96, 96))
                 self._live_set(key, preview_png=preview_png, capture_png=_to_png_bytes(img), error="")
-                time.sleep(0.06)
+                time.sleep(0.08)
         finally:
             cap.release()
 
@@ -1711,6 +1792,23 @@ class RecordController:
         with self._lock:
             return self._active.get(session_id, {}).get("recording") == "1"
 
+    def _record_frame_saved(self, session_id: str, png: bytes, class_name: str) -> None:
+        cfg = self._configs.get(session_id)
+        if cfg is None:
+            return
+        p = _save_png(cfg.dataset_root, class_name, png)
+        with self._lock:
+            cur = self._active.get(session_id)
+            if cur is not None and cur.get("recording") == "1":
+                cur["seq"] = int(cur.get("seq") or 0) + 1
+                cur["count"] = int(cur.get("count") or 0) + 1
+                cur["filename"] = str(p.name)
+                cur["image_b64"] = base64.b64encode(png).decode("ascii")
+        cond = self._record_conds.get(session_id)
+        if cond is not None:
+            with cond:
+                cond.notify_all()
+
     def _record_serial(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
         reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
         try:
@@ -1718,18 +1816,7 @@ class RecordController:
             while self._is_recording(session_id):
                 raw = reader.read_frame(timeout_s=2.0)
                 png = _raw96_to_png(raw, crop_box=cfg.crop_box)
-                p = _save_png(cfg.dataset_root, class_name, png)
-                with self._lock:
-                    cur = self._active.get(session_id)
-                    if cur is not None and cur.get("recording") == "1":
-                        cur["seq"] = int(cur.get("seq") or 0) + 1
-                        cur["count"] = int(cur.get("count") or 0) + 1
-                        cur["filename"] = str(p.name)
-                        cur["image_b64"] = base64.b64encode(png).decode("ascii")
-                cond = self._record_conds.get(session_id)
-                if cond is not None:
-                    with cond:
-                        cond.notify_all()
+                self._record_frame_saved(session_id=session_id, png=png, class_name=class_name)
                 time.sleep(interval)
         finally:
             try:
@@ -1738,7 +1825,7 @@ class RecordController:
                 pass
 
     def _record_webcam(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
-        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index))
+        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
         if not permission.allowed:
             with self._lock:
                 self._active[session_id] = {"recording": "0", "error": permission.message}
@@ -1750,8 +1837,38 @@ class RecordController:
                 self._active[session_id] = {"recording": "0", "error": "missing opencv-python"}
             return
 
-        cap = cv2.VideoCapture(int(cfg.webcam_index))
-        if not cap.isOpened():
+        # Reuse the live webcam stream when available so hold-record behaves like the original
+        # "press and hold" flow instead of fighting a second VideoCapture handle.
+        try:
+            self._ensure_live(session_id=session_id, source="webcam")
+        except Exception:
+            pass
+
+        live_deadline = time.time() + 2.0
+        last_live_png: Optional[bytes] = None
+        while self._is_recording(session_id) and time.time() < live_deadline:
+            png = self._get_live_capture(session_id=session_id, source="webcam")
+            if png:
+                last_live_png = bytes(png)
+                break
+            live_err = self._get_live_error(session_id=session_id, source="webcam")
+            if live_err:
+                break
+            time.sleep(0.05)
+
+        if last_live_png is not None:
+            while self._is_recording(session_id):
+                png = self._get_live_capture(session_id=session_id, source="webcam")
+                if png:
+                    next_png = bytes(png)
+                    if next_png != last_live_png:
+                        last_live_png = next_png
+                        self._record_frame_saved(session_id=session_id, png=next_png, class_name=class_name)
+                time.sleep(max(0.03, min(float(interval), 0.10)))
+            return
+
+        cap, _actual_index = _open_working_camera(int(cfg.webcam_index))
+        if cap is None:
             with self._lock:
                 self._active[session_id] = {"recording": "0", "error": "webcam open failed"}
             return
@@ -1768,18 +1885,7 @@ class RecordController:
                     img = img.crop((x1, y1, x2, y2))
                 img = img.resize((96, 96))
                 png = _to_png_bytes(img)
-                p = _save_png(cfg.dataset_root, class_name, png)
-                with self._lock:
-                    cur = self._active.get(session_id)
-                    if cur is not None and cur.get("recording") == "1":
-                        cur["seq"] = int(cur.get("seq") or 0) + 1
-                        cur["count"] = int(cur.get("count") or 0) + 1
-                        cur["filename"] = str(p.name)
-                        cur["image_b64"] = base64.b64encode(png).decode("ascii")
-                cond = self._record_conds.get(session_id)
-                if cond is not None:
-                    with cond:
-                        cond.notify_all()
+                self._record_frame_saved(session_id=session_id, png=png, class_name=class_name)
                 time.sleep(interval)
         finally:
             cap.release()
@@ -1890,17 +1996,54 @@ def _preview_item_payload(path: Path) -> Dict[str, str]:
 def _open_working_camera(preferred_index: int, max_probe_index: int = 3):
     import cv2
 
-    candidates = [int(preferred_index)] + [i for i in range(max_probe_index + 1) if i != int(preferred_index)]
-    for idx in candidates:
-        cap = cv2.VideoCapture(int(idx))
-        opened = bool(cap.isOpened())
+    def _prepare_capture(cap) -> None:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        except Exception:
+            pass
+
+    def _read_frame_with_warmup(cap, attempts: int = 12, wait_s: float = 0.08):
         ok = False
         frame = None
-        if opened:
+        for _ in range(max(1, int(attempts))):
             ok, frame = cap.read()
-        if opened and ok and frame is not None:
-            return cap, int(idx)
-        cap.release()
+            if ok and frame is not None:
+                return True, frame
+            time.sleep(max(0.01, float(wait_s)))
+        return False, frame
+
+    candidates = [int(preferred_index)] + [i for i in range(max_probe_index + 1) if i != int(preferred_index)]
+    backends = [None]
+    if sys.platform == "win32":
+        backends = []
+        dshow = getattr(cv2, "CAP_DSHOW", None)
+        msmf = getattr(cv2, "CAP_MSMF", None)
+        if dshow is not None:
+            backends.append(dshow)
+        if msmf is not None:
+            backends.append(msmf)
+        backends.append(None)
+    for idx in candidates:
+        for backend in backends:
+            if backend is None:
+                cap = cv2.VideoCapture(int(idx))
+            else:
+                cap = cv2.VideoCapture(int(idx), backend)
+            opened = cap.isOpened()
+            if opened:
+                _prepare_capture(cap)
+                ok, frame = _read_frame_with_warmup(cap)
+            else:
+                ok = False
+                frame = None
+            if opened and ok and frame is not None:
+                return cap, int(idx)
+            cap.release()
     return None, None
 
 

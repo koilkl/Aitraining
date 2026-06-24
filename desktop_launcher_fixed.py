@@ -1,3 +1,7 @@
+"""
+Desktop launcher - macOS style using pywebview
+Fixed for Windows to avoid recursion depth issues
+"""
 from __future__ import annotations
 
 import contextlib
@@ -11,13 +15,94 @@ import time
 import urllib.request
 from pathlib import Path
 
-# ================================
-# FIX FOR WINDOWS RECURSION ERROR!
-# Force mshtml backend instead of edgechromium
-# This fixes the "maximum recursion depth exceeded" error
-# ================================
-if sys.platform == "win32":
-    os.environ['PYWEBVIEW_GUI'] = 'mshtml'
+
+# ================================================
+# Monkey patch importlib.metadata for streamlit
+# ================================================
+def monkey_patch_metadata():
+    try:
+        import importlib.metadata
+        ver = importlib.metadata.version('streamlit')
+        return
+    except Exception:
+        pass
+    
+    try:
+        import sys
+        from importlib.metadata import Distribution, PackageNotFoundError
+        import importlib.metadata
+        
+        try:
+            import streamlit
+            if hasattr(streamlit, '__version__'):
+                STREAMLIT_VERSION = streamlit.__version__
+            else:
+                STREAMLIT_VERSION = '1.28.0'
+        except Exception:
+            STREAMLIT_VERSION = '1.28.0'
+        
+        class FakeDistribution(Distribution):
+            def __init__(self, name, version):
+                self._name = name
+                self._version = version
+            
+            @property
+            def metadata(self):
+                class FakeMetadata:
+                    def __getitem__(self, key):
+                        if key == 'Name':
+                            return self._name
+                        if key == 'Version':
+                            return self._version
+                        return ''
+                    def get(self, key, default=None):
+                        try:
+                            return self[key]
+                        except:
+                            return default
+                return FakeMetadata()
+            
+            @property
+            def name(self):
+                return self._name
+            
+            @property
+            def version(self):
+                return self._version
+        
+        original_from_name = importlib.metadata.Distribution.from_name
+        
+        def patched_from_name(name):
+            if name == 'streamlit':
+                return FakeDistribution(name, STREAMLIT_VERSION)
+            return original_from_name(name)
+        
+        importlib.metadata.Distribution.from_name = staticmethod(patched_from_name)
+        
+        original_version = importlib.metadata.version
+        
+        def patched_version(name):
+            if name == 'streamlit':
+                return STREAMLIT_VERSION
+            return original_version(name)
+        
+        importlib.metadata.version = patched_version
+        
+        original_distribution = importlib.metadata.distribution
+        
+        def patched_distribution(name):
+            if name == 'streamlit':
+                return FakeDistribution(name, STREAMLIT_VERSION)
+            return original_distribution(name)
+        
+        importlib.metadata.distribution = patched_distribution
+        
+        print(f"Monkey-patched streamlit metadata: version {STREAMLIT_VERSION}")
+        
+    except Exception as e:
+        print(f"Metadata patch failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def _resource_path(rel_path: str) -> Path:
@@ -95,11 +180,15 @@ def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None =
 def _run_streamlit_server(port: int, log_path: str) -> None:
     import traceback
 
+    monkey_patch_metadata()
+
     from streamlit.web import bootstrap
 
     app_py = _resource_path("app.py")
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_ENABLE_CORS", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "false")
 
     flag_options = {
         "global_developmentMode": False,
@@ -131,9 +220,6 @@ _LAYOUT_REFRESH_JS = r"""
     if (!win) return;
     try { win.dispatchEvent(new Event('resize')); } catch (e) {}
     try { win.dispatchEvent(new Event('orientationchange')); } catch (e) {}
-    try { if (typeof win.scheduleLayoutResync === 'function') win.scheduleLayoutResync(); } catch (e) {}
-    try { if (typeof win.queueFrameHeightSync === 'function') win.queueFrameHeightSync(); } catch (e) {}
-    try { if (typeof win.syncFrameHeight === 'function') win.syncFrameHeight(); } catch (e) {}
   };
   refreshTarget(window);
   try {
@@ -147,16 +233,15 @@ _LAYOUT_REFRESH_JS = r"""
 
 
 def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") -> None:
-    # #region debug-point C:schedule-window-layout-refresh
-    _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell layout refresh scheduled", {"reason": str(reason or "")})
-    # #endregion
     def _run_once(delay_s: float) -> None:
         def _inner() -> None:
             try:
-                # #region debug-point C:evaluate-layout-refresh-js
-                _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell evaluate_js layout refresh", {"reason": str(reason or ""), "delay_s": float(delay_s)})
-                # #endregion
-                window.evaluate_js(_LAYOUT_REFRESH_JS)
+                # Use evaluate_js but catch any errors
+                result = None
+                try:
+                    result = window.evaluate_js(_LAYOUT_REFRESH_JS)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -166,46 +251,6 @@ def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") 
 
     for delay_s in (0.0, 0.12, 0.35, 0.8):
         _run_once(delay_s)
-
-
-_LAST_NATIVE_NUDGE_AT = 0.0
-
-
-def _maybe_native_resize_nudge(window: "webview.Window", reason: str = "") -> bool:
-    global _LAST_NATIVE_NUDGE_AT
-    reason_s = str(reason or "")
-    if reason_s.startswith("resized:"):
-        return False
-    if not (reason_s.startswith("image-project-mount") or reason_s in {"shown", "loaded", "startup", "open-project"}):
-        return False
-    now = time.time()
-    if (now - float(_LAST_NATIVE_NUDGE_AT or 0.0)) < 1.2:
-        return False
-    resize_fn = getattr(window, "resize", None)
-    width = int(getattr(window, "width", 0) or 0)
-    height = int(getattr(window, "height", 0) or 0)
-    if not callable(resize_fn) or width < 300 or height < 300:
-        # #region debug-point C:native-resize-nudge-skip
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge skipped", {"reason": reason_s, "width": width, "height": height, "has_resize": bool(callable(resize_fn))})
-        # #endregion
-        return False
-    try:
-        _LAST_NATIVE_NUDGE_AT = now
-        # #region debug-point C:native-resize-nudge
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge start", {"reason": reason_s, "width": width, "height": height})
-        # #endregion
-        resize_fn(width + 1, height + 1)
-        time.sleep(0.03)
-        resize_fn(width, height)
-        # #region debug-point C:native-resize-nudge-done
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge done", {"reason": reason_s, "width": width, "height": height})
-        # #endregion
-        return True
-    except Exception as e:
-        # #region debug-point C:native-resize-nudge-error
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge failed", {"reason": reason_s, "error": str(e)})
-        # #endregion
-        return False
 
 
 class _ShellApi:
@@ -218,17 +263,12 @@ class _ShellApi:
     def request_reflow(self, reason: str = "") -> bool:
         if self.window is None:
             return False
-        # #region debug-point C:request-reflow
-        _debug_post("C", "desktop_launcher.py:_ShellApi.request_reflow", "[DEBUG] shell request_reflow invoked", {"reason": str(reason or "")})
-        # #endregion
         _schedule_window_layout_refresh(self.window, reason=reason)
-        _maybe_native_resize_nudge(self.window, reason=reason)
         return True
 
 
 def _startup_window_logic(window: "webview.Window") -> None:
     _schedule_window_layout_refresh(window, reason="startup")
-    _maybe_native_resize_nudge(window, reason="startup")
 
 
 def main() -> None:
@@ -263,16 +303,32 @@ def main() -> None:
 
         import webview
 
+        # On Windows, try to avoid recursion issues with accessibility APIs
+        if sys.platform == "win32":
+            os.environ['PYWEBVIEW_GUI'] = 'edgechromium'
+            os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = '--disable-gpu --disable-gpu-compositing --disable-features=msWebRTCCdpInterceptor'
+
         shell_api = _ShellApi()
         window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
         shell_api.bind(window)
-        window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
-        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"))
-        window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _schedule_window_layout_refresh(window, reason="restored"))
-        window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
-        window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
-        window.events.closed += lambda: _shutdown_and_exit(proc)
-        webview.start(_startup_window_logic, window)
+        
+        # Bind events with error handling to avoid recursion
+        try:
+            window.events.loaded += lambda: _schedule_window_layout_refresh(window, reason="loaded")
+        except Exception:
+            pass
+        
+        try:
+            window.events.shown += lambda: _schedule_window_layout_refresh(window, reason="shown")
+        except Exception:
+            pass
+        
+        try:
+            window.events.closed += lambda: _shutdown_and_exit(proc)
+        except Exception:
+            pass
+        
+        webview.start(_startup_window_logic, window, debug=(sys.platform == "win32"))
     finally:
         if proc.is_alive():
             proc.terminate()
@@ -284,7 +340,6 @@ def _shutdown_and_exit(proc: multiprocessing.Process) -> None:
         proc.terminate()
         proc.join(timeout=5)
     os._exit(0)
-
 
 
 if __name__ == "__main__":

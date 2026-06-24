@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import threading
 import time
 import uuid
 import os
@@ -361,10 +362,24 @@ def _session_workspace() -> Path:
     return p
 
 
-def _reset_session_workspace() -> None:
-    p = WORKSPACE_DIR / st.session_state.session_id
+def _remove_workspace_tree(session_id: str) -> None:
+    p = WORKSPACE_DIR / str(session_id or "").strip()
     if p.exists():
-        shutil.rmtree(p)
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def _remove_workspace_tree_async(session_id: str) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    t = threading.Thread(target=_remove_workspace_tree, args=(sid,), daemon=True)
+    t.start()
+
+
+def _reset_session_workspace(remove_workspace: bool = True, session_id: Optional[str] = None) -> None:
+    target_session = str(session_id or st.session_state.session_id or "").strip()
+    if remove_workspace and target_session:
+        _remove_workspace_tree(target_session)
     st.session_state.imported = None
     st.session_state.project_type = None
     st.session_state.step = 0
@@ -399,8 +414,11 @@ def _begin_fresh_tm_session() -> str:
     # #region debug-point B:begin-fresh-session
     _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] begin fresh session", {"old_session": str(st.session_state.get("session_id", ""))})
     # #endregion
-    _reset_session_workspace()
+    old_session_id = str(st.session_state.get("session_id", "") or "").strip()
+    _reset_session_workspace(remove_workspace=False)
     st.session_state.session_id = uuid.uuid4().hex
+    if old_session_id and old_session_id != st.session_state.session_id:
+        _remove_workspace_tree_async(old_session_id)
     # #region debug-point B:begin-fresh-session-new
     _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] fresh session created", {"new_session": str(st.session_state.session_id)})
     # #endregion
@@ -2308,8 +2326,11 @@ def _render_tm_old_frontend_html(
 <script>
 const STATE = {data};
 const baseUrl = `http://127.0.0.1:${{STATE.port}}`;
+const DEBUG_ENABLED = false;
+let debugEventDisabled = false;
 if (window.__tmStageMark) window.__tmStageMark('script-start');
 function dbgEvent(hypothesisId, location, msg, data) {{
+  if (!DEBUG_ENABLED || debugEventDisabled) return;
   try {{
     fetch(STATE.debug_server_url || 'http://127.0.0.1:7777/event', {{
       method: 'POST',
@@ -2323,7 +2344,10 @@ function dbgEvent(hypothesisId, location, msg, data) {{
         data,
         ts: Date.now()
       }})
-    }}).catch(() => null);
+    }}).catch(() => {{
+      debugEventDisabled = true;
+      return null;
+    }});
   }} catch (e) {{}}
 }}
 function logScrollLayers(tag) {{
@@ -2405,6 +2429,8 @@ let frameHeightRaf = 0;
 let layoutResyncTimers = [];
 let mountReflowTimers = [];
 let homeNavigateTimer = 0;
+let lastFrameHeightSent = 0;
+let lastFrameHeightAt = 0;
 function syncFrameHeight() {{
   if (window.__tmNavigatingAway) return;
   initStreamlitFrame();
@@ -2416,10 +2442,9 @@ function syncFrameHeight() {{
     const doc = document.documentElement;
     const wrap = document.querySelector('.wrap');
     nextHeight = Math.max(
+      wrap ? Math.round(wrap.getBoundingClientRect().height) : 0,
+      wrap ? Math.round(wrap.scrollHeight || 0) : 0,
       body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
-      doc ? doc.scrollHeight : 0,
-      doc ? doc.offsetHeight : 0,
       doc ? doc.clientHeight : 0,
     );
     nextWidth = Math.max(
@@ -2458,13 +2483,6 @@ function syncFrameHeight() {{
       frame.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
       frame.style.width = '100%';
       frame.style.maxWidth = '100%';
-      if (frame.parentElement && frame.parentElement.style) {{
-        frame.parentElement.style.width = '100%';
-        frame.parentElement.style.maxWidth = '100%';
-        frame.parentElement.style.height = `${{Math.ceil(nextHeight + 12)}}px`;
-        frame.parentElement.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
-        frame.parentElement.style.overflow = 'hidden';
-      }}
     }}
     if (nextWidth && Number.isFinite(nextWidth) && document.body && document.body.style) {{
       document.body.style.width = '100%';
@@ -2474,7 +2492,13 @@ function syncFrameHeight() {{
   // #region debug-point A:sync-frame-height
   dbgEvent('A', 'app.py:syncFrameHeight', '[DEBUG] syncFrameHeight posting iframe height', metrics);
   // #endregion
-  sendStreamlitMessage('streamlit:setFrameHeight', {{height: Math.ceil(nextHeight + 12)}});
+  const sentHeight = Math.ceil(nextHeight + 12);
+  const now = Date.now();
+  if (Math.abs(sentHeight - lastFrameHeightSent) >= 8 || (now - lastFrameHeightAt) >= 800) {{
+    lastFrameHeightSent = sentHeight;
+    lastFrameHeightAt = now;
+    sendStreamlitMessage('streamlit:setFrameHeight', {{height: sentHeight}});
+  }}
 }}
 function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;
@@ -2574,7 +2598,7 @@ let sourceSwitchKind = '';
 let trainInFlight = false;
 let trainPollToken = 0;
 let sourceSettingsOpen = false;
-let previewIntervalMs = 80;
+let previewIntervalMs = 120;
 let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
@@ -2586,6 +2610,8 @@ let previewPredictInFlight = false;
 let previewPredictToken = 0;
 let previewSettingsOpen = false;
 let navMenuOpen = false;
+let uploadInputEl = null;
+let uploadInputTargetClass = '';
 let navMenuBound = false;
 let resizeBound = false;
 STATE.counts = STATE.counts || {{}};
@@ -2873,7 +2899,7 @@ function stopPreviewLoop() {{
 function startPreviewLoop() {{
   stopPreviewLoop();
   refreshPreviewImage();
-  previewTimer = window.setInterval(refreshPreviewImage, Math.max(40, Number(previewIntervalMs || 80)));
+  previewTimer = window.setInterval(refreshPreviewImage, Math.max(90, Number(previewIntervalMs || 120)));
 }}
 function stopHoldSyncLoop() {{
   holdNextToken += 1;
@@ -2940,9 +2966,12 @@ function refreshPreviewImage() {{
   previewRequestInFlight = true;
   fetch(url).then(async (res) => {{
     if (!res.ok) {{
-      throw new Error(openSourceKind === 'device'
+      const data = await res.json().catch(() => null);
+      const serverMsg = data && data.error ? String(data.error) : '';
+      const fallbackMsg = openSourceKind === 'device'
         ? 'Unable to read from serial device. Check serial port and baudrate.'
-        : 'Unable to open webcam. Check permission or whether the camera is in use.');
+        : 'Unable to open webcam. Check permission or whether the camera is in use.';
+      throw new Error(serverMsg || fallbackMsg);
     }}
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (!contentType.includes('image/png')) {{
@@ -2966,7 +2995,10 @@ async function openSourcePanel(kind, className) {{
   dbgEvent('B', 'app.py:openSourcePanel', '[DEBUG] openSourcePanel requested', {{kind, className, openSourceClass, openSourceKind}});
   // #endregion
   if (openSourceClass === className && openSourceKind === kind) return;
-  await closeSourcePanel(false);
+  const switchingWithinSameSource = (openSourceKind === kind) && (kind === 'webcam' || kind === 'device');
+  if (!switchingWithinSameSource) {{
+    await closeSourcePanel(false);
+  }}
   openSourceClass = className;
   openSourceKind = kind;
   sourceSettingsOpen = false;
@@ -3474,28 +3506,118 @@ function setAction(action, params) {{
   }}
   navigateParent(u.toString());
 }}
+function readFileAsDataUrl(file) {{
+  return new Promise((resolve, reject) => {{
+    try {{
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('File read failed.'));
+      reader.readAsDataURL(file);
+    }} catch (err) {{
+      reject(err);
+    }}
+  }});
+}}
+async function fileToUploadBase64(file) {{
+  const extractBase64 = (dataUrl) => {{
+    const result = String(dataUrl || '');
+    const comma = result.indexOf(',');
+    return comma >= 0 ? result.slice(comma + 1) : result;
+  }};
+  try {{
+    if (typeof createImageBitmap === 'function') {{
+      const bitmap = await createImageBitmap(file);
+      try {{
+        const srcW = Math.max(1, Number(bitmap.width) || 1);
+        const srcH = Math.max(1, Number(bitmap.height) || 1);
+        const maxEdge = 512;
+        const scale = Math.min(1, maxEdge / Math.max(srcW, srcH));
+        const targetW = Math.max(1, Math.round(srcW * scale));
+        const targetH = Math.max(1, Math.round(srcH * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d', {{alpha: false}});
+        if (!ctx) throw new Error('Canvas unavailable.');
+        ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+        return extractBase64(canvas.toDataURL('image/png'));
+      }} finally {{
+        if (typeof bitmap.close === 'function') bitmap.close();
+      }}
+    }}
+  }} catch (err) {{
+    console.warn('Upload image resize failed, using original file.', err);
+  }}
+  return extractBase64(await readFileAsDataUrl(file));
+}}
+function getSharedUploadInput() {{
+  if (uploadInputEl && document.body && document.body.contains(uploadInputEl)) {{
+    return uploadInputEl;
+  }}
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.multiple = true;
+  input.tabIndex = -1;
+  input.style.position = 'fixed';
+  input.style.left = '-9999px';
+  input.style.width = '1px';
+  input.style.height = '1px';
+  input.style.opacity = '0';
+  input.style.pointerEvents = 'none';
+  input.onchange = async () => {{
+    const targetClass = String(uploadInputTargetClass || openSourceClass || '');
+    const selectedFiles = Array.from(input.files || []);
+    input.value = '';
+    uploadInputTargetClass = '';
+    if (!targetClass || selectedFiles.length === 0) return;
+    await uploadFiles(targetClass, selectedFiles);
+  }};
+  document.body.appendChild(input);
+  uploadInputEl = input;
+  return input;
+}}
 async function uploadFiles(className, files) {{
-  if (!files || files.length === 0) return;
+  const queuedFiles = Array.from(files || []);
+  if (!className || queuedFiles.length === 0) return;
   let uploaded = 0;
-  for (const f of files) {{
-    const buf = await f.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let bin = '';
-    for (let i=0; i<bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    const b64 = btoa(bin);
-    const res = await fetch(`${{baseUrl}}/upload`, {{
-      method: 'POST',
-      headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify({{session: STATE.session, class: className, image_b64: b64}})
+  for (const f of queuedFiles) {{
+    const b64 = await fileToUploadBase64(f).catch((err) => {{
+      console.error('Upload file read failed:', err);
+      toast(String(err && err.message ? err.message : err));
+      return '';
     }});
+    if (!b64) continue;
+    if (!STATE.port) {{
+      console.error('RecordController port is missing!', STATE);
+      toast('Error: Backend service port is missing.');
+      return;
+    }}
+    let res = null;
+    try {{
+      res = await fetch(`${{baseUrl}}/upload`, {{
+        method: 'POST',
+        headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify({{session: STATE.session, class: className, image_b64: b64}})
+      }});
+    }} catch (err) {{
+      console.error('Upload fetch failed:', err);
+      toast(String(err && err.message ? err.message : err));
+      continue;
+    }}
     const data = await res.json().catch(() => ({{ok:'0'}}));
-    if (res.ok && data.ok === '1') {{
+    if (!res.ok || data.ok !== '1') {{
+      toast(String(data.error || `Upload failed (${{res.status}})`));
+      continue;
+    }}
+    {{
       uploaded += 1;
       if (data.image_b64) prependSamplePreview(className, {{src: `data:image/png;base64,${{data.image_b64}}`, filename: String(data.filename || '')}});
       else prependSamplePreview(className, {{src: `data:image/*;base64,${{b64}}`, filename: String(data.filename || '')}});
       incrementSampleCount(className, 1);
       recomputeTrainEnabled();
     }}
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
   }}
   syncTrainUi();
   if (openSourceClass === className) updateOpenSamplesPanel(className);
@@ -3989,7 +4111,6 @@ async function refreshPreviewPrediction(token) {{
     }}
     if (openSourceClass && openSourceKind === previewSource) {{
       const sImg = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
-      if (sImg && src) sImg.src = src;
     }}
     renderOutputBars(data.labels || [], data.probs || []);
     if (note) {{
@@ -4007,11 +4128,10 @@ function startPreviewPredictLoop() {{
   stopPreviewPredictLoop();
   previewPredictToken += 1;
   const token = previewPredictToken;
-  stopPreviewLoop();
   refreshPreviewPrediction(token);
   previewPredictTimer = window.setInterval(
     () => refreshPreviewPrediction(token),
-    Math.max(50, Number(previewIntervalMs || 80))
+    Math.max(240, Number(previewIntervalMs || 120) * 2)
   );
 }}
 async function setWebcamIndexGlobal(value) {{
@@ -4232,6 +4352,7 @@ function renderPreviewCard() {{
   bindLayoutImageObservers(pane);
   scheduleLayoutResync();
   if (previewInputOn) {{
+    if (openSourceClass && (openSourceKind === 'webcam' || openSourceKind === 'device') && !previewTimer) startPreviewLoop();
     if (!previewPredictTimer) startPreviewPredictLoop();
   }} else {{
     if (previewPredictTimer) stopPreviewPredictLoop();
@@ -4784,11 +4905,11 @@ function render() {{
         startHoldCapture();
       }};
       holdBtn.onpointerup = (e) => {{
+        try {{ holdBtn.releasePointerCapture(e.pointerId); }} catch (err) {{}}
         e.preventDefault();
         stopHoldCapture();
       }};
       holdBtn.onpointercancel = () => stopHoldCapture();
-      holdBtn.onpointerleave = () => stopHoldCapture();
     }}
     if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
     if (settingsToggle) settingsToggle.onclick = () => toggleSourceSettings(openSourceClass);
@@ -4798,11 +4919,11 @@ function render() {{
       render();
     }};
     if (uploadPick) uploadPick.onclick = () => {{
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'image/*';
-      input.multiple = true;
-      input.onchange = () => uploadFiles(openSourceClass, input.files);
+      const targetClass = String(openSourceClass || '');
+      if (!targetClass) return;
+      const input = getSharedUploadInput();
+      uploadInputTargetClass = targetClass;
+      input.value = '';
       input.click();
     }};
     syncSourceActionButtons(openSourceClass);

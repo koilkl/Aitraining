@@ -6,20 +6,35 @@ def inject_teachable_style() -> None:
 <style>
   :root {
     --tm-bg: var(--background-color, #f5f7fa);
-    --tm-flow-bg: color-mix(in srgb, var(--tm-bg) 88%, #f5f7fa 12%);
+    --tm-flow-bg: color-mix(in srgb, var(--tm-bg) 88%, var(--tm-bg) 12%);
     --tm-surface: var(--secondary-background-color, #ffffff);
     --tm-surface-strong: var(--secondary-background-color, #ffffff);
     --tm-text: var(--text-color, #23262d);
-    --tm-muted: color-mix(in srgb, var(--text-color, #23262d) 58%, transparent);
-    --tm-border: color-mix(in srgb, var(--text-color, #23262d) 14%, transparent);
+    --tm-muted: color-mix(in srgb, var(--tm-text) 58%, transparent);
+    --tm-border: color-mix(in srgb, var(--tm-text) 14%, transparent);
     --tm-primary: var(--primary-color, #2f73ea);
-    --tm-primary-strong: color-mix(in srgb, var(--primary-color, #2f73ea) 88%, black 12%);
-    --tm-accent: color-mix(in srgb, var(--primary-color, #2f73ea) 10%, var(--secondary-background-color, #ffffff));
+    --tm-primary-strong: #1a73e8;
+    --tm-accent: color-mix(in srgb, var(--tm-primary) 10%, var(--tm-surface));
     --tm-success: #0f9f6e;
     --tm-shadow: 0 2px 8px rgba(17, 24, 39, 0.10);
     --tm-shadow-soft: 0 2px 8px rgba(17, 24, 39, 0.08);
     --tm-card-radius: 8px;
+    --tm-white-or-surface: #ffffff;
+    --tm-white-or-surface-soft: rgba(255, 255, 255, 0.96);
   }
+
+  /* Dark mode adjustments */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --tm-white-or-surface: var(--tm-surface);
+      --tm-white-or-surface-soft: color-mix(in srgb, var(--tm-surface) 96%, transparent);
+      --tm-primary-strong: #4285f4;
+      --tm-success: #22c55e;
+      --tm-shadow: 0 4px 12px rgba(0, 0, 0, 0.40);
+      --tm-shadow-soft: 0 2px 8px rgba(0, 0, 0, 0.30);
+    }
+  }
+
 
   .stApp {
     background: var(--tm-bg);
@@ -155,8 +170,8 @@ def inject_teachable_style() -> None:
     min-height: 56px;
     padding: 10px 12px;
     border-radius: 14px;
-    background: rgba(255,255,255,0.96);
-    border: 1px solid rgba(16, 35, 63, 0.08);
+    background: var(--tm-white-or-surface);
+    border: 1px solid var(--tm-border);
     box-shadow: var(--tm-shadow-soft);
   }
   .tm-flow-step span {
@@ -221,8 +236,8 @@ def inject_teachable_style() -> None:
   .tm-hero-panel {
     border-radius: 16px;
     padding: 14px 16px;
-    background: rgba(255, 255, 255, 0.98);
-    border: 1px solid rgba(16, 35, 63, 0.06);
+    background: var(--tm-white-or-surface);
+    border: 1px solid var(--tm-border);
     box-shadow: var(--tm-shadow-soft);
   }
   .tm-hero-panel h4 {
@@ -238,8 +253,8 @@ def inject_teachable_style() -> None:
   .tm-stat {
     border-radius: 14px;
     padding: 12px 14px;
-    background: rgba(255, 255, 255, 0.98);
-    border: 1px solid rgba(16, 35, 63, 0.06);
+    background: var(--tm-white-or-surface);
+    border: 1px solid var(--tm-border);
   }
   .tm-stat-label {
     font-size: 12px;
@@ -315,8 +330,8 @@ def inject_teachable_style() -> None:
     padding: 10px 12px;
     margin: 12px 0 8px 0;
     border-radius: 14px;
-    background: rgba(255, 255, 255, 0.98);
-    border: 1px solid rgba(16, 35, 63, 0.06);
+    background: var(--tm-white-or-surface);
+    border: 1px solid var(--tm-border);
     box-shadow: var(--tm-shadow-soft);
   }
   .tm-class-header strong {
@@ -330,8 +345,8 @@ def inject_teachable_style() -> None:
   .tm-inline-note {
     border-radius: 14px;
     padding: 12px 14px;
-    background: rgba(255,255,255,0.94);
-    border: 1px solid rgba(16, 35, 63, 0.06);
+    background: var(--tm-white-or-surface);
+    border: 1px solid var(--tm-border);
     color: var(--tm-muted);
     margin: 8px 0 12px 0;
   }
@@ -776,10 +791,34 @@ def inject_teachable_style() -> None:
     pointer-events: none;
   }
   div[data-testid="stVerticalBlock"]:has(.tm-layout-wrap-marker) .tm-flow-svg path {
-    stroke: #c5c8cc;
+    stroke: color-mix(in srgb, var(--tm-text) 30%, transparent);
     stroke-width: 2;
     fill: none;
   }
+
+  /* Better dark mode hover effects */
+  @media (prefers-color-scheme: dark) {
+    div:has(.tm-top-brand-marker) .stButton > button:hover {
+      background: color-mix(in srgb, var(--tm-surface) 86%, var(--tm-primary)) !important;
+    }
+
+    div[data-testid="stVerticalBlock"]:has(.tm-class-card-marker) > [data-testid="stHorizontalBlock"]:first-of-type .stButton > button:hover {
+      background: color-mix(in srgb, var(--tm-text) 10%, transparent) !important;
+    }
+
+    div[data-testid="stVerticalBlock"]:has(.tm-add-class-marker) .stButton > button:hover {
+      background: color-mix(in srgb, var(--tm-text) 8%, transparent) !important;
+    }
+
+    div[data-testid="column"]:has(.tm-preview-card-marker) .stButton > button:hover {
+      background: color-mix(in srgb, var(--tm-text) 12%, transparent) !important;
+    }
+
+    div[data-testid="column"]:has(.tm-train-card-marker) [data-testid="stPopoverButton"] button:hover {
+      background: color-mix(in srgb, var(--tm-text) 8%, transparent) !important;
+    }
+  }
+
   div[data-testid="stHorizontalBlock"]:has(.tm-layout-row-marker) {
     position: relative;
     z-index: 1;
@@ -903,12 +942,19 @@ def inject_teachable_style() -> None:
   .stButton > button {
     border-radius: 10px;
     border: 1px solid var(--tm-border);
-    background: var(--tm-surface);
+    background: var(--tm-white-or-surface);
     color: var(--tm-text) !important;
     font-weight: 700;
     min-height: 40px;
     white-space: nowrap;
-    box-shadow: none;
+    box-shadow: var(--tm-shadow-soft);
+  }
+
+  [data-testid="stPopoverButton"] button {
+    background: var(--tm-white-or-surface) !important;
+    color: var(--tm-text) !important;
+    border: 1px solid var(--tm-border) !important;
+    box-shadow: var(--tm-shadow-soft) !important;
   }
 
   .stButton > button p {
@@ -920,6 +966,7 @@ def inject_teachable_style() -> None:
     border: 0 !important;
     background: var(--tm-primary) !important;
     color: #ffffff !important;
+    box-shadow: var(--tm-shadow) !important;
   }
 
   .stButton > button[kind="primary"] p {
@@ -927,8 +974,9 @@ def inject_teachable_style() -> None:
   }
 
   .stButton > button:hover {
-    border-color: rgba(47, 115, 234, 0.32);
-    color: var(--tm-primary-strong);
+    border-color: var(--tm-primary);
+    color: var(--tm-primary) !important;
+    background: var(--tm-accent) !important;
   }
 
   .stButton > button[kind="primary"]:hover {
@@ -999,7 +1047,7 @@ def inject_teachable_style() -> None:
 
   .stTabs [data-baseweb="tab"] {
     border-radius: 999px;
-    background: rgba(255,255,255,0.78);
+    background: var(--tm-white-or-surface-soft);
     padding: 10px 16px;
   }
 

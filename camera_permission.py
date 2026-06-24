@@ -94,7 +94,23 @@ def ensure_camera_access(webcam_index: int = 0, wait_timeout_s: float = 15.0, pr
     except Exception:
         return status
 
-    cap = cv2.VideoCapture(int(webcam_index))
+    if sys.platform == "win32":
+        dshow = getattr(cv2, "CAP_DSHOW", None)
+        msmf = getattr(cv2, "CAP_MSMF", None)
+        cap = None
+        if dshow is not None:
+            cap = cv2.VideoCapture(int(webcam_index), dshow)
+        if (cap is None or not cap.isOpened()) and msmf is not None:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            cap = cv2.VideoCapture(int(webcam_index), msmf)
+        if cap is None:
+            cap = cv2.VideoCapture(int(webcam_index))
+    else:
+        cap = cv2.VideoCapture(int(webcam_index))
     if not cap.isOpened():
         cap.release()
         return _result("open_failed", allowed=False)
