@@ -2940,13 +2940,26 @@ function refreshPreviewImage() {{
   previewRequestInFlight = true;
   fetch(url).then(async (res) => {{
     if (!res.ok) {{
-      throw new Error(openSourceKind === 'device'
-        ? 'Unable to read from serial device. Check serial port and baudrate.'
-        : 'Unable to open webcam. Check permission or whether the camera is in use.');
+      let msg = '';
+      try {{
+        const data = await res.json();
+        msg = String(data && data.error ? data.error : '');
+      }} catch (e) {{}}
+      if (!msg) {{
+        msg = openSourceKind === 'device'
+          ? 'Unable to read from serial device. Check serial port and baudrate.'
+          : 'Unable to open webcam. Check permission or whether the camera is in use.';
+      }}
+      throw new Error(msg);
     }}
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (!contentType.includes('image/png')) {{
-      throw new Error('Preview returned invalid data.');
+      let msg = 'Preview returned invalid data.';
+      try {{
+        const data = await res.json();
+        msg = String(data && data.error ? data.error : msg);
+      }} catch (e) {{}}
+      throw new Error(msg);
     }}
     const blob = await res.blob();
     clearPreviewBlob();
@@ -2976,7 +2989,11 @@ async function openSourcePanel(kind, className) {{
   if (openSourceClass === className) updateOpenSamplesPanel(className);
   if (kind === 'webcam' || kind === 'device') {{
     try {{
-      await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(kind)}}`);
+      const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(kind)}}`);
+      if (!res.ok) {{
+        const data = await res.json().catch(() => ({{ok:'0'}}));
+        toast(String(data && data.error ? data.error : 'Unable to open live preview.'));
+      }}
     }} catch (e) {{}}
     startPreviewLoop();
   }}
@@ -2988,7 +3005,11 @@ async function ensureOpenSourceLive() {{
   if (!openSourceKind || !openSourceClass) return;
   if (openSourceKind !== 'webcam' && openSourceKind !== 'device') return;
   try {{
-    await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
+    const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
+    if (!res.ok) {{
+      const data = await res.json().catch(() => ({{ok:'0'}}));
+      toast(String(data && data.error ? data.error : 'Unable to open live preview.'));
+    }}
   }} catch (e) {{}}
   startPreviewLoop();
 }}
@@ -3587,6 +3608,14 @@ async function syncClassState(className) {{
 async function startHoldCapture() {{
   if (holdRecording || !openSourceClass || !openSourceKind || openSourceKind === 'upload') return;
   try {{
+    if (openSourceKind === 'webcam' || openSourceKind === 'device') {{
+      stopPreviewLoop();
+      clearPreviewBlob();
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
+      }} catch (e) {{}}
+      await new Promise((r) => setTimeout(r, 120));
+    }}
     const res = await fetch(`${{baseUrl}}/start?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&class=${{encodeURIComponent(openSourceClass)}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to start hold capture.');
@@ -3605,9 +3634,20 @@ async function startHoldCapture() {{
           const nextData = await nextRes.json().catch(() => ({{ok:'0'}}));
           if (!holdRecording || holdNextToken !== token) break;
           if (!nextRes.ok || nextData.ok !== '1') throw new Error(nextData.error || 'Unable to read hold capture updates.');
+          const serverError = String(nextData.error || '').trim();
+          if (serverError) {{
+            toast(serverError);
+            break;
+          }}
           const seq = Number(nextData.seq || holdSeq || 0);
           if (seq > holdSeq && nextData.image_b64) {{
             holdSeq = seq;
+            try {{
+              const img = document.getElementById(`sourcePreview-${{cssSafe(holdRecordClass)}}`);
+              const note = document.getElementById(`sourceNote-${{cssSafe(holdRecordClass)}}`);
+              if (img) img.src = `data:image/png;base64,${{nextData.image_b64}}`;
+              if (note) note.textContent = '';
+            }} catch (e) {{}}
             prependSamplePreview(holdRecordClass, {{
               src: `data:image/png;base64,${{nextData.image_b64}}`,
               filename: String(nextData.filename || '')
@@ -3643,6 +3683,9 @@ async function stopHoldCapture() {{
   }} catch (e) {{}}
   await syncClassState(className);
   if (openSourceClass === className) updateOpenSamplesPanel(className);
+  if (openSourceClass === className && openSourceKind === sourceKind && (sourceKind === 'webcam' || sourceKind === 'device')) {{
+    await ensureOpenSourceLive();
+  }}
   toast('Hold capture stopped.');
 }}
 function buildDeviceOptions(selected) {{

@@ -6,6 +6,8 @@ from typing import List, Optional
 
 import numpy as np
 from PIL import Image
+import sys
+import glob
 
 
 HEADER = bytes([0xAA, 0x55, 0xAA])  # default frame sync header
@@ -26,11 +28,16 @@ class SerialFrameReader:
         self._baud = int(baud)
         self._header = parse_sync_header(sync_header)
         self._ser = None
+        self._buf = bytearray()
 
     def open(self) -> None:
-        import serial
+        try:
+            import serial
+        except Exception as e:
+            raise RuntimeError("pyserial is missing (serial module not available).") from e
 
         self._ser = serial.Serial(port=self._port, baudrate=self._baud, timeout=0.1)
+        self._buf = bytearray()
         try:
             self._ser.reset_input_buffer()
         except Exception:
@@ -47,22 +54,36 @@ class SerialFrameReader:
         if self._ser is None:
             raise RuntimeError("Serial not opened")
         start = time.time()
-        header_pos = 0
+        header = self._header
+        header_len = len(header)
         while time.time() - start < timeout_s:
             chunk = self._ser.read(4096)
-            if not chunk:
-                continue
-            for b in chunk:
-                if b == self._header[header_pos]:
-                    header_pos += 1
-                    if header_pos == len(self._header):
-                        header_pos = 0
-                        frame = _read_exact(self._ser, FRAME_SIZE, timeout_s=max(0.2, timeout_s - (time.time() - start)))
-                        if frame is None:
-                            raise TimeoutError("Timeout while reading frame bytes")
-                        return frame
-                else:
-                    header_pos = 0
+            if chunk:
+                self._buf.extend(chunk)
+                if len(self._buf) > 262144:
+                    self._buf = self._buf[-65536:]
+            else:
+                time.sleep(0.004)
+            while True:
+                idx = self._buf.find(header)
+                if idx < 0:
+                    if len(self._buf) > header_len:
+                        keep = max(0, header_len - 1)
+                        self._buf = self._buf[-keep:] if keep else bytearray()
+                    break
+                after = idx + header_len
+                need = after + FRAME_SIZE
+                if len(self._buf) < need:
+                    if idx > 0:
+                        del self._buf[:idx]
+                    break
+                if len(self._buf) >= need + header_len:
+                    if self._buf[need : need + header_len] != header:
+                        del self._buf[: idx + 1]
+                        continue
+                frame = bytes(self._buf[after:need])
+                del self._buf[:need]
+                return frame
         raise TimeoutError("Timeout waiting for frame header")
 
 
@@ -70,11 +91,32 @@ def list_serial_ports() -> List[SerialPortInfo]:
     try:
         from serial.tools import list_ports
     except Exception:
-        return []
+        return _fallback_list_serial_ports()
     out: List[SerialPortInfo] = []
     for p in list_ports.comports():
         desc = getattr(p, "description", "") or ""
         out.append(SerialPortInfo(device=str(p.device), description=str(desc)))
+    return out
+
+
+def _fallback_list_serial_ports() -> List[SerialPortInfo]:
+    patterns: List[str] = []
+    if sys.platform == "darwin":
+        patterns = ["/dev/cu.*", "/dev/tty.*"]
+    elif sys.platform.startswith("linux"):
+        patterns = ["/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyAMA*", "/dev/ttyS*"]
+    else:
+        patterns = []
+    devices: List[str] = []
+    for pat in patterns:
+        devices.extend(glob.glob(pat))
+    seen = set()
+    out: List[SerialPortInfo] = []
+    for dev in sorted(devices):
+        if dev in seen:
+            continue
+        seen.add(dev)
+        out.append(SerialPortInfo(device=str(dev), description=""))
     return out
 
 

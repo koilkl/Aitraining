@@ -794,6 +794,7 @@ class RecordController:
                 "count": int(existing),
                 "filename": "",
                 "image_b64": "",
+                "error": "",
             }
             if session_id not in self._record_conds:
                 self._record_conds[session_id] = threading.Condition()
@@ -827,6 +828,7 @@ class RecordController:
                 recording = str(cur.get("recording") or "0")
                 image_b64 = str(cur.get("image_b64") or "")
                 filename = str(cur.get("filename") or "")
+                error = str(cur.get("error") or "")
             return {
                 "ok": "1",
                 "seq": seq,
@@ -834,6 +836,7 @@ class RecordController:
                 "recording": recording,
                 "filename": filename,
                 "image_b64": image_b64 if seq > since else "",
+                "error": error,
             }
         deadline = time.time() + float(timeout_s)
         while True:
@@ -846,6 +849,7 @@ class RecordController:
                 recording = str(cur.get("recording") or "0")
                 image_b64 = str(cur.get("image_b64") or "")
                 filename = str(cur.get("filename") or "")
+                error = str(cur.get("error") or "")
             if seq > since or recording != "1":
                 return {
                     "ok": "1",
@@ -854,6 +858,7 @@ class RecordController:
                     "recording": recording,
                     "filename": filename,
                     "image_b64": image_b64 if seq > since else "",
+                    "error": error,
                 }
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -864,6 +869,7 @@ class RecordController:
                     "recording": recording,
                     "filename": "",
                     "image_b64": "",
+                    "error": error,
                 }
             with cond:
                 cond.wait(timeout=min(remaining, 1.0))
@@ -1488,12 +1494,26 @@ class RecordController:
         if cfg is None:
             return
         interval = 1.0 / max(1.0, float(cfg.fps))
-        if source == "device":
-            self._record_serial(session_id, cfg, class_name, interval)
-            return
-        if source == "webcam":
-            self._record_webcam(session_id, cfg, class_name, interval)
-            return
+        try:
+            if source == "device":
+                self._record_serial(session_id, cfg, class_name, interval)
+                return
+            if source == "webcam":
+                self._record_webcam(session_id, cfg, class_name, interval)
+                return
+        except Exception as e:
+            with self._lock:
+                cur = self._active.get(session_id)
+                if cur is not None:
+                    cur["recording"] = "0"
+                    msg = str(e) or "record failed"
+                    if len(msg) > 220:
+                        msg = msg[:220] + "..."
+                    cur["error"] = msg
+            cond = self._record_conds.get(session_id)
+            if cond is not None:
+                with cond:
+                    cond.notify_all()
 
     def _live_key(self, session_id: str, source: str) -> str:
         return f"{session_id}:{source}"
@@ -1511,18 +1531,27 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         key = self._live_key(session_id, source)
+        now = time.time()
         with self._lock:
+            for stale_key, stale_state in list(self._live.items()):
+                try:
+                    if stale_state.get("running"):
+                        continue
+                    if now - float(stale_state.get("last_touch") or 0.0) > 30.0:
+                        self._live.pop(stale_key, None)
+                except Exception:
+                    continue
             for other_key, state in list(self._live.items()):
                 if other_key.startswith(f"{session_id}:") and other_key != key:
                     state["running"] = False
             cur = self._live.get(key)
             if cur is not None and cur.get("running"):
-                cur["last_touch"] = time.time()
+                cur["last_touch"] = now
                 cur["cfg"] = cfg
                 return
             state = {
                 "running": True,
-                "last_touch": time.time(),
+                "last_touch": now,
                 "source": source,
                 "cfg": cfg,
                 "preview_png": None,
@@ -1590,12 +1619,17 @@ class RecordController:
         cfg = self._configs.get(session_id)
         if cfg is None:
             return
-        if source == "webcam":
-            self._live_webcam(key, cfg)
-        elif source == "device":
-            self._live_serial(key, cfg)
-        with self._lock:
-            self._live.pop(key, None)
+        try:
+            if source == "webcam":
+                self._live_webcam(key, cfg)
+            elif source == "device":
+                self._live_serial(key, cfg)
+        finally:
+            with self._lock:
+                state = self._live.get(key)
+                if state is not None:
+                    state["running"] = False
+                    state["last_touch"] = time.time()
 
     def _live_serial(self, key: str, cfg: SessionConfig) -> None:
         if not cfg.serial_port:
@@ -1609,8 +1643,11 @@ class RecordController:
                 preview_png = _raw96_preview_png(raw)
                 capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box)
                 self._live_set(key, preview_png=preview_png, capture_png=capture_png, error="")
-        except Exception:
-            self._live_set(key, error="Unable to read from serial device.")
+        except Exception as e:
+            msg = str(e) or "Unable to read from serial device."
+            if len(msg) > 220:
+                msg = msg[:220] + "..."
+            self._live_set(key, error=msg)
         finally:
             try:
                 reader.close()
