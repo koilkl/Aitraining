@@ -21,7 +21,21 @@ from PIL import Image
 from camera_permission import ensure_camera_access
 from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
 from dataset_io import IMAGE_EXTS, sanitize_class_name
-from image_preprocess import focus_and_enhance_array
+from image_preprocess import (
+    CLIP_MODE_JUNCTION,
+    PREPROCESS_MODE_AUTO_BY_LABEL,
+    PREPROCESS_MODE_JUNCTION,
+    PREPROCESS_MODE_MANUAL_ROI,
+    PREPROCESS_MODE_NONE,
+    PREPROCESS_MODE_SIGN,
+    class_clip_mode,
+    normalize_class_preprocess,
+    normalize_class_preprocess_map,
+    normalize_sample_preprocess_map,
+    normalize_manual_roi,
+    preprocess_for_label,
+    prepare_inference_inputs,
+)
 
 
 @dataclass
@@ -332,6 +346,7 @@ class RecordController:
         if path == "/preview/predict":
             session_id = (qs.get("session") or [""])[0]
             source = (qs.get("source") or [""])[0]
+            preprocess_mode = (qs.get("preprocess") or [""])[0]
             if not session_id or source not in {"webcam", "device"}:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -342,7 +357,7 @@ class RecordController:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
                     return
-                pred = self._preview_predict(session_id=session_id, png=png)
+                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -498,6 +513,8 @@ class RecordController:
             "/classes/add",
             "/classes/delete",
             "/samples/delete",
+            "/preprocess/preview",
+            "/preview/predict_upload",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
             return
@@ -520,6 +537,51 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1"}, cors=True)
+            return
+        if path == "/preprocess/preview":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            filename = str(payload.get("filename") or "").strip()
+            class_config = payload.get("class_config")
+            sample_config = payload.get("sample_config")
+            if not session_id or not class_name or not filename:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            try:
+                preview = self._preprocess_preview(
+                    session_id=session_id,
+                    class_name=class_name,
+                    filename=filename,
+                    class_config=class_config,
+                    sample_config=sample_config,
+                )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", **preview}, cors=True)
+            return
+        if path == "/preview/predict_upload":
+            session_id = str(payload.get("session") or "").strip()
+            image_b64 = str(payload.get("image_b64") or "").strip()
+            preprocess_mode = str(payload.get("preprocess") or "").strip()
+            if not session_id or not image_b64:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            try:
+                png = base64.b64decode(image_b64, validate=True)
+                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(
+                req,
+                {
+                    "ok": "1",
+                    **pred,
+                    "image_b64": image_b64,
+                },
+                cors=True,
+            )
             return
         if path == "/export/run":
             session_id = str(payload.get("session") or "").strip()
@@ -704,34 +766,65 @@ class RecordController:
     def _classes_meta_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_classes.json"
 
+    def _processed_cache_dir(self, dataset_root: Path) -> Path:
+        return dataset_root.parent / ".tm_processed_cache"
+
+    def _classes_meta_load(self, dataset_root: Path) -> Dict[str, Any]:
+        p = self._classes_meta_path(dataset_root)
+        if not p.exists():
+            return {}
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
     def _classes_infer_from_dirs(self, dataset_root: Path) -> List[str]:
         out: List[str] = []
         try:
             for p in sorted(dataset_root.iterdir()):
-                if p.is_dir():
+                if p.is_dir() and _list_class_image_files(p):
                     out.append(str(p.name))
         except Exception:
             return []
         return out
 
     def _classes_load(self, dataset_root: Path) -> List[str]:
-        p = self._classes_meta_path(dataset_root)
-        if p.exists():
-            try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
-                classes = raw.get("classes") if isinstance(raw, dict) else None
-                if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
-                    return [str(x) for x in classes]
-            except Exception:
-                pass
+        raw = self._classes_meta_load(dataset_root)
+        classes = raw.get("classes") if isinstance(raw, dict) else None
+        if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
+            return [str(x) for x in classes]
         inferred = self._classes_infer_from_dirs(dataset_root)
         if inferred:
             return inferred
         return ["Class 1", "Class 2"]
 
-    def _classes_save(self, dataset_root: Path, classes: List[str]) -> None:
+    def _class_preprocess_load(self, dataset_root: Path) -> Dict[str, Dict[str, Any]]:
+        raw = self._classes_meta_load(dataset_root)
+        return normalize_class_preprocess_map(raw.get("class_preprocess"))
+
+    def _sample_preprocess_load(self, dataset_root: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        raw = self._classes_meta_load(dataset_root)
+        return normalize_sample_preprocess_map(raw.get("sample_preprocess"))
+
+    def _classes_save(
+        self,
+        dataset_root: Path,
+        classes: List[str],
+        class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+        sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    ) -> None:
         p = self._classes_meta_path(dataset_root)
-        p.write_text(json.dumps({"classes": list(classes)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        payload: Dict[str, Any] = {"classes": list(classes)}
+        existing = self._class_preprocess_load(dataset_root)
+        merged = normalize_class_preprocess_map(class_preprocess if class_preprocess is not None else existing)
+        existing_sample = self._sample_preprocess_load(dataset_root)
+        merged_sample = normalize_sample_preprocess_map(sample_preprocess if sample_preprocess is not None else existing_sample)
+        if merged:
+            payload["class_preprocess"] = merged
+        if merged_sample:
+            payload["sample_preprocess"] = merged_sample
+        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _next_class_name(self, existing: List[str]) -> str:
         s = set([str(x).strip() for x in existing if str(x).strip()])
@@ -748,8 +841,10 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         classes = self._classes_load(cfg.dataset_root)
+        class_preprocess = self._class_preprocess_load(cfg.dataset_root)
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
         classes = list(classes) + [self._next_class_name(classes)]
-        self._classes_save(cfg.dataset_root, classes)
+        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
         return classes
 
     def _classes_delete(self, session_id: str, name: str) -> List[str]:
@@ -776,9 +871,16 @@ class RecordController:
         if len(classes) < 2:
             raise ValueError("At least 2 classes are required.")
         class_dir = cfg.dataset_root / sanitize_class_name(actual_name)
+        processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(actual_name)
+        class_preprocess = self._class_preprocess_load(cfg.dataset_root)
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_preprocess.pop(actual_name, None)
+        sample_preprocess.pop(actual_name, None)
         if class_dir.exists():
             shutil.rmtree(class_dir)
-        self._classes_save(cfg.dataset_root, classes)
+        if processed_dir.exists():
+            shutil.rmtree(processed_dir)
+        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
         return classes
 
     def _classes_rename(self, session_id: str, old_name: str, new_name: str) -> List[str]:
@@ -790,6 +892,8 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         classes = self._classes_load(cfg.dataset_root)
+        class_preprocess = self._class_preprocess_load(cfg.dataset_root)
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
         if old_name not in classes:
             raise ValueError("Class not found.")
         if new_name in classes and new_name != old_name:
@@ -797,11 +901,18 @@ class RecordController:
 
         old_dir = cfg.dataset_root / sanitize_class_name(old_name)
         new_dir = cfg.dataset_root / sanitize_class_name(new_name)
+        old_processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(old_name)
+        new_processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(new_name)
         if old_dir.resolve() != new_dir.resolve():
             if new_dir.exists():
                 raise ValueError("Target class folder already exists.")
             if old_dir.exists():
                 old_dir.rename(new_dir)
+        if old_processed_dir.resolve() != new_processed_dir.resolve():
+            if new_processed_dir.exists():
+                raise ValueError("Target processed folder already exists.")
+            if old_processed_dir.exists():
+                old_processed_dir.rename(new_processed_dir)
 
         updated: List[str] = []
         replaced = False
@@ -813,7 +924,11 @@ class RecordController:
                 updated.append(c)
         if not replaced:
             raise ValueError("Class not found.")
-        self._classes_save(cfg.dataset_root, updated)
+        if old_name in class_preprocess:
+            class_preprocess[new_name] = class_preprocess.pop(old_name)
+        if old_name in sample_preprocess:
+            sample_preprocess[new_name] = sample_preprocess.pop(old_name)
+        self._classes_save(cfg.dataset_root, updated, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
         return updated
 
     def _start_record(self, session_id: str, source: str, class_name: str) -> None:
@@ -1076,6 +1191,7 @@ class RecordController:
         dataset_root = cfg.dataset_root
         workspace_root = dataset_root.parent
         classes_meta = self._classes_meta_path(dataset_root)
+        processed_cache_dir = self._processed_cache_dir(dataset_root)
         latest = self._train_result_path(dataset_root)
         meta: Dict[str, Any] = {}
         if latest.exists():
@@ -1097,12 +1213,24 @@ class RecordController:
             "train_latest": "tm_train_latest.json" if latest.exists() else "",
             "train_run_dir": "",
             "project_state": "tm_project_state.json",
+            "processed_cache_dir": "",
         }
 
         run_dir = Path(str(meta.get("run_dir") or "")).expanduser().resolve() if meta else Path()
         include_run_dir = bool(run_dir) and run_dir.exists() and str(run_dir).startswith(str(workspace_root.resolve()))
         if include_run_dir:
             manifest["train_run_dir"] = "runs/latest"
+        class_preprocess = normalize_class_preprocess_map(merged_project_state.get("class_preprocess"))
+        sample_preprocess = normalize_sample_preprocess_map(merged_project_state.get("sample_preprocess"))
+        if processed_cache_dir.exists():
+            shutil.rmtree(processed_cache_dir)
+        self._rebuild_processed_cache(
+            dataset_root,
+            class_preprocess=class_preprocess,
+            sample_preprocess=sample_preprocess,
+        )
+        if processed_cache_dir.exists():
+            manifest["processed_cache_dir"] = "processed_cache"
 
         tmp_path = save_path.with_suffix(".tmproj.tmp")
         if tmp_path.exists():
@@ -1126,6 +1254,12 @@ class RecordController:
                         continue
                     rel = p.relative_to(dataset_root)
                     zf.write(p, arcname=str(Path("dataset") / rel))
+            if processed_cache_dir.exists():
+                for p in processed_cache_dir.rglob("*"):
+                    if p.is_dir():
+                        continue
+                    rel = p.relative_to(processed_cache_dir)
+                    zf.write(p, arcname=str(Path("processed_cache") / rel))
             if include_run_dir:
                 for p in run_dir.rglob("*"):
                     if p.is_dir():
@@ -1198,6 +1332,13 @@ class RecordController:
                     classes = sorted([str(x) for x in dirs]) if dirs else ["Class 1", "Class 2"]
                 self._classes_save(dataset_root, classes)
 
+            processed_cache_in = tmp_dir / str(manifest.get("processed_cache_dir") or "")
+            processed_cache_out = self._processed_cache_dir(dataset_root)
+            if processed_cache_out.exists():
+                shutil.rmtree(processed_cache_out)
+            if processed_cache_in.exists():
+                shutil.copytree(processed_cache_in, processed_cache_out)
+
             latest_in = tmp_dir / "tm_train_latest.json"
             latest_out = self._train_result_path(dataset_root)
             run_dir_hint = str(manifest.get("train_run_dir") or "")
@@ -1243,6 +1384,7 @@ class RecordController:
         dataset_root = cfg.dataset_root
         workspace_root = dataset_root.parent
         classes_meta = self._classes_meta_path(dataset_root)
+        processed_cache_dir = self._processed_cache_dir(dataset_root)
         latest = self._train_result_path(dataset_root)
         if dataset_root.exists():
             for p in list(dataset_root.iterdir()):
@@ -1257,6 +1399,8 @@ class RecordController:
             latest.unlink(missing_ok=True)
         if classes_meta.exists():
             classes_meta.unlink(missing_ok=True)
+        if processed_cache_dir.exists():
+            shutil.rmtree(processed_cache_dir, ignore_errors=True)
         runs_dir = workspace_root / "runs"
         if runs_dir.exists():
             try:
@@ -1297,6 +1441,18 @@ class RecordController:
                     out[key] = float(src.get(key))
                 except Exception:
                     out[key] = float(fallback)
+            preprocess_mode = str(src.get("preprocess_mode") or "").strip().lower()
+            if preprocess_mode in {"auto_by_label", "manual_roi", "none", "sign", "junction"}:
+                out["preprocess_mode"] = preprocess_mode
+            manual_roi = normalize_manual_roi(src.get("manual_roi"))
+            if manual_roi is not None:
+                out["manual_roi"] = list(manual_roi)
+            class_preprocess = normalize_class_preprocess_map(src.get("class_preprocess"))
+            if class_preprocess:
+                out["class_preprocess"] = class_preprocess
+            sample_preprocess = normalize_sample_preprocess_map(src.get("sample_preprocess"))
+            if sample_preprocess:
+                out["sample_preprocess"] = sample_preprocess
             return out
 
         if isinstance(project_state, dict):
@@ -1333,10 +1489,119 @@ class RecordController:
         if not target.exists():
             raise FileNotFoundError("sample not found")
         target.unlink()
+        processed = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(class_name) / (Path(filename).stem + ".png")
+        processed.unlink(missing_ok=True)
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_map = sample_preprocess.get(class_name)
+        if isinstance(class_map, dict):
+            class_map.pop(Path(filename).name, None)
+            if not class_map:
+                sample_preprocess.pop(class_name, None)
+            self._classes_save(
+                cfg.dataset_root,
+                self._classes_load(cfg.dataset_root),
+                class_preprocess=self._class_preprocess_load(cfg.dataset_root),
+                sample_preprocess=sample_preprocess,
+            )
         return self._class_state_payload(cfg.dataset_root, class_name)
+
+    def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
+        return _preview_item_payload(path)
+
+    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None) -> bytes:
+        config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
+        img = Image.open(_bytes_io(png)).convert("L")
+        arr = preprocess_for_label(
+            np.asarray(img),
+            out_size=96,
+            color_mode="grayscale",
+            label_name=label_name,
+            preprocess_mode=str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
+            manual_roi=config.get("manual_roi"),
+        )
+        out = np.asarray(np.clip(arr[:, :, 0] * 255.0, 0.0, 255.0), dtype=np.uint8)
+        return _to_png_bytes(Image.fromarray(out, mode="L"))
+
+    def _rebuild_processed_cache(
+        self,
+        dataset_root: Path,
+        class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+        sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    ) -> None:
+        classes = self._classes_load(dataset_root)
+        cache_root = self._processed_cache_dir(dataset_root)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        class_preprocess = normalize_class_preprocess_map(class_preprocess if class_preprocess is not None else self._class_preprocess_load(dataset_root))
+        sample_preprocess = normalize_sample_preprocess_map(sample_preprocess if sample_preprocess is not None else self._sample_preprocess_load(dataset_root))
+        for class_name in classes:
+            src_dir = dataset_root / sanitize_class_name(class_name)
+            dst_dir = cache_root / sanitize_class_name(class_name)
+            if dst_dir.exists():
+                shutil.rmtree(dst_dir)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            if not src_dir.exists():
+                continue
+            config = class_preprocess.get(class_name, {})
+            class_sample_map = sample_preprocess.get(class_name, {})
+            for src in _list_class_image_files(src_dir):
+                try:
+                    png = src.read_bytes()
+                    out_png = self._preprocess_image_png(
+                        png,
+                        label_name=class_name,
+                        class_config=config,
+                        sample_config=class_sample_map.get(src.name),
+                    )
+                    (dst_dir / f"{src.stem}.png").write_bytes(out_png)
+                except Exception:
+                    continue
+
+    def _processed_previews_payload(self, dataset_root: Path, classes: List[str]) -> Dict[str, List[Dict[str, str]]]:
+        out: Dict[str, List[Dict[str, str]]] = {}
+        cache_root = self._processed_cache_dir(dataset_root)
+        for class_name in classes:
+            items: List[Dict[str, str]] = []
+            class_dir = cache_root / sanitize_class_name(class_name)
+            if class_dir.exists():
+                for p in sorted(class_dir.glob("*.png"))[:12]:
+                    try:
+                        items.append(self._processed_preview_item_payload(p))
+                    except Exception:
+                        continue
+            out[class_name] = items
+        return out
+
+    def _preprocess_preview(
+        self,
+        session_id: str,
+        class_name: str,
+        filename: str,
+        class_config: Any,
+        sample_config: Any = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        class_dir = cfg.dataset_root / sanitize_class_name(class_name)
+        src = (class_dir / Path(filename).name).resolve()
+        if src.parent != class_dir.resolve() or not src.exists():
+            raise FileNotFoundError("sample not found")
+        out_png = self._preprocess_image_png(
+            src.read_bytes(),
+            label_name=class_name,
+            class_config=class_config,
+            sample_config=sample_config,
+        )
+        return {"image_b64": base64.b64encode(out_png).decode("ascii")}
 
     def _project_state_payload(self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         classes = self._classes_load(dataset_root)
+        class_preprocess = self._class_preprocess_load(dataset_root)
+        sample_preprocess = self._sample_preprocess_load(dataset_root)
+        if isinstance(project_state, dict):
+            class_preprocess = normalize_class_preprocess_map(project_state.get("class_preprocess") or class_preprocess)
+            sample_preprocess = normalize_sample_preprocess_map(project_state.get("sample_preprocess") or sample_preprocess)
         counts: Dict[str, int] = {}
         previews: Dict[str, List[Dict[str, str]]] = {}
         for c in classes:
@@ -1366,10 +1631,14 @@ class RecordController:
             except Exception:
                 export_enabled = False
         train_cfg = self._project_train_cfg(dataset_root, project_state=project_state)
+        processed_previews = self._processed_previews_payload(dataset_root, classes)
         payload = {
             "classes": list(classes),
             "counts": counts,
             "sample_previews": previews,
+            "processed_previews": processed_previews,
+            "class_preprocess": class_preprocess,
+            "sample_preprocess": sample_preprocess,
             "export_enabled": "1" if export_enabled else "0",
         }
         if train_cfg:
@@ -1414,6 +1683,9 @@ class RecordController:
             "tflite_path": str(tflite_path),
             "tflite_mtime": mtime,
             "labels": list(labels),
+            "preprocess_mode": str(meta.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL) if isinstance(meta, dict) else PREPROCESS_MODE_AUTO_BY_LABEL,
+            "manual_roi": normalize_manual_roi(meta.get("manual_roi")) if isinstance(meta, dict) else None,
+            "class_preprocess": normalize_class_preprocess_map(meta.get("class_preprocess")) if isinstance(meta, dict) else {},
             "interpreter": interpreter,
             "input_details": input_details,
             "output_details": output_details,
@@ -1422,24 +1694,30 @@ class RecordController:
             self._preview[session_id] = cur
         return cur
 
-    def _preview_predict(self, session_id: str, png: bytes) -> Dict[str, Any]:
+    def _preview_predict(self, session_id: str, png: bytes, preprocess_mode: str = "") -> Dict[str, Any]:
         model = self._preview_load_model(session_id=session_id)
         interpreter = model["interpreter"]
         input_details = model["input_details"]
         output_details = model["output_details"]
         labels: List[str] = list(model.get("labels") or [])
+        model_preprocess_mode = str(model.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
+        preprocess_mode = str(preprocess_mode or model_preprocess_mode or PREPROCESS_MODE_AUTO_BY_LABEL).strip().lower()
+        manual_roi = normalize_manual_roi(model.get("manual_roi"))
+        class_preprocess = normalize_class_preprocess_map(model.get("class_preprocess"))
         shape_raw = input_details.get("shape")
         shape = tuple(int(x) for x in (shape_raw if shape_raw is not None else []))
         if len(shape) != 4:
             raise RuntimeError("unsupported input shape")
         _, h, w, c = shape
         img = Image.open(_bytes_io(png)).convert("L" if int(c) == 1 else "RGB")
-        arr = focus_and_enhance_array(
+        prepared = prepare_inference_inputs(
             np.asarray(img),
             out_size=int(w),
             color_mode="grayscale" if int(c) == 1 else "rgb",
+            preprocess_mode=preprocess_mode,
+            manual_roi=manual_roi,
+            class_preprocess=class_preprocess,
         )
-        arr = np.expand_dims(arr, axis=0)
         qscale = 0.0
         qzp = 0
         q = input_details.get("quantization")
@@ -1447,38 +1725,55 @@ class RecordController:
             qscale = float(q[0] or 0.0)
             qzp = int(q[1] or 0)
         dtype = input_details.get("dtype")
-        if dtype is not None and dtype != np.float32 and qscale > 0:
-            qarr = np.round(arr / qscale + qzp)
-            if dtype == np.int8:
-                qarr = np.clip(qarr, -128, 127).astype(np.int8)
-            elif dtype == np.uint8:
-                qarr = np.clip(qarr, 0, 255).astype(np.uint8)
+
+        def _invoke_one(arr: np.ndarray) -> np.ndarray:
+            batch = np.expand_dims(arr, axis=0)
+            if dtype is not None and dtype != np.float32 and qscale > 0:
+                qarr = np.round(batch / qscale + qzp)
+                if dtype == np.int8:
+                    x = np.clip(qarr, -128, 127).astype(np.int8)
+                elif dtype == np.uint8:
+                    x = np.clip(qarr, 0, 255).astype(np.uint8)
+                else:
+                    x = qarr.astype(dtype)
             else:
-                qarr = qarr.astype(dtype)
-            x = qarr
+                x = batch.astype(np.float32)
+            out_idx = int(output_details.get("index"))
+            in_idx = int(input_details.get("index"))
+            with self._preview_model_lock(session_id):
+                interpreter.set_tensor(in_idx, x)
+                interpreter.invoke()
+                out = interpreter.get_tensor(out_idx)
+            out = np.asarray(out).reshape((-1,))
+            oscale = 0.0
+            ozp = 0
+            oq = output_details.get("quantization")
+            if isinstance(oq, (tuple, list)) and len(oq) == 2:
+                oscale = float(oq[0] or 0.0)
+                ozp = int(oq[1] or 0)
+            odtype = output_details.get("dtype")
+            if odtype is not None and odtype != np.float32 and oscale > 0:
+                scores = (out.astype(np.float32) - float(ozp)) * float(oscale)
+            else:
+                scores = out.astype(np.float32)
+            scores = scores - float(np.max(scores))
+            expv = np.exp(scores)
+            return expv / float(np.sum(expv) + 1e-12)
+
+        variant_probs = {name: _invoke_one(arr) for name, arr in prepared.items()}
+
+        if preprocess_mode == PREPROCESS_MODE_AUTO_BY_LABEL and "sign" in variant_probs and "junction" in variant_probs and labels:
+            sign_probs = variant_probs["sign"]
+            junction_probs = variant_probs["junction"]
+            probs = np.zeros_like(sign_probs)
+            for idx, label_name in enumerate(labels):
+                probs[idx] = junction_probs[idx] if class_clip_mode(label_name) == CLIP_MODE_JUNCTION else sign_probs[idx]
+            total = float(np.sum(probs))
+            if total > 0.0:
+                probs = probs / total
         else:
-            x = arr.astype(np.float32)
-        out_idx = int(output_details.get("index"))
-        in_idx = int(input_details.get("index"))
-        with self._preview_model_lock(session_id):
-            interpreter.set_tensor(in_idx, x)
-            interpreter.invoke()
-            out = interpreter.get_tensor(out_idx)
-        out = np.asarray(out).reshape((-1,))
-        oscale = 0.0
-        ozp = 0
-        oq = output_details.get("quantization")
-        if isinstance(oq, (tuple, list)) and len(oq) == 2:
-            oscale = float(oq[0] or 0.0)
-            ozp = int(oq[1] or 0)
-        odtype = output_details.get("dtype")
-        if odtype is not None and odtype != np.float32 and oscale > 0:
-            scores = (out.astype(np.float32) - float(ozp)) * float(oscale)
-        else:
-            scores = out.astype(np.float32)
-        scores = scores - float(np.max(scores))
-        expv = np.exp(scores)
-        probs = expv / float(np.sum(expv) + 1e-12)
+            probs = next(iter(variant_probs.values()))
+
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
         top_i = int(np.argmax(probs)) if probs.size else 0
@@ -1560,7 +1855,7 @@ class RecordController:
 
             cfg = TrainConfig(
                 img_size=int(cfg_dict.get("img_size") or 96),
-            color_mode="grayscale",
+                color_mode="grayscale",
                 batch_size=int(cfg_dict.get("batch_size") or 16),
                 epochs=int(cfg_dict.get("epochs") or 10),
                 validation_split=float(cfg_dict.get("validation_split") or 0.2),
@@ -1571,17 +1866,30 @@ class RecordController:
                 conv2_filters=int(cfg_dict.get("conv2_filters") or 16),
                 dense_units=int(cfg_dict.get("dense_units") or 32),
                 representative_samples=int(cfg_dict.get("representative_samples") or 200),
+                preprocess_mode=str(cfg_dict.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
+                manual_roi=normalize_manual_roi(cfg_dict.get("manual_roi")),
+                class_preprocess=normalize_class_preprocess_map(cfg_dict.get("class_preprocess")),
+                sample_preprocess=normalize_sample_preprocess_map(cfg_dict.get("sample_preprocess")),
+                use_preprocessed_dataset=True,
             )
 
             workspace_root = sess_cfg.dataset_root.parent
             run_dir = new_run_dir(workspace_root / "runs")
+            processed_dataset_dir = self._processed_cache_dir(sess_cfg.dataset_root)
+
+            self._train_set(session_id, progress=0.01, message="Preparing ROI dataset...")
+            self._rebuild_processed_cache(
+                sess_cfg.dataset_root,
+                class_preprocess=cfg.class_preprocess,
+                sample_preprocess=cfg.sample_preprocess,
+            )
 
             def on_progress(p: float, msg: str) -> None:
                 self._train_set(session_id, progress=p, message=msg)
 
-            self._train_set(session_id, progress=0.01, message="Preparing...")
+            self._train_set(session_id, progress=0.03, message="Starting training...")
             result: TrainResult = train_and_export(
-                dataset_dir=sess_cfg.dataset_root,
+                dataset_dir=processed_dataset_dir,
                 run_dir=run_dir,
                 cfg=cfg,
                 progress=on_progress,
@@ -1597,6 +1905,11 @@ class RecordController:
                 "metrics": dict(result.metrics),
                 "img_size": int(cfg.img_size),
                 "color_mode": str(cfg.color_mode),
+                "preprocess_mode": str(cfg.preprocess_mode),
+                "manual_roi": list(cfg.manual_roi) if cfg.manual_roi is not None else None,
+                "class_preprocess": normalize_class_preprocess_map(cfg.class_preprocess),
+                "sample_preprocess": normalize_sample_preprocess_map(cfg.sample_preprocess),
+                "trained_dataset_dir": str(processed_dataset_dir),
             }
             latest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             self._train_set(session_id, progress=1.0, message="Done.", result_path=str(latest), done=True)
@@ -1749,23 +2062,28 @@ class RecordController:
         if not cfg.serial_port:
             self._live_set(key, error="Serial port is not configured.")
             return
-        reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
-        try:
-            reader.open()
-            while self._live_running(key):
-                raw = reader.read_frame(timeout_s=2.0)
+        last_error = ""
+        while self._live_running(key):
+            reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+            try:
+                reader.open()
+                raw = reader.read_frame(timeout_s=1.5)
                 capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box)
                 self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
-        except Exception as e:
-            msg = str(e) or "Unable to read from serial device."
-            if len(msg) > 220:
-                msg = msg[:220] + "..."
-            self._live_set(key, error=msg)
-        finally:
-            try:
-                reader.close()
-            except Exception:
-                pass
+                last_error = ""
+            except Exception as e:
+                msg = str(e) or "Unable to read from serial device."
+                if len(msg) > 220:
+                    msg = msg[:220] + "..."
+                if msg != last_error:
+                    self._live_set(key, error=msg)
+                    last_error = msg
+                time.sleep(0.06)
+            finally:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
 
     def _live_webcam(self, key: str, cfg: SessionConfig) -> None:
         permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)

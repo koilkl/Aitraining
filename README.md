@@ -33,12 +33,20 @@ Goal: students should not need to install Python. Double-click to launch.
   - `Load folder` stays disabled until a folder path is present
   - Supported input layouts are documented below in `Dataset Folder Structure`
   - Imported class names come from folder / label names
-- Preprocess (optional):
-  - Use the `Preprocess` section to keep the raw image or define an ROI box
 - Training:
   - The middle `Training` panel trains an int8 TFLite model from the current workspace
+  - The `Advanced` section is now focused on model hyperparameters only, such as batch size, epochs, learning rate, and layer sizes
+  - Image preprocessing is configured per class from the preprocess button shown next to each class name
+  - Each class preprocess page supports:
+    - `Auto by Label`: automatically route road-sign classes to the sign ROI pipeline and junction classes to the junction pipeline
+    - `Sign`: force the sign-style ROI pipeline for that class
+    - `Junction`: force the junction-style crop for that class
+    - `Manual ROI`: draw a custom ROI directly on a sample image for that class
+    - `Full Frame`: disable extra ROI cropping for that class
+  - This per-class workflow is recommended when one project mixes classes such as `LEFT`, `RIGHT`, and `CROSS`
 - Preview / Export:
   - The right `Preview` panel runs preview inference after training
+  - Use the visible `Auto / Sign / Junction` tabs in the preview header to switch inference preprocessing without opening settings
   - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
@@ -154,9 +162,10 @@ project.tmproj
 
 - Main files:
   - `manifest.json`: archive format/version and internal paths such as `dataset/` and `runs/latest/`
-  - `tm_classes.json`: current class order used by the workspace UI
+  - `tm_classes.json`: current class order plus per-class preprocess settings used by the workspace UI
   - `tm_train_latest.json`: latest trained model metadata and export references
   - `dataset/`: samples saved in dataset format, grouped by class
+  - `processed_cache/`: cached processed previews regenerated from the current preprocess settings when available
   - `dataset/labels.txt` and `dataset/labels.json`: label list stored with the samples
   - `runs/latest/`: latest training outputs, included only when a trained run exists
 

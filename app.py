@@ -942,6 +942,8 @@ def _render_new_project() -> None:
                         conv2_filters=int(train_cfg_state.get("conv2_filters", getattr(prev_cfg, "conv2_filters", 16))),
                         dense_units=int(train_cfg_state.get("dense_units", getattr(prev_cfg, "dense_units", 32))),
                         representative_samples=int(getattr(prev_cfg, "representative_samples", 200)),
+                        preprocess_mode=str(train_cfg_state.get("preprocess_mode", getattr(prev_cfg, "preprocess_mode", "auto_by_label"))),
+                        manual_roi=train_cfg_state.get("manual_roi", getattr(prev_cfg, "manual_roi", None)),
                     )
                 st.session_state.project_type = "image"
                 _tm_set_query_params(tm_project="image", tm_session=st.session_state.session_id)
@@ -998,6 +1000,8 @@ def _render_train_config(cfg: TrainConfig) -> TrainConfig:
         conv2_filters=int(conv2_filters),
         dense_units=int(dense_units),
         representative_samples=int(cfg.representative_samples),
+        preprocess_mode=str(getattr(cfg, "preprocess_mode", "auto_by_label")),
+        manual_roi=getattr(cfg, "manual_roi", None),
     )
 
 
@@ -1248,6 +1252,8 @@ def _render_tm_old_frontend_html(
             "conv1_filters": int(train_cfg.conv1_filters),
             "conv2_filters": int(train_cfg.conv2_filters),
             "dense_units": int(train_cfg.dense_units),
+            "preprocess_mode": str(getattr(train_cfg, "preprocess_mode", "auto_by_label")),
+            "manual_roi": list(getattr(train_cfg, "manual_roi", []) or []) or None,
         },
     }
     debug_server_url = "http://127.0.0.1:7777/event"
@@ -1275,16 +1281,51 @@ def _render_tm_old_frontend_html(
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     :root {{
+      color-scheme: light;
       --bg: #f5f7fa;
       --card: #ffffff;
+      --surface: #ffffff;
+      --surface-soft: #f4f7fb;
+      --surface-elevated: #ffffff;
+      --surface-frost: rgba(255,255,255,0.72);
       --shadow: 0 2px 8px rgba(0,0,0,0.08);
       --blue: #1a73e8;
       --blue-bg: #e8f0fe;
       --blue-bg-hover: #d2e3fc;
       --text: #202124;
+      --text-inverse: #ffffff;
       --muted: #5f6368;
       --line: #c5c8cc;
+      --input-bg: #ffffff;
+      --input-border: rgba(0,0,0,0.12);
+      --overlay: rgba(32,33,36,0.56);
+      --danger: #d93025;
+      --danger-soft: #fff1f3;
       --radius: 12px;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        color-scheme: dark;
+        --bg: #0f141a;
+        --card: #1a212b;
+        --surface: #18202a;
+        --surface-soft: #111821;
+        --surface-elevated: #202833;
+        --surface-frost: rgba(24,32,42,0.88);
+        --shadow: 0 10px 30px rgba(0,0,0,0.32);
+        --blue: #8ab4f8;
+        --blue-bg: rgba(138,180,248,0.16);
+        --blue-bg-hover: rgba(138,180,248,0.24);
+        --text: #e8eaed;
+        --text-inverse: #0f141a;
+        --muted: #a8b0ba;
+        --line: rgba(255,255,255,0.12);
+        --input-bg: #111821;
+        --input-border: rgba(255,255,255,0.12);
+        --overlay: rgba(0,0,0,0.62);
+        --danger: #f28b82;
+        --danger-soft: rgba(242,139,130,0.16);
+      }}
     }}
     html, body {{
       height: 100%;
@@ -1507,13 +1548,13 @@ def _render_tm_old_frontend_html(
       accent-color: var(--blue);
     }}
     .preview-select {{
-      border: 1px solid rgba(0,0,0,0.12);
+      border: 1px solid var(--input-border);
       border-radius: 8px;
       padding: 7px 10px;
       font-size: 12px;
       font-weight: 700;
       color: var(--text);
-      background: white;
+      background: var(--input-bg);
     }}
     .preview-pane img {{
       width: 100%;
@@ -1632,16 +1673,17 @@ def _render_tm_old_frontend_html(
       overflow-wrap: normal;
       white-space: normal;
     }}
-    .train-adv-row input {{
+    .train-adv-row input,
+    .train-adv-row select {{
       width: 100%;
       box-sizing: border-box;
-      border: 1px solid rgba(0,0,0,0.18);
+      border: 1px solid var(--input-border);
       border-radius: 8px;
       padding: 10px 12px;
       font-size: 15px;
       font-weight: 700;
       color: var(--blue);
-      background: white;
+      background: var(--input-bg);
       text-align: right;
       min-width: 128px;
     }}
@@ -1829,6 +1871,276 @@ def _render_tm_old_frontend_html(
     .btn-primary:hover {{
       background: #1669d4;
     }}
+    .preprocess-chip {{
+      border: 0;
+      border-radius: 999px;
+      background: rgba(26,115,232,0.10);
+      color: var(--blue);
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .preprocess-chip:hover {{
+      background: rgba(26,115,232,0.16);
+    }}
+    #classPreprocessModal {{
+      z-index: 2400;
+      align-items: stretch;
+      justify-content: stretch;
+      padding: 18px;
+    }}
+    .class-preprocess-shell {{
+      width: min(1240px, calc(100vw - 36px));
+      height: min(840px, calc(100vh - 36px));
+      background: var(--card);
+      border-radius: 18px;
+      box-shadow: 0 18px 44px rgba(0,0,0,0.28);
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.9fr);
+    }}
+    .class-preprocess-left {{
+      background: var(--blue-bg);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 0;
+      min-height: 0;
+    }}
+    .class-preprocess-right {{
+      background: var(--surface-elevated);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+    }}
+    .class-preprocess-visuals {{
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1.18fr) minmax(260px, 0.82fr);
+      gap: 14px;
+      align-items: stretch;
+    }}
+    .class-preprocess-visual-pane {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 0;
+    }}
+    .class-preprocess-visual-title {{
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }}
+    .class-preprocess-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--blue);
+      font-size: 15px;
+      font-weight: 700;
+    }}
+    .class-preprocess-stage {{
+      flex: 1;
+      min-height: 0;
+      border-radius: 16px;
+      background: var(--surface-frost);
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      touch-action: none;
+      cursor: crosshair;
+    }}
+    .class-preprocess-stage img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+    }}
+    .roi-overlay {{
+      position: absolute;
+      border: 2px solid #1a73e8;
+      background: rgba(26,115,232,0.14);
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.35) inset;
+      pointer-events: none;
+    }}
+    .class-preprocess-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+      gap: 10px;
+    }}
+    .class-preprocess-thumb {{
+      border: 0;
+      border-radius: 10px;
+      padding: 4px;
+      background: rgba(26,115,232,0.08);
+      cursor: pointer;
+    }}
+    .class-preprocess-thumb.active {{
+      background: rgba(26,115,232,0.20);
+      box-shadow: 0 0 0 2px rgba(26,115,232,0.22) inset;
+    }}
+    .class-preprocess-thumb.defined {{
+      background: rgba(30, 142, 62, 0.14);
+      box-shadow: 0 0 0 2px rgba(30, 142, 62, 0.28) inset;
+    }}
+    .class-preprocess-thumb img {{
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      border-radius: 8px;
+      display: block;
+      background: #eef3f9;
+    }}
+    .class-preprocess-thumb-state {{
+      margin-top: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      text-align: center;
+      color: var(--muted);
+    }}
+    .class-preprocess-thumb.defined .class-preprocess-thumb-state {{
+      color: #1e8e3e;
+    }}
+    .preview-mode-tabs {{
+      display: inline-flex;
+      gap: 6px;
+      padding: 4px;
+      border-radius: 999px;
+      background: rgba(26,115,232,0.08);
+    }}
+    .preview-mode-tab {{
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .preview-mode-tab.active {{
+      background: var(--surface-elevated);
+      color: var(--blue);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }}
+    .class-preprocess-fields {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }}
+    .class-preprocess-fields label,
+    .class-preprocess-side label {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }}
+    .class-preprocess-fields input,
+    .class-preprocess-side input,
+    .class-preprocess-side select {{
+      border: 1px solid var(--input-border);
+      border-radius: 10px;
+      padding: 9px 10px;
+      font-size: 13px;
+      color: var(--text);
+      background: var(--input-bg);
+      width: 100%;
+      box-sizing: border-box;
+    }}
+    .class-preprocess-info {{
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .class-preprocess-current {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+    .class-preprocess-current .class-preprocess-info {{
+      flex: 1;
+      min-width: 0;
+    }}
+    .class-preprocess-result {{
+      border-radius: 14px;
+      background: var(--surface-soft);
+      min-height: 0;
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }}
+    .class-preprocess-mode-row {{
+      display: flex;
+      align-items: end;
+      gap: 10px;
+    }}
+    .class-preprocess-mode-row label {{
+      flex: 1;
+      min-width: 0;
+    }}
+    .class-preprocess-mode-save {{
+      white-space: nowrap;
+      align-self: end;
+    }}
+    .class-preprocess-status-row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .class-preprocess-status-chip {{
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(26,115,232,0.12);
+      color: var(--blue);
+    }}
+    .class-preprocess-status-chip.dirty {{
+      background: rgba(217,119,6,0.14);
+      color: #b45309;
+    }}
+    .class-preprocess-result img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }}
+    .class-preprocess-actions {{
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: auto;
+    }}
+    @media (max-width: 1100px) {{
+      .class-preprocess-shell {{
+        grid-template-columns: minmax(0, 1fr);
+      }}
+      .class-preprocess-visuals {{
+        grid-template-columns: minmax(0, 1fr);
+      }}
+      .class-preprocess-left {{
+        min-height: 440px;
+      }}
+    }}
     .source-panel {{
       margin-top: 16px;
       margin-left: 0;
@@ -1841,14 +2153,14 @@ def _render_tm_old_frontend_html(
       border-radius: 0 0 12px 12px;
     }}
     .source-left {{
-      background: #dfe9f7;
+      background: var(--blue-bg);
       padding: 18px;
       display: flex;
       flex-direction: column;
       gap: 14px;
     }}
     .source-right {{
-      background: white;
+      background: var(--surface-elevated);
       padding: 22px 24px;
       display: flex;
       flex-direction: column;
@@ -1872,7 +2184,7 @@ def _render_tm_old_frontend_html(
       flex: 1;
       border-radius: 12px;
       overflow: hidden;
-      background: rgba(255,255,255,0.4);
+      background: color-mix(in srgb, var(--surface-elevated) 55%, transparent);
       min-height: 220px;
       display: flex;
       align-items: center;
@@ -1882,7 +2194,7 @@ def _render_tm_old_frontend_html(
       width: 100%;
       height: 100%;
       display: block;
-      background: #dfe3e8;
+      background: var(--surface-soft);
       object-fit: contain;
       image-rendering: auto;
     }}
@@ -1908,7 +2220,7 @@ def _render_tm_old_frontend_html(
       margin-top: 12px;
       padding: 12px;
       border-radius: 12px;
-      background: rgba(255,255,255,0.78);
+      background: color-mix(in srgb, var(--surface-elevated) 84%, transparent);
       border: 1px solid rgba(26,115,232,0.16);
       box-shadow: 0 6px 18px rgba(0,0,0,0.05);
       box-sizing: border-box;
@@ -1933,12 +2245,12 @@ def _render_tm_old_frontend_html(
     .source-settings-grid input,
     .source-settings-grid select {{
       width: 100%;
-      border: 1px solid rgba(0,0,0,0.12);
+      border: 1px solid var(--input-border);
       border-radius: 8px;
       padding: 9px 10px;
       font-size: 13px;
       color: var(--text);
-      background: #fff;
+      background: var(--input-bg);
       box-sizing: border-box;
       min-width: 0;
     }}
@@ -1985,12 +2297,12 @@ def _render_tm_old_frontend_html(
     .device-select {{
       margin-top: 12px;
       width: 100%;
-      border: 1px solid rgba(0,0,0,0.12);
+      border: 1px solid var(--input-border);
       border-radius: 8px;
       padding: 10px 12px;
       font-size: 13px;
       color: var(--text);
-      background: white;
+      background: var(--input-bg);
     }}
     .device-help {{
       margin-top: 10px;
@@ -2046,7 +2358,7 @@ def _render_tm_old_frontend_html(
       border: 0;
       border-radius: 999px;
       background: rgba(32, 33, 36, 0.82);
-      color: #fff;
+      color: var(--text-inverse);
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -2156,12 +2468,12 @@ def _render_tm_old_frontend_html(
       font-weight: 600;
     }}
     .field input {{
-      border: 1px solid rgba(0,0,0,0.12);
+      border: 1px solid var(--input-border);
       border-radius: 8px;
       padding: 10px 12px;
       font-size: 13px;
       color: var(--text);
-      background: white;
+      background: var(--input-bg);
     }}
   </style>
 </head>
@@ -2199,6 +2511,7 @@ def _render_tm_old_frontend_html(
     </div>
   </div>
 </div>
+<div class="modal-backdrop" id="classPreprocessModal"></div>
 <div class="wrap">
   <svg class="flow" viewBox="0 0 1200 700" preserveAspectRatio="none" aria-hidden="true">
     <path id="flowClass1" d="" />
@@ -2241,11 +2554,12 @@ def _render_tm_old_frontend_html(
         </div>
         <div class="preview-controls">
           <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
+          <div class="preview-mode-tabs" id="previewModeTabs">
+            <button class="preview-mode-tab" type="button" data-preview-mode="auto_by_label">Auto</button>
+            <button class="preview-mode-tab" type="button" data-preview-mode="sign">Sign</button>
+            <button class="preview-mode-tab" type="button" data-preview-mode="junction">Junction</button>
+          </div>
           <div class="preview-controls-right">
-            <select class="preview-select" id="previewSourceSelect">
-              <option value="webcam">Webcam</option>
-              <option value="device">Device</option>
-            </select>
             <button class="iconbtn source-settings" type="button" id="previewSettingsToggle" title="Input settings">⚙</button>
           </div>
         </div>
@@ -2275,7 +2589,7 @@ def _render_tm_old_frontend_html(
         box.style.padding = '8px 10px';
         box.style.borderRadius = '999px';
         box.style.background = 'rgba(32,33,36,0.88)';
-        box.style.color = '#fff';
+          box.style.color = themeVar('--text-inverse', '#fff');
         box.style.font = '11px/1.2 system-ui, -apple-system, Segoe UI, sans-serif';
         box.style.whiteSpace = 'pre-wrap';
         document.body.appendChild(box);
@@ -2297,9 +2611,9 @@ def _render_tm_old_frontend_html(
         box.style.zIndex = '99999';
         box.style.padding = '12px 14px';
         box.style.borderRadius = '10px';
-        box.style.background = '#fff1f3';
-        box.style.border = '1px solid #fda4af';
-        box.style.color = '#9f1239';
+          box.style.background = themeVar('--danger-soft', '#fff1f3');
+          box.style.border = `1px solid ${{themeVar('--danger', '#f28b82')}}`;
+          box.style.color = themeVar('--text', '#202124');
         box.style.font = '12px/1.45 system-ui, -apple-system, Segoe UI, sans-serif';
         box.style.whiteSpace = 'pre-wrap';
         document.body.appendChild(box);
@@ -2600,15 +2914,30 @@ let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
 let currentSerialSync = String(STATE.current_serial_sync || 'AA 55 AA');
 let previewInputOn = false;
 let previewSource = 'webcam';
+let previewPreprocessMode = 'auto_by_label';
+let previewUploadImageSrc = '';
+let previewUploadImageB64 = '';
+let previewUploadFilename = '';
 let previewPredictTimer = null;
 let previewPredictInFlight = false;
 let previewPredictToken = 0;
 let previewSettingsOpen = false;
+let classPreprocessOpen = false;
+let classPreprocessClass = '';
+let classPreprocessDraft = null;
+let classPreprocessSampleIndex = 0;
+let classPreprocessProcessedSrc = '';
+let classPreprocessBusy = false;
+let classPreprocessScrollTop = 0;
+let classPreprocessDirty = false;
 let navMenuOpen = false;
 let navMenuBound = false;
 let resizeBound = false;
 STATE.counts = STATE.counts || {{}};
 STATE.sample_previews = STATE.sample_previews || {{}};
+STATE.class_preprocess = STATE.class_preprocess || {{}};
+STATE.sample_preprocess = STATE.sample_preprocess || {{}};
+STATE.processed_previews = STATE.processed_previews || {{}};
 const openSourceStorageKey = `tm-open-source-${{STATE.session}}`;
 const trainCfgStorageKey = `tm-train-cfg-${{STATE.session}}`;
 const previewStorageKey = `tm-preview-${{STATE.session}}`;
@@ -2689,6 +3018,12 @@ function restoreTrainCfgFromStorage() {{
     if ('conv1_filters' in data) next.conv1_filters = clampInt(data.conv1_filters, 1, 256, nullish(prev.conv1_filters, 8));
     if ('conv2_filters' in data) next.conv2_filters = clampInt(data.conv2_filters, 1, 512, nullish(prev.conv2_filters, 16));
     if ('dense_units' in data) next.dense_units = clampInt(data.dense_units, 1, 2048, nullish(prev.dense_units, 32));
+    if (data.preprocess_mode === 'auto_by_label' || data.preprocess_mode === 'manual_roi' || data.preprocess_mode === 'none') {{
+      next.preprocess_mode = String(data.preprocess_mode);
+    }}
+    if (Array.isArray(data.manual_roi) && data.manual_roi.length === 4) {{
+      next.manual_roi = data.manual_roi.map((v, idx) => clampFloat(v, 0, 1, idx < 2 ? 0 : 1));
+    }}
     STATE.train_cfg = next;
   }} catch (e) {{}}
 }}
@@ -2697,6 +3032,605 @@ function persistTrainCfgStorage() {{
     window.localStorage.setItem(trainCfgStorageKey, JSON.stringify(STATE.train_cfg || {{}}));
   }} catch (e) {{}}
 }}
+function normalizeClassPreprocessConfig(raw) {{
+  const src = raw && typeof raw === 'object' ? raw : {{}};
+  const mode = ['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(src.mode || ''))
+    ? String(src.mode)
+    : 'auto_by_label';
+  let manual = null;
+  if (Array.isArray(src.manual_roi) && src.manual_roi.length === 4) {{
+    manual = src.manual_roi.map((v, idx) => {{
+      const n = Number(v);
+      if (!isFinite(n)) return idx < 2 ? 0 : 1;
+      return Math.max(0, Math.min(1, n));
+    }});
+    manual[2] = Math.max(manual[2], manual[0] + 0.01);
+    manual[3] = Math.max(manual[3], manual[1] + 0.01);
+    manual[0] = Math.min(manual[0], manual[2] - 0.01);
+    manual[1] = Math.min(manual[1], manual[3] - 0.01);
+  }}
+  return {{ mode, manual_roi: manual }};
+}}
+function getClassPreprocessConfig(className) {{
+  const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
+  return normalizeClassPreprocessConfig(all[className]);
+}}
+function setClassPreprocessConfig(className, cfg) {{
+  const next = Object.assign({{}}, STATE.class_preprocess || {{}});
+  next[className] = normalizeClassPreprocessConfig(cfg);
+  STATE.class_preprocess = next;
+}}
+function normalizeSamplePreprocessMap(raw) {{
+  const src = raw && typeof raw === 'object' ? raw : {{}};
+  const out = {{}};
+  for (const [className, value] of Object.entries(src)) {{
+    if (!value || typeof value !== 'object') continue;
+    const classKey = String(className || '').trim();
+    if (!classKey) continue;
+    const classMap = {{}};
+    for (const [filename, cfg] of Object.entries(value)) {{
+      const fileKey = String(filename || '').trim();
+      if (!fileKey) continue;
+      classMap[fileKey] = normalizeClassPreprocessConfig(cfg);
+    }}
+    if (Object.keys(classMap).length) out[classKey] = classMap;
+  }}
+  return out;
+}}
+function getSampleOwnPreprocessConfig(className, filename) {{
+  const map = normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}});
+  const classMap = map[String(className || '')] || {{}};
+  return normalizeClassPreprocessConfig(classMap[String(filename || '')] || null);
+}}
+function sampleHasOwnPreprocessConfig(className, filename) {{
+  const map = STATE.sample_preprocess && typeof STATE.sample_preprocess === 'object' ? STATE.sample_preprocess : {{}};
+  const classMap = map[String(className || '')];
+  if (!classMap || typeof classMap !== 'object') return false;
+  return Object.prototype.hasOwnProperty.call(classMap, String(filename || ''));
+}}
+function getSampleEffectivePreprocessConfig(className, filename) {{
+  if (sampleHasOwnPreprocessConfig(className, filename)) {{
+    return getSampleOwnPreprocessConfig(className, filename);
+  }}
+  return getClassPreprocessConfig(className);
+}}
+function samePreprocessConfig(a, b) {{
+  const left = normalizeClassPreprocessConfig(a);
+  const right = normalizeClassPreprocessConfig(b);
+  if (String(left.mode || '') !== String(right.mode || '')) return false;
+  const lroi = Array.isArray(left.manual_roi) ? left.manual_roi : null;
+  const rroi = Array.isArray(right.manual_roi) ? right.manual_roi : null;
+  if (!lroi && !rroi) return true;
+  if (!lroi || !rroi || lroi.length !== 4 || rroi.length !== 4) return false;
+  for (let i = 0; i < 4; i += 1) {{
+    if (Math.abs(Number(lroi[i] || 0) - Number(rroi[i] || 0)) > 1e-6) return false;
+  }}
+  return true;
+}}
+function setSamplePreprocessConfig(className, filename, cfg) {{
+  const name = String(className || '').trim();
+  const file = String(filename || '').trim();
+  if (!name || !file) return;
+  const next = normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}});
+  const classDefault = getClassPreprocessConfig(name);
+  const normalized = normalizeClassPreprocessConfig(cfg);
+  if (samePreprocessConfig(normalized, classDefault)) {{
+    if (next[name] && typeof next[name] === 'object') {{
+      delete next[name][file];
+      if (!Object.keys(next[name]).length) delete next[name];
+    }}
+  }} else {{
+    if (!next[name] || typeof next[name] !== 'object') next[name] = {{}};
+    next[name][file] = normalized;
+  }}
+  STATE.sample_preprocess = next;
+}}
+function deleteSamplePreprocessConfig(className, filename) {{
+  const next = normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}});
+  const name = String(className || '').trim();
+  const file = String(filename || '').trim();
+  if (next[name] && typeof next[name] === 'object') {{
+    delete next[name][file];
+    if (!Object.keys(next[name]).length) delete next[name];
+  }}
+  STATE.sample_preprocess = next;
+}}
+function selectedClassSample(className) {{
+  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  if (!items.length) return null;
+  const idx = Math.max(0, Math.min(items.length - 1, Number(classPreprocessSampleIndex || 0)));
+  classPreprocessSampleIndex = idx;
+  return items[idx];
+}}
+function selectedClassSampleFilename(className) {{
+  const sample = selectedClassSample(className);
+  return sample ? String(previewFilename(sample) || '') : '';
+}}
+function classPreprocessModeLabel(mode) {{
+  if (mode === 'sign') return 'Sign ROI';
+  if (mode === 'junction') return 'Junction ROI';
+  if (mode === 'manual_roi') return 'Manual ROI';
+  if (mode === 'none') return 'Full Frame';
+  return 'Auto';
+}}
+function samplePreprocessStatus(className, filename) {{
+  return sampleHasOwnPreprocessConfig(className, filename) ? 'Edited' : 'Auto';
+}}
+function currentClassPreprocessDirty() {{
+  if (!classPreprocessClass) return false;
+  const filename = selectedClassSampleFilename(classPreprocessClass);
+  if (!filename) return false;
+  return !samePreprocessConfig(
+    classPreprocessDraft,
+    getSampleEffectivePreprocessConfig(classPreprocessClass, filename)
+  );
+}}
+function maybeDiscardClassPreprocessDraft() {{
+  classPreprocessDirty = currentClassPreprocessDirty();
+  if (!classPreprocessDirty) return true;
+  return window.confirm('This sample has unsaved ROI changes. Discard them?');
+}}
+function saveCurrentClassPreprocessSample(closeAfterSave = false) {{
+  const filename = selectedClassSampleFilename(classPreprocessClass);
+  if (!classPreprocessClass || !filename) return;
+  setSamplePreprocessConfig(classPreprocessClass, filename, classPreprocessDraft);
+  classPreprocessDirty = false;
+  render();
+  if (closeAfterSave) {{
+    closeClassPreprocessEditor(true);
+    return;
+  }}
+  renderClassPreprocessModal();
+  refreshClassProcessedPreview();
+}}
+function rememberClassPreprocessScroll() {{
+  const pane = document.getElementById('classPreprocessRightPane');
+  if (!pane) return;
+  classPreprocessScrollTop = Number(pane.scrollTop || 0);
+}}
+function restoreClassPreprocessScroll() {{
+  const pane = document.getElementById('classPreprocessRightPane');
+  if (!pane) return;
+  pane.scrollTop = Math.max(0, Number(classPreprocessScrollTop || 0));
+}}
+async function refreshClassProcessedPreview() {{
+  if (!classPreprocessOpen || !classPreprocessClass) return;
+  const sample = selectedClassSample(classPreprocessClass);
+  if (!sample) {{
+    classPreprocessProcessedSrc = '';
+    renderClassPreprocessModal();
+    return;
+  }}
+  classPreprocessBusy = true;
+  renderClassPreprocessModal();
+  try {{
+    const res = await fetch(`${{baseUrl}}/preprocess/preview`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        class: classPreprocessClass,
+        filename: String(previewFilename(sample) || ''),
+        class_config: getClassPreprocessConfig(classPreprocessClass),
+        sample_config: normalizeClassPreprocessConfig(classPreprocessDraft)
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to render preprocess preview.');
+    classPreprocessProcessedSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+  }} catch (err) {{
+    classPreprocessProcessedSrc = '';
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    classPreprocessBusy = false;
+    renderClassPreprocessModal();
+  }}
+}}
+function openClassPreprocessEditor(className) {{
+  classPreprocessClass = String(className || '');
+  classPreprocessSampleIndex = 0;
+  classPreprocessDraft = normalizeClassPreprocessConfig(
+    getSampleEffectivePreprocessConfig(classPreprocessClass, selectedClassSampleFilename(classPreprocessClass))
+  );
+  classPreprocessProcessedSrc = '';
+  classPreprocessDirty = false;
+  classPreprocessOpen = true;
+  renderClassPreprocessModal();
+  refreshClassProcessedPreview();
+}}
+function closeClassPreprocessEditor(force = false) {{
+  if (!force && !maybeDiscardClassPreprocessDraft()) return;
+  classPreprocessOpen = false;
+  classPreprocessClass = '';
+  classPreprocessDraft = null;
+  classPreprocessProcessedSrc = '';
+  classPreprocessBusy = false;
+  classPreprocessDirty = false;
+  renderClassPreprocessModal();
+}}
+  function getClassPreprocessImageContentRect() {{
+    const stage = document.getElementById('classPreprocessStage');
+    const img = document.getElementById('classPreprocessImage');
+    if (!stage || !img) return null;
+    const stageRect = stage.getBoundingClientRect();
+    if (!stageRect.width || !stageRect.height) return null;
+    const naturalW = Number(img.naturalWidth || 0);
+    const naturalH = Number(img.naturalHeight || 0);
+    if (naturalW <= 0 || naturalH <= 0) {{
+      return {{
+        stageLeft: stageRect.left,
+        stageTop: stageRect.top,
+        stageWidth: stageRect.width,
+        stageHeight: stageRect.height,
+        left: stageRect.left,
+        top: stageRect.top,
+        width: stageRect.width,
+        height: stageRect.height,
+        offsetX: 0,
+        offsetY: 0,
+      }};
+    }}
+    const scale = Math.min(stageRect.width / naturalW, stageRect.height / naturalH);
+    const width = naturalW * scale;
+    const height = naturalH * scale;
+    const offsetX = (stageRect.width - width) * 0.5;
+    const offsetY = (stageRect.height - height) * 0.5;
+    return {{
+      stageLeft: stageRect.left,
+      stageTop: stageRect.top,
+      stageWidth: stageRect.width,
+      stageHeight: stageRect.height,
+      left: stageRect.left + offsetX,
+      top: stageRect.top + offsetY,
+      width,
+      height,
+      offsetX,
+      offsetY,
+    }};
+  }}
+  function normalizeClassPreprocessClientPoint(clientX, clientY, allowClamp = true) {{
+    const rect = getClassPreprocessImageContentRect();
+    if (!rect || !rect.width || !rect.height) return null;
+    const inside = clientX >= rect.left && clientX <= (rect.left + rect.width)
+      && clientY >= rect.top && clientY <= (rect.top + rect.height);
+    if (!inside && !allowClamp) return null;
+    const px = allowClamp ? Math.max(rect.left, Math.min(rect.left + rect.width, clientX)) : clientX;
+    const py = allowClamp ? Math.max(rect.top, Math.min(rect.top + rect.height, clientY)) : clientY;
+    return {{
+      x: Math.max(0, Math.min(1, (px - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (py - rect.top) / rect.height)),
+    }};
+  }}
+  function applyClassPreprocessMode(mode) {{
+    const nextMode = ['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(mode || ''))
+      ? String(mode)
+      : 'auto_by_label';
+    rememberClassPreprocessScroll();
+    const next = normalizeClassPreprocessConfig(Object.assign({{}}, classPreprocessDraft || {{}}, {{mode: nextMode}}));
+    if (!next.manual_roi) next.manual_roi = [0, 0, 1, 1];
+    classPreprocessDraft = next;
+    classPreprocessDirty = true;
+    renderClassPreprocessModal();
+    refreshClassProcessedPreview();
+  }}
+  function nudgeClassPreprocessRoi(dx, dy) {{
+    if (!classPreprocessOpen || !classPreprocessDraft || String(classPreprocessDraft.mode || 'auto_by_label') !== 'manual_roi') return;
+    rememberClassPreprocessScroll();
+    const draft = normalizeClassPreprocessConfig(classPreprocessDraft);
+    const roi = Array.isArray(draft.manual_roi) && draft.manual_roi.length === 4 ? draft.manual_roi.slice() : [0, 0, 1, 1];
+    const width = Math.max(0.01, Math.min(1, Number(roi[2] || 1) - Number(roi[0] || 0)));
+    const height = Math.max(0.01, Math.min(1, Number(roi[3] || 1) - Number(roi[1] || 0)));
+    const nextX1 = Math.max(0, Math.min(1 - width, Number(roi[0] || 0) + Number(dx || 0)));
+    const nextY1 = Math.max(0, Math.min(1 - height, Number(roi[1] || 0) + Number(dy || 0)));
+    draft.manual_roi = [nextX1, nextY1, nextX1 + width, nextY1 + height];
+    classPreprocessDraft = normalizeClassPreprocessConfig(draft);
+    classPreprocessDirty = true;
+    renderClassPreprocessModal();
+    refreshClassProcessedPreview();
+  }}
+function updateClassPreprocessOverlay(roi) {{
+  const overlay = document.getElementById('classPreprocessOverlay');
+  if (!overlay) return;
+    const valid = Array.isArray(roi) && roi.length === 4 && classPreprocessDraft && String(classPreprocessDraft.mode || 'auto_by_label') === 'manual_roi';
+  if (!valid) {{
+    overlay.style.display = 'none';
+    return;
+  }}
+    const rect = getClassPreprocessImageContentRect();
+    if (!rect || !rect.width || !rect.height) {{
+      overlay.style.display = 'none';
+      return;
+    }}
+  const x1 = Math.max(0, Math.min(1, Number(roi[0] || 0)));
+  const y1 = Math.max(0, Math.min(1, Number(roi[1] || 0)));
+  const x2 = Math.max(x1, Math.min(1, Number(roi[2] || x1)));
+  const y2 = Math.max(y1, Math.min(1, Number(roi[3] || y1)));
+  overlay.style.display = 'block';
+    overlay.style.left = `${{rect.offsetX + x1 * rect.width}}px`;
+    overlay.style.top = `${{rect.offsetY + y1 * rect.height}}px`;
+    overlay.style.width = `${{Math.max(0, (x2 - x1) * rect.width)}}px`;
+    overlay.style.height = `${{Math.max(0, (y2 - y1) * rect.height)}}px`;
+}}
+function syncClassPreprocessRoiInputs(roi) {{
+  if (!Array.isArray(roi) || roi.length !== 4) return;
+  const ids = ['classPreprocessX1', 'classPreprocessY1', 'classPreprocessX2', 'classPreprocessY2'];
+  ids.forEach((id, idx) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.value = Number(roi[idx] || 0).toFixed(2);
+  }});
+}}
+function bindClassPreprocessStage() {{
+  const stage = document.getElementById('classPreprocessStage');
+  const img = document.getElementById('classPreprocessImage');
+  if (!stage || !img) return;
+  let dragStart = null;
+  const applyPoint = (clientX, clientY, finalize = false) => {{
+    if (!dragStart || !classPreprocessDraft || String(classPreprocessDraft.mode || 'auto_by_label') !== 'manual_roi') return;
+      const start = normalizeClassPreprocessClientPoint(dragStart.x, dragStart.y, true);
+      const end = normalizeClassPreprocessClientPoint(clientX, clientY, true);
+      if (!start || !end) return;
+      const x1 = start.x;
+      const y1 = start.y;
+      const x2 = end.x;
+      const y2 = end.y;
+    const nextRoi = [
+      Math.min(x1, x2),
+      Math.min(y1, y2),
+      Math.max(x1, x2),
+      Math.max(y1, y2),
+    ];
+    classPreprocessDraft.manual_roi = nextRoi;
+    classPreprocessDraft = normalizeClassPreprocessConfig(classPreprocessDraft);
+    classPreprocessDirty = true;
+    updateClassPreprocessOverlay(classPreprocessDraft.manual_roi);
+    syncClassPreprocessRoiInputs(classPreprocessDraft.manual_roi);
+    if (finalize) {{
+      renderClassPreprocessModal();
+      refreshClassProcessedPreview();
+    }}
+  }};
+  stage.onpointerdown = (e) => {{
+    if (!classPreprocessDraft || String(classPreprocessDraft.mode || 'auto_by_label') !== 'manual_roi') return;
+      const start = normalizeClassPreprocessClientPoint(e.clientX, e.clientY, false);
+      if (!start) return;
+    dragStart = {{x: e.clientX, y: e.clientY}};
+    try {{ stage.setPointerCapture(e.pointerId); }} catch (err) {{}}
+    applyPoint(e.clientX, e.clientY, false);
+    e.preventDefault();
+  }};
+  stage.onpointermove = (e) => {{
+    if (!dragStart) return;
+    applyPoint(e.clientX, e.clientY, false);
+  }};
+  stage.onpointerup = (e) => {{
+    if (!dragStart) return;
+    applyPoint(e.clientX, e.clientY, true);
+    dragStart = null;
+  }};
+  stage.onpointercancel = () => {{
+    dragStart = null;
+  }};
+    const syncOverlay = () => updateClassPreprocessOverlay(classPreprocessDraft && classPreprocessDraft.manual_roi);
+    if (img.complete) syncOverlay();
+    img.onload = syncOverlay;
+}}
+function renderClassPreprocessModal() {{
+  const host = document.getElementById('classPreprocessModal');
+  if (!host) return;
+  if (!classPreprocessOpen || !classPreprocessClass) {{
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }}
+  const sample = selectedClassSample(classPreprocessClass);
+  const sampleFilename = sample ? String(previewFilename(sample) || '') : '';
+  const cfg = normalizeClassPreprocessConfig(
+    classPreprocessDraft || getSampleEffectivePreprocessConfig(classPreprocessClass, sampleFilename)
+  );
+  classPreprocessDraft = cfg;
+  const roi = Array.isArray(cfg.manual_roi) && cfg.manual_roi.length === 4 ? cfg.manual_roi : null;
+  const left = roi ? roi[0] * 100 : 0;
+  const top = roi ? roi[1] * 100 : 0;
+  const width = roi ? Math.max(0, (roi[2] - roi[0]) * 100) : 0;
+  const height = roi ? Math.max(0, (roi[3] - roi[1]) * 100) : 0;
+  const samples = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[classPreprocessClass]) || []);
+  const dirty = currentClassPreprocessDirty();
+  classPreprocessDirty = dirty;
+  const thumbs = samples.map((item, idx) => `
+    <button class="class-preprocess-thumb${{idx === classPreprocessSampleIndex ? ' active' : ''}}${{sampleHasOwnPreprocessConfig(classPreprocessClass, String(previewFilename(item) || '')) ? ' defined' : ''}}" type="button" data-preprocess-sample="${{idx}}">
+      <img src="${{escapeHtml(previewSrc(item))}}" alt="Sample ${{idx + 1}}"/>
+      <div class="class-preprocess-thumb-state">${{samplePreprocessStatus(classPreprocessClass, String(previewFilename(item) || ''))}}</div>
+    </button>
+  `).join('');
+  host.style.display = 'flex';
+  host.innerHTML = `
+    <div class="class-preprocess-shell">
+      <div class="class-preprocess-left">
+        <div class="class-preprocess-head">
+          <span>${{escapeHtml(classPreprocessClass)}} · ${{classPreprocessModeLabel(cfg.mode)}}</span>
+          <button class="iconbtn" type="button" id="classPreprocessCloseTop">✕</button>
+        </div>
+        <div class="class-preprocess-visuals">
+          <div class="class-preprocess-visual-pane">
+            <div class="class-preprocess-visual-title">Original Sample</div>
+            <div class="class-preprocess-stage" id="classPreprocessStage">
+              ${{
+                sample
+                  ? `<img id="classPreprocessImage" src="${{escapeHtml(previewSrc(sample))}}" alt="Raw sample"/>`
+                  : `<div class="preview-empty">This class has no samples yet.</div>`
+              }}
+                <div class="roi-overlay" id="classPreprocessOverlay" style="display:${{roi && cfg.mode === 'manual_roi' ? 'block' : 'none'}};"></div>
+            </div>
+          </div>
+          <div class="class-preprocess-visual-pane">
+            <div class="class-preprocess-visual-title">Processed Preview</div>
+            <div class="class-preprocess-result">${{classPreprocessProcessedSrc ? `<img src="${{escapeHtml(classPreprocessProcessedSrc)}}" alt="Processed preview"/>` : `<div class="preview-empty">${{classPreprocessBusy ? 'Rendering...' : 'Choose a sample to preview preprocessing.'}}</div>`}}</div>
+          </div>
+        </div>
+          <div class="class-preprocess-info">In Manual ROI mode, drag directly on the original image and save the current sample. Shortcuts: F1 Auto, F2 Sign, F3 Junction, F4 Manual ROI, F5 Full Frame, S Save, D Delete Sample, Esc Close, Arrow Keys Move ROI.</div>
+      </div>
+      <div class="class-preprocess-right class-preprocess-side" id="classPreprocessRightPane">
+        <div class="class-preprocess-current class-preprocess-status-row">
+          <div class="class-preprocess-info">Current Sample: ${{sampleFilename ? escapeHtml(sampleFilename) : 'No sample selected'}} · ${{samplePreprocessStatus(classPreprocessClass, sampleFilename)}}</div>
+          <div class="class-preprocess-status-chip${{dirty ? ' dirty' : ''}}">${{dirty ? 'Unsaved' : 'Saved'}}</div>
+          <button class="btn btn-secondary" type="button" id="classPreprocessDeleteSample"${{sampleFilename ? '' : ' disabled'}}>Delete Sample</button>
+        </div>
+        <div class="class-preprocess-mode-row">
+          <label>
+            Preprocess Mode
+            <select id="classPreprocessMode">
+              <option value="auto_by_label"${{cfg.mode === 'auto_by_label' ? ' selected' : ''}}>Auto by Label</option>
+              <option value="sign"${{cfg.mode === 'sign' ? ' selected' : ''}}>Sign</option>
+              <option value="junction"${{cfg.mode === 'junction' ? ' selected' : ''}}>Junction</option>
+              <option value="manual_roi"${{cfg.mode === 'manual_roi' ? ' selected' : ''}}>Manual ROI</option>
+              <option value="none"${{cfg.mode === 'none' ? ' selected' : ''}}>Full Frame</option>
+            </select>
+          </label>
+          <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
+        </div>
+        <div class="class-preprocess-fields">
+          <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
+          <label>ROI Y1<input id="classPreprocessY1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[1].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
+          <label>ROI X2<input id="classPreprocessX2" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[2].toFixed(2) : '1.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
+          <label>ROI Y2<input id="classPreprocessY2" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[3].toFixed(2) : '1.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
+        </div>
+        <div>
+          <div class="class-preprocess-info">Samples</div>
+          <div class="class-preprocess-grid">${{thumbs || '<div class="preview-empty">No samples yet.</div>'}}</div>
+        </div>
+        <div class="class-preprocess-actions">
+          <button class="btn btn-secondary" type="button" id="classPreprocessCancel">Close</button>
+        </div>
+      </div>
+    </div>
+  `;
+  restoreClassPreprocessScroll();
+  const rightPane = document.getElementById('classPreprocessRightPane');
+  if (rightPane) {{
+    rightPane.onscroll = () => {{
+      classPreprocessScrollTop = Number(rightPane.scrollTop || 0);
+    }};
+  }}
+  const closeTop = document.getElementById('classPreprocessCloseTop');
+  const cancel = document.getElementById('classPreprocessCancel');
+  const deleteSampleBtn = document.getElementById('classPreprocessDeleteSample');
+  const save = document.getElementById('classPreprocessSave');
+  const modeSel = document.getElementById('classPreprocessMode');
+  const bindRoi = (id, idx) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.onchange = () => {{
+      rememberClassPreprocessScroll();
+      const draft = normalizeClassPreprocessConfig(classPreprocessDraft);
+      const roiNow = Array.isArray(draft.manual_roi) && draft.manual_roi.length === 4 ? draft.manual_roi.slice() : [0, 0, 1, 1];
+      const n = Number(el.value);
+      if (!isFinite(n)) return;
+      roiNow[idx] = Math.max(0, Math.min(1, n));
+      draft.manual_roi = roiNow;
+      classPreprocessDraft = normalizeClassPreprocessConfig(draft);
+      classPreprocessDirty = true;
+      renderClassPreprocessModal();
+      refreshClassProcessedPreview();
+    }};
+  }};
+  bindRoi('classPreprocessX1', 0);
+  bindRoi('classPreprocessY1', 1);
+  bindRoi('classPreprocessX2', 2);
+  bindRoi('classPreprocessY2', 3);
+  host.onclick = (e) => {{
+    if (e.target === host) closeClassPreprocessEditor();
+  }};
+  if (closeTop) closeTop.onclick = () => closeClassPreprocessEditor();
+  if (cancel) cancel.onclick = () => closeClassPreprocessEditor();
+  if (deleteSampleBtn) deleteSampleBtn.onclick = async () => {{
+    if (!sampleFilename) return;
+    await deleteSample(classPreprocessClass, sampleFilename);
+  }};
+  if (save) save.onclick = () => {{
+    saveCurrentClassPreprocessSample(false);
+  }};
+  if (modeSel) modeSel.onchange = () => {{
+      applyClassPreprocessMode(modeSel.value);
+  }};
+  host.querySelectorAll('[data-preprocess-sample]').forEach((btn) => {{
+    btn.onclick = () => {{
+      if (!maybeDiscardClassPreprocessDraft()) return;
+      rememberClassPreprocessScroll();
+      classPreprocessSampleIndex = Number(btn.getAttribute('data-preprocess-sample') || 0);
+      classPreprocessDraft = normalizeClassPreprocessConfig(
+        getSampleEffectivePreprocessConfig(classPreprocessClass, selectedClassSampleFilename(classPreprocessClass))
+      );
+      classPreprocessDirty = false;
+      renderClassPreprocessModal();
+      refreshClassProcessedPreview();
+    }};
+  }});
+  bindClassPreprocessStage();
+    updateClassPreprocessOverlay(classPreprocessDraft && classPreprocessDraft.manual_roi);
+}}
+  document.addEventListener('keydown', (e) => {{
+    if (!classPreprocessOpen) return;
+    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+    const target = e.target;
+    const tag = String(target && target.tagName || '').toUpperCase();
+    const isTypingTarget = !!(target && (target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'));
+    if (isTypingTarget) return;
+    const key = String(e.key || '').toUpperCase();
+    const modeMap = {{
+      F1: 'auto_by_label',
+      F2: 'sign',
+      F3: 'junction',
+      F4: 'manual_roi',
+      F5: 'none',
+    }};
+    const nextMode = modeMap[key];
+    if (nextMode) {{
+      e.preventDefault();
+      applyClassPreprocessMode(nextMode);
+      return;
+    }}
+    if (key === 'ESCAPE') {{
+      e.preventDefault();
+      closeClassPreprocessEditor();
+      return;
+    }}
+    if (key === 'S') {{
+      e.preventDefault();
+      if (classPreprocessClass && selectedClassSampleFilename(classPreprocessClass) && currentClassPreprocessDirty()) {{
+        saveCurrentClassPreprocessSample(false);
+      }}
+      return;
+    }}
+    if (key === 'D') {{
+      e.preventDefault();
+      const sampleFilename = classPreprocessClass ? selectedClassSampleFilename(classPreprocessClass) : '';
+      if (classPreprocessClass && sampleFilename) {{
+        deleteSample(classPreprocessClass, sampleFilename);
+      }}
+      return;
+    }}
+    const step = e.shiftKey ? 0.05 : 0.01;
+    if (key === 'ARROWLEFT') {{
+      e.preventDefault();
+      nudgeClassPreprocessRoi(-step, 0);
+      return;
+    }}
+    if (key === 'ARROWRIGHT') {{
+      e.preventDefault();
+      nudgeClassPreprocessRoi(step, 0);
+      return;
+    }}
+    if (key === 'ARROWUP') {{
+      e.preventDefault();
+      nudgeClassPreprocessRoi(0, -step);
+      return;
+    }}
+    if (key === 'ARROWDOWN') {{
+      e.preventDefault();
+      nudgeClassPreprocessRoi(0, step);
+    }}
+  }});
 restoreTrainCfgFromStorage();
 if (window.__tmStageMark) window.__tmStageMark('train-cfg-restored');
 function restorePreviewState() {{
@@ -2706,13 +3640,63 @@ function restorePreviewState() {{
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return;
     previewInputOn = !!data.inputOn;
-    if (data.source === 'webcam' || data.source === 'device') previewSource = String(data.source);
+    if (data.source === 'webcam' || data.source === 'device' || data.source === 'upload') previewSource = String(data.source);
+    if (['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(data.preprocess || ''))) {{
+      previewPreprocessMode = String(data.preprocess);
+    }}
   }} catch (e) {{}}
 }}
 function persistPreviewState() {{
   try {{
-    window.localStorage.setItem(previewStorageKey, JSON.stringify({{inputOn: !!previewInputOn, source: String(previewSource || 'webcam')}}));
+    window.localStorage.setItem(previewStorageKey, JSON.stringify({{
+      inputOn: !!previewInputOn,
+      source: String(previewSource || 'webcam'),
+      preprocess: String(previewPreprocessMode || 'auto_by_label')
+    }}));
   }} catch (e) {{}}
+}}
+function clearPreviewUploadState() {{
+  previewUploadImageSrc = '';
+  previewUploadImageB64 = '';
+  previewUploadFilename = '';
+}}
+  async function fileToB64(file) {{
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }}
+async function pickPreviewUploadFile() {{
+    return await new Promise((resolve) => {{
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/png,image/jpeg,image/jpg,image/bmp,image/gif';
+      input.onchange = async () => {{
+        const file = input.files && input.files[0];
+        if (!file) {{
+          resolve(false);
+          return;
+        }}
+        try {{
+          const b64 = await fileToB64(file);
+          const mime = String(file.type || 'image/png');
+          previewUploadImageB64 = String(b64 || '');
+          previewUploadImageSrc = `data:${{mime}};base64,${{b64}}`;
+          previewUploadFilename = String(file.name || 'upload');
+          previewSource = 'upload';
+          persistPreviewState();
+          renderPreviewSettings();
+          renderPreviewCard();
+          if (previewInputOn) await runPreviewUploadPrediction();
+          resolve(true);
+        }} catch (err) {{
+          toast(String(err && err.message ? err.message : err));
+          resolve(false);
+        }}
+      }};
+      input.click();
+    }});
 }}
 restorePreviewState();
 if (window.__tmStageMark) window.__tmStageMark('preview-restored');
@@ -3088,6 +4072,15 @@ function toast(msg) {{
   el.style.display = 'block';
   setTimeout(() => {{ el.style.display = 'none'; }}, 2400);
 }}
+function themeVar(name, fallback = '') {{
+  try {{
+    const root = document.documentElement;
+    const value = window.getComputedStyle(root).getPropertyValue(name);
+    return String(value || '').trim() || String(fallback || '');
+  }} catch (e) {{
+    return String(fallback || '');
+  }}
+}}
 function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
   return new Promise((resolve) => {{
     let hostDocument = document;
@@ -3099,7 +4092,7 @@ function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
     const overlay = hostDocument.createElement('div');
     overlay.style.position = 'fixed';
     overlay.style.inset = '0';
-    overlay.style.background = 'rgba(32,33,36,0.56)';
+    overlay.style.background = themeVar('--overlay', 'rgba(32,33,36,0.56)');
     overlay.style.display = 'flex';
     overlay.style.alignItems = 'center';
     overlay.style.justifyContent = 'center';
@@ -3108,11 +4101,11 @@ function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
 
     const card = hostDocument.createElement('div');
     card.style.width = 'min(480px, 92vw)';
-    card.style.background = '#fff';
+    card.style.background = themeVar('--surface-elevated', '#fff');
     card.style.borderRadius = '14px';
     card.style.boxShadow = '0 14px 40px rgba(0,0,0,0.28)';
     card.style.padding = '16px';
-    card.style.color = '#202124';
+    card.style.color = themeVar('--text', '#202124');
 
     const title = hostDocument.createElement('div');
     title.style.fontSize = '16px';
@@ -3135,9 +4128,9 @@ function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
     const cancelBtn = hostDocument.createElement('button');
     cancelBtn.type = 'button';
     cancelBtn.textContent = 'Cancel';
-    cancelBtn.style.border = '1px solid rgba(0,0,0,0.16)';
-    cancelBtn.style.background = '#fff';
-    cancelBtn.style.color = '#202124';
+    cancelBtn.style.border = `1px solid ${{themeVar('--input-border', 'rgba(0,0,0,0.16)')}}`;
+    cancelBtn.style.background = themeVar('--input-bg', '#fff');
+    cancelBtn.style.color = themeVar('--text', '#202124');
     cancelBtn.style.padding = '9px 14px';
     cancelBtn.style.borderRadius = '10px';
     cancelBtn.style.cursor = 'pointer';
@@ -3146,8 +4139,8 @@ function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
     okBtn.type = 'button';
     okBtn.textContent = String(confirmText || 'Confirm');
     okBtn.style.border = '0';
-    okBtn.style.background = '#d93025';
-    okBtn.style.color = '#fff';
+    okBtn.style.background = themeVar('--danger', '#d93025');
+    okBtn.style.color = themeVar('--text-inverse', '#fff');
     okBtn.style.padding = '9px 14px';
     okBtn.style.borderRadius = '10px';
     okBtn.style.cursor = 'pointer';
@@ -3184,7 +4177,7 @@ function showOverwriteConfirmDialog(conflicts) {{
     const overlay = hostDocument.createElement('div');
     overlay.style.position = 'fixed';
     overlay.style.inset = '0';
-    overlay.style.background = 'rgba(32,33,36,0.56)';
+    overlay.style.background = themeVar('--overlay', 'rgba(32,33,36,0.56)');
     overlay.style.display = 'flex';
     overlay.style.alignItems = 'center';
     overlay.style.justifyContent = 'center';
@@ -3193,11 +4186,11 @@ function showOverwriteConfirmDialog(conflicts) {{
 
     const card = hostDocument.createElement('div');
     card.style.width = 'min(560px, 92vw)';
-    card.style.background = '#fff';
+    card.style.background = themeVar('--surface-elevated', '#fff');
     card.style.borderRadius = '14px';
     card.style.boxShadow = '0 14px 40px rgba(0,0,0,0.28)';
     card.style.padding = '16px';
-    card.style.color = '#202124';
+    card.style.color = themeVar('--text', '#202124');
 
     const title = hostDocument.createElement('div');
     title.style.fontSize = '16px';
@@ -3230,8 +4223,8 @@ function showOverwriteConfirmDialog(conflicts) {{
     cancelBtn.style.padding = '10px 12px';
     cancelBtn.style.fontWeight = '700';
     cancelBtn.style.cursor = 'pointer';
-    cancelBtn.style.background = '#eef1f5';
-    cancelBtn.style.color = '#202124';
+    cancelBtn.style.background = themeVar('--surface-soft', '#eef1f5');
+    cancelBtn.style.color = themeVar('--text', '#202124');
 
     const okBtn = hostDocument.createElement('button');
     okBtn.type = 'button';
@@ -3241,8 +4234,8 @@ function showOverwriteConfirmDialog(conflicts) {{
     okBtn.style.padding = '10px 12px';
     okBtn.style.fontWeight = '700';
     okBtn.style.cursor = 'pointer';
-    okBtn.style.background = '#1a73e8';
-    okBtn.style.color = '#fff';
+    okBtn.style.background = themeVar('--blue', '#1a73e8');
+    okBtn.style.color = themeVar('--text-inverse', '#fff');
 
     let done = false;
     function finish(value) {{
@@ -3310,6 +4303,12 @@ function applyProjectState(state) {{
   holdRecordSource = '';
   openSourceClass = '';
   openSourceKind = '';
+  classPreprocessOpen = false;
+  classPreprocessClass = '';
+  classPreprocessDraft = null;
+  classPreprocessSampleIndex = 0;
+  classPreprocessProcessedSrc = '';
+  classPreprocessBusy = false;
   clearOpenSourceState();
   previewInputOn = false;
   persistPreviewState();
@@ -3324,6 +4323,12 @@ function applyProjectState(state) {{
   const nextPrev = {{}};
   for (const [k, v] of Object.entries(prev)) nextPrev[String(k)] = normalizePreviewList(v);
   STATE.sample_previews = nextPrev;
+  const processedPrev = s.processed_previews && typeof s.processed_previews === 'object' ? s.processed_previews : {{}};
+  const nextProcessedPrev = {{}};
+  for (const [k, v] of Object.entries(processedPrev)) nextProcessedPrev[String(k)] = normalizePreviewList(v);
+  STATE.processed_previews = nextProcessedPrev;
+  STATE.class_preprocess = s.class_preprocess && typeof s.class_preprocess === 'object' ? Object.assign({{}}, s.class_preprocess) : {{}};
+  STATE.sample_preprocess = normalizeSamplePreprocessMap(s.sample_preprocess);
   STATE.export_enabled = String(s.export_enabled || '0') === '1';
   if (s.train_cfg && typeof s.train_cfg === 'object') {{
     STATE.train_cfg = Object.assign({{}}, STATE.train_cfg || {{}}, s.train_cfg);
@@ -3378,7 +4383,11 @@ async function saveProject() {{
         session: STATE.session,
         save_path: savePath,
         project_state: {{
-          train_cfg: Object.assign({{}}, STATE.train_cfg || {{}})
+          train_cfg: Object.assign({{}}, STATE.train_cfg || {{}}, {{
+            class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}})
+          }}),
+          class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}}),
+          sample_preprocess: normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}})
         }}
       }})
     }});
@@ -3564,7 +4573,10 @@ async function startTrain() {{
       headers: {{'Content-Type':'application/json'}},
       body: JSON.stringify({{
         session: STATE.session,
-        cfg: STATE.train_cfg || {{}}
+        cfg: Object.assign({{}}, STATE.train_cfg || {{}}, {{
+          class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}}),
+          sample_preprocess: normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}})
+        }})
       }})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
@@ -4193,7 +5205,7 @@ async function refreshPreviewPrediction(token) {{
   const note = document.getElementById('previewNote');
   const imgId = 'previewImage';
   try {{
-    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&_ts=${{Date.now()}}`);
+    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&_ts=${{Date.now()}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const src = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
@@ -4221,11 +5233,55 @@ async function refreshPreviewPrediction(token) {{
     previewPredictInFlight = false;
   }}
 }}
+async function runPreviewUploadPrediction() {{
+  if (!previewInputOn || !STATE.export_enabled) return;
+  if (!previewUploadImageB64) {{
+    const note = document.getElementById('previewNote');
+    if (note) note.textContent = 'Choose an image in settings to test upload preview.';
+    return;
+  }}
+  if (previewPredictInFlight) return;
+  previewPredictInFlight = true;
+  const pane = document.getElementById('previewPane');
+  const note = document.getElementById('previewNote');
+  try {{
+    const res = await fetch(`${{baseUrl}}/preview/predict_upload`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        image_b64: previewUploadImageB64,
+        preprocess: previewPreprocessMode,
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
+    const src = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
+    if (pane) {{
+      pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
+      pane.dataset.ready = '1';
+    }}
+    renderOutputBars(data.labels || [], data.probs || []);
+    if (note) {{
+      const top = data.top_label ? `${{String(data.top_label)}}` : '';
+      const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
+      note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)` : `Upload: ${{String(previewUploadFilename || 'image')}}`;
+    }}
+  }} catch (err) {{
+    if (note) note.textContent = String(err && err.message ? err.message : err);
+  }} finally {{
+    previewPredictInFlight = false;
+  }}
+}}
 function startPreviewPredictLoop() {{
   stopPreviewPredictLoop();
   previewPredictToken += 1;
   const token = previewPredictToken;
   stopPreviewLoop();
+  if (previewSource === 'upload') {{
+    runPreviewUploadPrediction();
+    return;
+  }}
   refreshPreviewPrediction(token);
   previewPredictTimer = window.setInterval(
     () => refreshPreviewPrediction(token),
@@ -4314,7 +5370,36 @@ function buildPreviewSettingsMarkup() {{
       Array Name (optional)
       <input id="previewExportArray" value="${{String(exportArrayName || '')}}" placeholder="g_person_detect_model_data"/>
     </label>
+    <label>
+      Input Source
+      <select id="previewInputSource">
+        <option value="webcam"${{previewSource === 'webcam' ? ' selected' : ''}}>Webcam</option>
+        <option value="device"${{previewSource === 'device' ? ' selected' : ''}}>Device</option>
+        <option value="upload"${{previewSource === 'upload' ? ' selected' : ''}}>Upload File</option>
+      </select>
+    </label>
   `;
+  if (previewSource === 'upload') {{
+    return `
+      <div class="source-settings-panel" id="previewSettingsPanel">
+        <div class="source-settings-grid">
+          ${{exportFields}}
+          <label>
+            Test Image
+            <button class="upload-pick" type="button" id="previewUploadPick">Choose image</button>
+          </label>
+          <label>
+            Selected File
+            <input id="previewUploadName" value="${{escapeHtml(String(previewUploadFilename || 'No file selected'))}}" readonly/>
+          </label>
+        </div>
+        <div class="source-settings-actions">
+          <button class="source-settings-cancel" type="button" id="previewSettingsCancel">Close</button>
+          <button class="source-settings-save" type="button" id="previewSettingsSave">Apply</button>
+        </div>
+      </div>
+    `;
+  }}
   if (previewSource === 'device') {{
     return `
       <div class="source-settings-panel" id="previewSettingsPanel">
@@ -4379,10 +5464,20 @@ function renderPreviewSettings() {{
   const cancel = document.getElementById('previewSettingsCancel');
   const save = document.getElementById('previewSettingsSave');
   const portSel = document.getElementById('previewDevicePort');
+  const sourceSel = document.getElementById('previewInputSource');
+  const uploadPick = document.getElementById('previewUploadPick');
   if (portSel) {{
     portSel.onpointerdown = () => refreshSerialPorts(false, 'previewDevicePort');
     portSel.onmousedown = () => refreshSerialPorts(false, 'previewDevicePort');
   }}
+  if (sourceSel) sourceSel.onchange = () => {{
+    previewSource = String(sourceSel.value || 'webcam');
+    renderPreviewSettings();
+  }};
+  if (uploadPick) uploadPick.onclick = async () => {{
+    await pickPreviewUploadFile();
+    renderPreviewSettings();
+  }};
   if (cancel) cancel.onclick = () => {{
     previewSettingsOpen = false;
     renderPreviewSettings();
@@ -4391,8 +5486,12 @@ function renderPreviewSettings() {{
     try {{
       const nameEl = document.getElementById('previewExportName');
       const arrayEl = document.getElementById('previewExportArray');
+      const sourceEl = document.getElementById('previewInputSource');
       exportModelName = String(nameEl ? nameEl.value : exportModelName || 'tm').trim() || 'tm';
       exportArrayName = String(arrayEl ? arrayEl.value : exportArrayName || '').trim();
+      const nextSource = String(sourceEl ? sourceEl.value : previewSource || 'webcam');
+      previewSource = nextSource === 'device' ? 'device' : (nextSource === 'upload' ? 'upload' : 'webcam');
+      persistPreviewState();
       persistExportSettings();
       if (previewSource === 'device') {{
         const portEl = document.getElementById('previewDevicePort');
@@ -4401,7 +5500,7 @@ function renderPreviewSettings() {{
         await setDevicePortGlobal(portEl ? portEl.value : currentSerialPort);
         await setSerialBaudGlobal(baudEl ? baudEl.value : String(currentSerialBaud));
         await setSerialSyncGlobal(syncEl ? syncEl.value : String(currentSerialSync));
-      }} else {{
+      }} else if (previewSource === 'webcam') {{
         const camEl = document.getElementById('previewCamera');
         const rateEl = document.getElementById('previewPreviewRate');
         if (camEl && String(camEl.value) !== String(currentWebcamIndex)) await setWebcamIndexGlobal(camEl.value);
@@ -4412,8 +5511,11 @@ function renderPreviewSettings() {{
       if (previewInputOn) {{
         if (previewPredictTimer) stopPreviewPredictLoop();
         startPreviewPredictLoop();
-      }} else {{
+      }} else if (previewSource !== 'upload') {{
         startPreviewLoop();
+      }} else {{
+        const note = document.getElementById('previewNote');
+        if (note) note.textContent = previewUploadFilename ? `Upload ready: ${{previewUploadFilename}}` : 'Choose an image in settings to test upload preview.';
       }}
     }} catch (err) {{
       toast(String(err && err.message ? err.message : err));
@@ -4430,9 +5532,9 @@ function renderPreviewCard() {{
   const note = document.getElementById('previewNote');
   const output = document.getElementById('previewOutput');
   const toggle = document.getElementById('previewInputToggle');
-  const select = document.getElementById('previewSourceSelect');
   const settingsBtn = document.getElementById('previewSettingsToggle');
-  if (!pane || !note || !output || !toggle || !select || !settingsBtn) return;
+  const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
+  if (!pane || !note || !output || !toggle || !settingsBtn) return;
   if (!STATE.export_enabled) {{
     stopPreviewPredictLoop();
     previewSettingsOpen = false;
@@ -4443,18 +5545,24 @@ function renderPreviewCard() {{
     note.textContent = 'You must train a model on the left before you can preview it here.';
     toggle.checked = false;
     toggle.disabled = true;
-    select.disabled = true;
     settingsBtn.disabled = true;
+    modeTabs.forEach((btn) => {{
+      btn.disabled = true;
+      btn.classList.remove('active');
+    }});
     return;
   }}
   toggle.disabled = false;
-  select.disabled = false;
   settingsBtn.disabled = false;
+  modeTabs.forEach((btn) => {{
+    const active = String(btn.getAttribute('data-preview-mode') || '') === String(previewPreprocessMode || 'auto_by_label');
+    btn.disabled = false;
+    btn.classList.toggle('active', active);
+  }});
   toggle.checked = !!previewInputOn;
-  select.value = previewSource;
   renderPreviewSettings();
   if (!pane.dataset.ready) {{
-    const src = latestPreviewImage();
+    const src = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
     pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Turn on Input to preview live predictions.</div>';
     pane.dataset.ready = '1';
   }}
@@ -4465,15 +5573,17 @@ function renderPreviewCard() {{
   }} else {{
     if (previewPredictTimer) stopPreviewPredictLoop();
     output.innerHTML = '';
-    note.textContent = 'Model ready. Turn on Input to preview it here.';
+    note.textContent = previewSource === 'upload'
+      ? (previewUploadFilename ? `Upload ready: ${{previewUploadFilename}}` : 'Choose an image in settings to test upload preview.')
+      : 'Model ready. Turn on Input to preview it here.';
     if (openSourceClass && (openSourceKind === 'webcam' || openSourceKind === 'device')) startPreviewLoop();
   }}
 }}
 function bindPreviewControls() {{
   const toggle = document.getElementById('previewInputToggle');
-  const select = document.getElementById('previewSourceSelect');
   const settings = document.getElementById('previewSettingsToggle');
-  if (!toggle || !select || !settings) return;
+  const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
+  if (!toggle || !settings) return;
   if (toggle.dataset.bound === '1') return;
   toggle.dataset.bound = '1';
   toggle.onchange = () => {{
@@ -4481,19 +5591,23 @@ function bindPreviewControls() {{
     persistPreviewState();
     renderPreviewCard();
   }};
-  select.onchange = () => {{
-    const v = String(select.value || 'webcam');
-    previewSource = (v === 'device') ? 'device' : 'webcam';
-    persistPreviewState();
-    if (previewPredictTimer) stopPreviewPredictLoop();
-    previewSettingsOpen = false;
-    renderPreviewSettings();
-    renderPreviewCard();
-  }};
   settings.onclick = () => {{
     previewSettingsOpen = !previewSettingsOpen;
     renderPreviewSettings();
   }};
+  modeTabs.forEach((btn) => {{
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.onclick = () => {{
+      previewPreprocessMode = String(btn.getAttribute('data-preview-mode') || 'auto_by_label');
+      persistPreviewState();
+      renderPreviewCard();
+      if (previewInputOn) {{
+        if (previewPredictTimer) stopPreviewPredictLoop();
+        startPreviewPredictLoop();
+      }}
+    }};
+  }});
 }}
 function updateOpenSamplesPanel(className) {{
   const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
@@ -4510,18 +5624,35 @@ function applyClassesState(nextClasses, oldClasses) {{
   const prevClasses = Array.isArray(oldClasses) ? oldClasses.slice() : STATE.classes.slice();
   const oldCounts = Object.assign({{}}, STATE.counts || {{}});
   const oldPreviews = Object.assign({{}}, STATE.sample_previews || {{}});
+  const oldProcessed = Object.assign({{}}, STATE.processed_previews || {{}});
+  const oldClassPreprocess = Object.assign({{}}, STATE.class_preprocess || {{}});
+  const oldSamplePreprocess = normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}});
   const nextCounts = {{}};
   const nextPreviews = {{}};
+  const nextProcessed = {{}};
+  const nextClassPreprocess = {{}};
+  const nextSamplePreprocess = {{}};
   (Array.isArray(nextClasses) ? nextClasses : []).forEach((name, idx) => {{
     const prevName = prevClasses[idx];
     nextCounts[name] = Number(nullish(oldCounts[name], nullish(oldCounts[prevName], 0)));
     nextPreviews[name] = normalizePreviewList(
       Array.isArray(oldPreviews[name]) ? oldPreviews[name] : oldPreviews[prevName]
     );
+    nextProcessed[name] = normalizePreviewList(
+      Array.isArray(oldProcessed[name]) ? oldProcessed[name] : oldProcessed[prevName]
+    );
+    nextClassPreprocess[name] = normalizeClassPreprocessConfig(oldClassPreprocess[name] || oldClassPreprocess[prevName]);
+    const sampleMap = oldSamplePreprocess[name] || oldSamplePreprocess[prevName];
+    if (sampleMap && typeof sampleMap === 'object' && Object.keys(sampleMap).length) {{
+      nextSamplePreprocess[name] = normalizeSamplePreprocessMap({{ [name]: sampleMap }})[name] || {{}};
+    }}
   }});
   STATE.classes = Array.isArray(nextClasses) ? nextClasses.slice() : [];
   STATE.counts = nextCounts;
   STATE.sample_previews = nextPreviews;
+  STATE.processed_previews = nextProcessed;
+  STATE.class_preprocess = nextClassPreprocess;
+  STATE.sample_preprocess = nextSamplePreprocess;
 }}
 async function deleteSample(className, filename) {{
   if (!className || !filename) return;
@@ -4540,6 +5671,21 @@ async function deleteSample(className, filename) {{
     const next = data.state || {{}};
     STATE.counts[className] = Number(next.count || 0);
     STATE.sample_previews[className] = normalizePreviewList(next.previews);
+    STATE.processed_previews[className] = normalizePreviewList(
+      normalizePreviewList(STATE.processed_previews[className]).filter((item) => String(previewFilename(item) || '') !== String(filename || ''))
+    );
+    deleteSamplePreprocessConfig(className, filename);
+    if (classPreprocessOpen && classPreprocessClass === className) {{
+      const remain = normalizePreviewList(STATE.sample_previews[className]);
+      if (!remain.length) {{
+        classPreprocessSampleIndex = 0;
+        classPreprocessProcessedSrc = '';
+      }} else if (classPreprocessSampleIndex >= remain.length) {{
+        classPreprocessSampleIndex = remain.length - 1;
+      }}
+      renderClassPreprocessModal();
+      refreshClassProcessedPreview();
+    }}
     recomputeTrainEnabled();
     syncTrainUi();
     const openHost = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
@@ -4584,6 +5730,9 @@ async function renameClass(oldName) {{
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to rename class.');
     applyClassesState(Array.isArray(data.classes) ? data.classes : STATE.classes, STATE.classes);
+    if (classPreprocessOpen && classPreprocessClass === oldName) {{
+      closeClassPreprocessEditor();
+    }}
     if (openSourceClass === oldName) openSourceClass = nextName;
     if (holdRecordClass === oldName) holdRecordClass = nextName;
     persistOpenSourceState();
@@ -4631,6 +5780,9 @@ async function deleteClass(name) {{
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to delete class.');
     applyClassesState(Array.isArray(data.classes) ? data.classes : prev.filter((x) => x !== name), prev);
+    if (classPreprocessOpen && classPreprocessClass === name) {{
+      closeClassPreprocessEditor();
+    }}
     if (openSourceClass === name) {{
       openSourceClass = '';
       openSourceKind = '';
@@ -4704,6 +5856,14 @@ function updateFlow() {{
   setFlowPath('flowTrainPreview', `M ${{tr}} ${{ty}} C ${{tr + 34}} ${{ty}}, ${{px - 34}} ${{py}}, ${{px}} ${{py}}`);
 }}
 let trainAdvancedOpen = false;
+function manualRoiOrDefault(cfg) {{
+  const roi = cfg && Array.isArray(cfg.manual_roi) && cfg.manual_roi.length === 4 ? cfg.manual_roi : [0.00, 0.00, 1.00, 1.00];
+  return roi.map((v, idx) => {{
+    const n = Number(v);
+    if (!isFinite(n)) return idx < 2 ? 0 : 1;
+    return Math.max(0, Math.min(1, n));
+  }});
+}}
 function syncAdvancedInlineInputs() {{
   const cfg = STATE.train_cfg || {{}};
   const set = (id, value) => {{
@@ -4722,7 +5882,10 @@ function syncAdvancedInlineInputs() {{
 function setTrainCfgField(key, rawValue) {{
   const cfg = STATE.train_cfg || {{}};
   let v = rawValue;
-  if (key === 'validation_split' || key === 'learning_rate') {{
+  if (key === 'preprocess_mode') {{
+    v = String(rawValue || 'auto_by_label');
+    if (!['auto_by_label', 'manual_roi', 'none'].includes(v)) return;
+  }} else if (key === 'validation_split' || key === 'learning_rate') {{
     v = Number(v);
     if (!isFinite(v)) return;
   }} else {{
@@ -4732,6 +5895,21 @@ function setTrainCfgField(key, rawValue) {{
   const next = Object.assign({{}}, cfg);
   next[key] = v;
   STATE.train_cfg = next;
+  persistTrainCfgStorage();
+  renderTrainStatus();
+}}
+function setManualRoiField(index, rawValue) {{
+  const cfg = Object.assign({{}}, STATE.train_cfg || {{}});
+  const roi = manualRoiOrDefault(cfg);
+  const n = Number(rawValue);
+  if (!isFinite(n)) return;
+  roi[index] = Math.max(0, Math.min(1, n));
+  roi[2] = Math.max(roi[2], roi[0] + 0.01);
+  roi[3] = Math.max(roi[3], roi[1] + 0.01);
+  roi[0] = Math.min(roi[0], roi[2] - 0.01);
+  roi[1] = Math.min(roi[1], roi[3] - 0.01);
+  cfg.manual_roi = roi;
+  STATE.train_cfg = cfg;
   persistTrainCfgStorage();
 }}
 function renderAdvancedPanel() {{
@@ -4777,6 +5955,7 @@ function resetTrainCfg() {{
   }};
   persistTrainCfgStorage();
   syncAdvancedInlineInputs();
+  renderTrainStatus();
   toast('Advanced settings reset.');
 }}
 function render() {{
@@ -4794,10 +5973,22 @@ function render() {{
     const title = document.createElement('div');
     title.className = 'class-title';
     title.textContent = name;
+    const preprocessBtn = document.createElement('button');
+    preprocessBtn.className = 'preprocess-chip';
+    preprocessBtn.type = 'button';
+    preprocessBtn.textContent = 'Edit';
+    preprocessBtn.onclick = (e) => {{
+      if (e) {{
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      openClassPreprocessEditor(name);
+    }};
     const edit = document.createElement('button');
     edit.className = 'iconbtn';
     edit.textContent = '✎';
     edit.onclick = () => renameClass(name);
+    title.appendChild(preprocessBtn);
     title.appendChild(edit);
     head.appendChild(title);
     const more = document.createElement('button');
@@ -4959,6 +6150,7 @@ function render() {{
   renderPreviewCard();
   renderTrainStatus();
   bindPreviewControls();
+  renderClassPreprocessModal();
 
   document.getElementById('advBtn').onclick = toggleAdvancedInline;
   const advReset = document.getElementById('advReset');
@@ -5277,6 +6469,8 @@ def _render_image_project() -> None:
                     conv2_filters=conv2_filters,
                     dense_units=dense_units,
                     representative_samples=cfg.representative_samples,
+                    preprocess_mode=str(getattr(cfg, "preprocess_mode", "auto_by_label")),
+                    manual_roi=getattr(cfg, "manual_roi", None),
                 )
                 notice = "Advanced settings updated."
             _tm_clear_query_params()
@@ -5934,6 +7128,8 @@ def _render_tm_train_panel() -> None:
                 conv2_filters=cfg.conv2_filters,
                 dense_units=cfg.dense_units,
                 representative_samples=cfg.representative_samples,
+                preprocess_mode=str(getattr(cfg, "preprocess_mode", "auto_by_label")),
+                manual_roi=getattr(cfg, "manual_roi", None),
             )
             st.session_state.train_cfg = cfg
             with st.spinner("Training and exporting int8 TFLite..."):

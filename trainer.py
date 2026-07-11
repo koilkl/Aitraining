@@ -5,13 +5,19 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.lite.python.util import convert_bytes_to_c_source
 
-from image_preprocess import focus_and_enhance_array
+from image_preprocess import (
+    PREPROCESS_MODE_AUTO_BY_LABEL,
+    normalize_class_preprocess_map,
+    normalize_sample_preprocess_map,
+    normalize_manual_roi,
+    preprocess_for_label,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,11 @@ class TrainConfig:
     conv2_filters: int = 32
     dense_units: int = 64
     representative_samples: int = 200
+    preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL
+    manual_roi: Optional[Tuple[float, float, float, float]] = None
+    class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None
+    sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
+    use_preprocessed_dataset: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +71,7 @@ def load_datasets(
 ) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], tf.data.Dataset, List[str], Tuple[int, int, int], Dict[int, float]]:
     dataset_dir = dataset_dir.resolve()
     image_map = _list_image_files(dataset_dir)
+    class_names = list(image_map.keys())
     total_files = sum(len(files) for files in image_map.values())
     if len(image_map) < 2:
         raise ValueError("Need at least 2 classes with images before training.")
@@ -74,6 +86,7 @@ def load_datasets(
         train_ds = tf.keras.utils.image_dataset_from_directory(
             str(dataset_dir),
             labels="inferred",
+            class_names=class_names,
             label_mode="int",
             color_mode=cfg.color_mode,
             batch_size=cfg.batch_size,
@@ -86,6 +99,7 @@ def load_datasets(
         val_ds = tf.keras.utils.image_dataset_from_directory(
             str(dataset_dir),
             labels="inferred",
+            class_names=class_names,
             label_mode="int",
             color_mode=cfg.color_mode,
             batch_size=cfg.batch_size,
@@ -99,6 +113,7 @@ def load_datasets(
         train_ds = tf.keras.utils.image_dataset_from_directory(
             str(dataset_dir),
             labels="inferred",
+            class_names=class_names,
             label_mode="int",
             color_mode=cfg.color_mode,
             batch_size=cfg.batch_size,
@@ -109,10 +124,13 @@ def load_datasets(
         val_ds = None
     class_names = list(train_ds.class_names)
     input_shape = (cfg.img_size, cfg.img_size, _channels(cfg.color_mode))
-
-    def normalize(x, y):
-        x = tf.cast(x, tf.float32) / 255.0
-        return x, y
+    class_name_list = [str(name) for name in class_names]
+    preprocess_mode = str(cfg.preprocess_mode or PREPROCESS_MODE_AUTO_BY_LABEL)
+    manual_roi = normalize_manual_roi(cfg.manual_roi)
+    class_preprocess = normalize_class_preprocess_map(cfg.class_preprocess)
+    sample_preprocess = normalize_sample_preprocess_map(cfg.sample_preprocess)
+    _ = sample_preprocess
+    use_preprocessed_dataset = bool(cfg.use_preprocessed_dataset)
 
     channels = _channels(cfg.color_mode)
     pad = max(2, int(cfg.img_size) // 12)
@@ -138,12 +156,22 @@ def load_datasets(
     )
 
     def focus_tensor_batch(x, y):
-        def _focus_one(img):
-            return focus_and_enhance_array(img, out_size=int(cfg.img_size), color_mode=str(cfg.color_mode))
+        def _focus_one(img: np.ndarray, label: Any):
+            label_idx = int(label)
+            label_name = class_name_list[label_idx] if 0 <= label_idx < len(class_name_list) else ""
+            return preprocess_for_label(
+                img,
+                out_size=int(cfg.img_size),
+                color_mode=str(cfg.color_mode),
+                label_name=label_name,
+                preprocess_mode=preprocess_mode,
+                manual_roi=manual_roi,
+                class_preprocess=class_preprocess,
+            )
 
         x = tf.map_fn(
-            lambda img: tf.numpy_function(_focus_one, [img], Tout=tf.float32),
-            x,
+            lambda elems: tf.numpy_function(_focus_one, [elems[0], elems[1]], Tout=tf.float32),
+            (x, y),
             fn_output_signature=tf.TensorSpec((int(cfg.img_size), int(cfg.img_size), channels), tf.float32),
         )
         return x, y
@@ -159,6 +187,19 @@ def load_datasets(
         x = tf.clip_by_value(x + noise, 0.0, 1.0)
         return x, y
 
+    def normalize_only(x, y):
+        x = tf.clip_by_value(tf.cast(x, tf.float32) / 255.0, 0.0, 1.0)
+        return x, y
+
+    def augment_preprocessed(x, y):
+        x, y = normalize_only(x, y)
+        x = augmenter(x, training=True)
+        x = tf.image.random_brightness(x, max_delta=0.08)
+        x = tf.image.random_contrast(x, lower=0.85, upper=1.15)
+        noise = tf.random.normal(tf.shape(x), mean=0.0, stddev=0.02, dtype=tf.float32)
+        x = tf.clip_by_value(x + noise, 0.0, 1.0)
+        return x, y
+
     total_files_f = float(total_files)
     num_classes_f = float(max(1, len(class_names)))
     class_weights: Dict[int, float] = {}
@@ -166,10 +207,16 @@ def load_datasets(
         count = max(1, len(image_map.get(name, [])))
         class_weights[int(idx)] = total_files_f / (num_classes_f * float(count))
 
-    calibration_ds = train_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
-    train_ds = train_ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    if val_ds is not None:
-        val_ds = val_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+    if use_preprocessed_dataset:
+        calibration_ds = train_ds.map(normalize_only, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+        train_ds = train_ds.map(augment_preprocessed, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+        if val_ds is not None:
+            val_ds = val_ds.map(normalize_only, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+    else:
+        calibration_ds = train_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+        train_ds = train_ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+        if val_ds is not None:
+            val_ds = val_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
     return train_ds, val_ds, calibration_ds, class_names, input_shape, class_weights
 
 
