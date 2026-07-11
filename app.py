@@ -467,13 +467,13 @@ def _render_import_panel() -> None:
 def _render_overview(imported: ImportedData) -> None:
     st.subheader("Preview")
     st.markdown(
-        f"""
+        f'''
 <div class="tm-kv">
   <b>Source</b>: {imported.root_dir}<br/>
   <b>Images</b>: {len(imported.images)}<br/>
   <b>Classified folders</b>: {imported.classified}
 </div>
-        """,
+        ''',
         unsafe_allow_html=True,
     )
 
@@ -736,7 +736,7 @@ def _render_tm_workspace_header() -> None:
     capture_label = st.session_state.tm_capture_source.upper() if st.session_state.tm_capture_open else "Idle"
     camera_status = get_camera_access_status()
     st.markdown(
-        f"""
+        f'''
 <div class="tm-hero">
   <div class="tm-hero-compact">
     <div class="tm-hero-copy">
@@ -766,7 +766,7 @@ def _render_tm_workspace_header() -> None:
     </div>
   </div>
 </div>
-        """,
+        ''',
         unsafe_allow_html=True,
     )
 
@@ -790,12 +790,12 @@ def _render_camera_permission_card() -> None:
     left, right = st.columns([3, 1.2])
     with left:
         st.markdown(
-            f"""
+            f'''
 <div class="tm-inline-note">
   <strong>Camera</strong>
   <div style="margin-top:6px;"><span class="{_status_style(status.status)}">{html_escape(status.message)}</span></div>
 </div>
-            """,
+            ''',
             unsafe_allow_html=True,
         )
     with right:
@@ -817,7 +817,7 @@ def _render_new_project() -> None:
     # #endregion
     inject_teachable_style()
     st.markdown(
-        """
+        '''
 <div class="tm-hero">
   <div class="tm-hero-grid">
     <div class="tm-hero-copy">
@@ -858,21 +858,21 @@ def _render_new_project() -> None:
     </div>
   </div>
 </div>
-        """,
+        ''',
         unsafe_allow_html=True,
     )
 
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(
-            """
+            '''
 <div class="tm-card">
   <div class="tm-eyebrow">Ready now</div>
   <h3>Image Project</h3>
   <p>Build an image classification model from images, webcam, or device stream.</p>
   <div class="tm-card-footnote">Great for classroom demos and local training.</div>
 </div>
-            """,
+            ''',
             unsafe_allow_html=True,
         )
         with st.popover("Open Image Project", use_container_width=True):
@@ -926,29 +926,46 @@ def _render_new_project() -> None:
                 _dbg_open_project_layout("A", "pre-fix", "app.py:_render_new_project", "[DEBUG] home open project restored state", {"session": str(st.session_state.session_id), "classes": list(state.get("classes") or []), "count_keys": list((state.get("counts") or {}).keys())})
                 # #endregion
                 st.session_state.tm_classes = list(state.get("classes") or ["Class 1", "Class 2"])
+                train_cfg_state = state.get("train_cfg") if isinstance(state, dict) else None
+                if isinstance(train_cfg_state, dict):
+                    prev_cfg = st.session_state.train_cfg
+                    st.session_state.train_cfg = TrainConfig(
+                        img_size=int(getattr(prev_cfg, "img_size", 96)),
+                        color_mode=str(getattr(prev_cfg, "color_mode", "grayscale")),
+                        batch_size=int(train_cfg_state.get("batch_size", getattr(prev_cfg, "batch_size", 16))),
+                        epochs=int(train_cfg_state.get("epochs", getattr(prev_cfg, "epochs", 10))),
+                        validation_split=float(train_cfg_state.get("validation_split", getattr(prev_cfg, "validation_split", 0.2))),
+                        seed=int(getattr(prev_cfg, "seed", 42)),
+                        optimizer=str(getattr(prev_cfg, "optimizer", "adam")),
+                        learning_rate=float(train_cfg_state.get("learning_rate", getattr(prev_cfg, "learning_rate", 0.001))),
+                        conv1_filters=int(train_cfg_state.get("conv1_filters", getattr(prev_cfg, "conv1_filters", 8))),
+                        conv2_filters=int(train_cfg_state.get("conv2_filters", getattr(prev_cfg, "conv2_filters", 16))),
+                        dense_units=int(train_cfg_state.get("dense_units", getattr(prev_cfg, "dense_units", 32))),
+                        representative_samples=int(getattr(prev_cfg, "representative_samples", 200)),
+                    )
                 st.session_state.project_type = "image"
                 _tm_set_query_params(tm_project="image", tm_session=st.session_state.session_id)
                 st.rerun()
     with c2:
         st.markdown(
-            """
+            '''
 <div class="tm-card">
   <div class="tm-eyebrow">Roadmap</div>
   <h3>Audio Project <span class="tm-badge">Coming soon</span></h3>
   <p>Planned: microphone sampling and audio classification for voice commands.</p>
 </div>
-            """,
+            ''',
             unsafe_allow_html=True,
         )
     with c3:
         st.markdown(
-            """
+            '''
 <div class="tm-card">
   <div class="tm-eyebrow">Roadmap</div>
   <h3>Pose Project <span class="tm-badge">Coming soon</span></h3>
   <p>Planned: pose and gesture projects for interactive demos.</p>
 </div>
-            """,
+            ''',
             unsafe_allow_html=True,
         )
 
@@ -1016,7 +1033,7 @@ def _tm_clear_query_params() -> None:
 
 def _tm_render_page_scroll_reset() -> None:
     components.html(
-        """
+        '''
         <script>
         function resetFrameBox(node) {
           try {
@@ -1051,7 +1068,7 @@ def _tm_render_page_scroll_reset() -> None:
           }
         } catch (e) {}
         </script>
-        """,
+        ''',
         height=0,
         width=0,
     )
@@ -1060,7 +1077,7 @@ def _tm_render_page_scroll_reset() -> None:
 def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
     safe_reason = html_escape(str(reason or "image-project-mount"))
     components.html(
-        f"""
+        f'''
         <script>
         (function() {{
           const reason = "{safe_reason}";
@@ -1088,7 +1105,7 @@ def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
           window.setTimeout(() => ping('t900'), 900);
         }})();
         </script>
-        """,
+        ''',
         height=0,
         width=0,
     )
@@ -1250,7 +1267,7 @@ def _render_tm_old_frontend_html(
     payload["debug_session_id"] = debug_session_id
     data = _json.dumps(payload)
     components.html(
-        f"""
+        f'''
 <!doctype html>
 <html>
 <head>
@@ -2565,6 +2582,8 @@ let captureInFlight = false;
 let holdRecording = false;
 let holdRecordClass = '';
 let holdRecordSource = '';
+let holdResumePreviewPredict = false;
+let holdPreviewSourceBeforeCapture = 'webcam';
 let holdSyncTimer = null;
 let holdSeq = 0;
 let holdNextToken = 0;
@@ -2663,10 +2682,10 @@ function restoreTrainCfgFromStorage() {{
       if (!isFinite(n)) return fallback;
       return Math.max(lo, Math.min(hi, n));
     }};
-    if ('batch_size' in data) next.batch_size = clampInt(data.batch_size, 1, 512, nullish(prev.batch_size, 16));
-    if ('epochs' in data) next.epochs = clampInt(data.epochs, 1, 1000, nullish(prev.epochs, 10));
-    if ('validation_split' in data) next.validation_split = clampFloat(data.validation_split, 0, 0.5, nullish(prev.validation_split, 0.2));
-    if ('learning_rate' in data) next.learning_rate = clampFloat(data.learning_rate, 0.000001, 1.0, nullish(prev.learning_rate, 0.001));
+    if ('batch_size' in data) next.batch_size = clampInt(data.batch_size, 1, 512, nullish(prev.batch_size, 32));
+    if ('epochs' in data) next.epochs = clampInt(data.epochs, 1, 1000, nullish(prev.epochs, 20));
+    if ('validation_split' in data) next.validation_split = clampFloat(data.validation_split, 0, 0.5, nullish(prev.validation_split, 0.25));
+    if ('learning_rate' in data) next.learning_rate = clampFloat(data.learning_rate, 0.000001, 1.0, nullish(prev.learning_rate, 0.0016));
     if ('conv1_filters' in data) next.conv1_filters = clampInt(data.conv1_filters, 1, 256, nullish(prev.conv1_filters, 8));
     if ('conv2_filters' in data) next.conv2_filters = clampInt(data.conv2_filters, 1, 512, nullish(prev.conv2_filters, 16));
     if ('dense_units' in data) next.dense_units = clampInt(data.dense_units, 1, 2048, nullish(prev.dense_units, 32));
@@ -2985,6 +3004,10 @@ async function openSourcePanel(kind, className) {{
   sourceSettingsOpen = false;
   persistOpenSourceState();
   render();
+  if (kind === 'device') {{
+    await refreshSerialPorts(false);
+    render();
+  }}
   await syncClassState(className);
   if (openSourceClass === className) updateOpenSamplesPanel(className);
   if (kind === 'webcam' || kind === 'device') {{
@@ -3019,11 +3042,20 @@ async function captureSource() {{
     dbgEvent('A', 'app.py:captureSource', '[DEBUG] duplicate capture ignored', {{openSourceKind, openSourceClass}});
     return;
   }}
+  const shouldResumePreviewPredict = !!previewInputOn;
+  const previewSourceBeforeCapture = String(previewSource || 'webcam');
   captureInFlight = true;
   syncSourceActionButtons(openSourceClass);
   dbgEvent('A', 'app.py:captureSource', '[DEBUG] capture clicked', {{openSourceKind, openSourceClass, captureInFlight}});
   const url = `${{baseUrl}}/live/capture?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&class=${{encodeURIComponent(openSourceClass)}}`;
   try {{
+    if (shouldResumePreviewPredict) {{
+      stopPreviewPredictLoop();
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSourceBeforeCapture)}}`);
+      }} catch (e) {{}}
+      await new Promise((r) => setTimeout(r, 120));
+    }}
     const res = await fetch(url);
     const data = await res.json().catch(() => ({{ok:'0', error:'capture failed'}}));
     if (!res.ok || data.ok !== '1') {{
@@ -3043,6 +3075,10 @@ async function captureSource() {{
   }} finally {{
     captureInFlight = false;
     syncSourceActionButtons(openSourceClass);
+    if (shouldResumePreviewPredict && previewInputOn) {{
+      previewSource = previewSourceBeforeCapture === 'device' ? 'device' : 'webcam';
+      startPreviewPredictLoop();
+    }}
   }}
 }}
 function toast(msg) {{
@@ -3051,6 +3087,89 @@ function toast(msg) {{
   el.textContent = msg;
   el.style.display = 'block';
   setTimeout(() => {{ el.style.display = 'none'; }}, 2400);
+}}
+function showConfirmDialog(titleText, bodyText, confirmText = 'Confirm') {{
+  return new Promise((resolve) => {{
+    let hostDocument = document;
+    try {{
+      if (window.parent && window.parent !== window && window.parent.document && window.parent.document.body) {{
+        hostDocument = window.parent.document;
+      }}
+    }} catch (e) {{}}
+    const overlay = hostDocument.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.inset = '0';
+    overlay.style.background = 'rgba(32,33,36,0.56)';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.zIndex = '2400';
+    overlay.style.padding = '20px';
+
+    const card = hostDocument.createElement('div');
+    card.style.width = 'min(480px, 92vw)';
+    card.style.background = '#fff';
+    card.style.borderRadius = '14px';
+    card.style.boxShadow = '0 14px 40px rgba(0,0,0,0.28)';
+    card.style.padding = '16px';
+    card.style.color = '#202124';
+
+    const title = hostDocument.createElement('div');
+    title.style.fontSize = '16px';
+    title.style.fontWeight = '700';
+    title.style.marginBottom = '10px';
+    title.textContent = String(titleText || 'Are you sure?');
+
+    const body = hostDocument.createElement('div');
+    body.style.fontSize = '13px';
+    body.style.lineHeight = '1.5';
+    body.style.whiteSpace = 'pre-wrap';
+    body.textContent = String(bodyText || '');
+
+    const actions = hostDocument.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.justifyContent = 'flex-end';
+    actions.style.gap = '10px';
+    actions.style.marginTop = '14px';
+
+    const cancelBtn = hostDocument.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.border = '1px solid rgba(0,0,0,0.16)';
+    cancelBtn.style.background = '#fff';
+    cancelBtn.style.color = '#202124';
+    cancelBtn.style.padding = '9px 14px';
+    cancelBtn.style.borderRadius = '10px';
+    cancelBtn.style.cursor = 'pointer';
+
+    const okBtn = hostDocument.createElement('button');
+    okBtn.type = 'button';
+    okBtn.textContent = String(confirmText || 'Confirm');
+    okBtn.style.border = '0';
+    okBtn.style.background = '#d93025';
+    okBtn.style.color = '#fff';
+    okBtn.style.padding = '9px 14px';
+    okBtn.style.borderRadius = '10px';
+    okBtn.style.cursor = 'pointer';
+
+    const cleanup = (result) => {{
+      try {{ overlay.remove(); }} catch (e) {{}}
+      resolve(!!result);
+    }};
+    cancelBtn.onclick = () => cleanup(false);
+    okBtn.onclick = () => cleanup(true);
+    overlay.onclick = (e) => {{
+      if (e.target === overlay) cleanup(false);
+    }};
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    card.appendChild(title);
+    card.appendChild(body);
+    card.appendChild(actions);
+    overlay.appendChild(card);
+    hostDocument.body.appendChild(overlay);
+  }});
 }}
 function showOverwriteConfirmDialog(conflicts) {{
   return new Promise((resolve) => {{
@@ -3206,6 +3325,10 @@ function applyProjectState(state) {{
   for (const [k, v] of Object.entries(prev)) nextPrev[String(k)] = normalizePreviewList(v);
   STATE.sample_previews = nextPrev;
   STATE.export_enabled = String(s.export_enabled || '0') === '1';
+  if (s.train_cfg && typeof s.train_cfg === 'object') {{
+    STATE.train_cfg = Object.assign({{}}, STATE.train_cfg || {{}}, s.train_cfg);
+    persistTrainCfgStorage();
+  }}
   recomputeTrainEnabled();
   try {{
     document.documentElement.scrollTop = 0;
@@ -3251,7 +3374,13 @@ async function saveProject() {{
     const res = await fetch(`${{baseUrl}}/project/save`, {{
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify({{session: STATE.session, save_path: savePath}})
+      body: JSON.stringify({{
+        session: STATE.session,
+        save_path: savePath,
+        project_state: {{
+          train_cfg: Object.assign({{}}, STATE.train_cfg || {{}})
+        }}
+      }})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Save failed.');
@@ -3608,6 +3737,15 @@ async function syncClassState(className) {{
 async function startHoldCapture() {{
   if (holdRecording || !openSourceClass || !openSourceKind || openSourceKind === 'upload') return;
   try {{
+    holdResumePreviewPredict = !!previewInputOn;
+    holdPreviewSourceBeforeCapture = String(previewSource || 'webcam');
+    if (holdResumePreviewPredict) {{
+      stopPreviewPredictLoop();
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(holdPreviewSourceBeforeCapture)}}`);
+      }} catch (e) {{}}
+      await new Promise((r) => setTimeout(r, 120));
+    }}
     if (openSourceKind === 'webcam' || openSourceKind === 'device') {{
       stopPreviewLoop();
       clearPreviewBlob();
@@ -3673,17 +3811,24 @@ async function stopHoldCapture() {{
   if (!holdRecording) return;
   const className = holdRecordClass;
   const sourceKind = holdRecordSource;
+  const shouldResumePreviewPredict = holdResumePreviewPredict;
+  const previewSourceBeforeCapture = holdPreviewSourceBeforeCapture === 'device' ? 'device' : 'webcam';
   stopHoldSyncLoop();
   holdRecording = false;
   holdRecordClass = '';
   holdRecordSource = '';
+  holdResumePreviewPredict = false;
+  holdPreviewSourceBeforeCapture = 'webcam';
   syncSourceActionButtons(className);
   try {{
     await fetch(`${{baseUrl}}/stop?session=${{encodeURIComponent(STATE.session)}}`);
   }} catch (e) {{}}
   await syncClassState(className);
   if (openSourceClass === className) updateOpenSamplesPanel(className);
-  if (openSourceClass === className && openSourceKind === sourceKind && (sourceKind === 'webcam' || sourceKind === 'device')) {{
+  if (shouldResumePreviewPredict && previewInputOn) {{
+    previewSource = previewSourceBeforeCapture;
+    startPreviewPredictLoop();
+  }} else if (openSourceClass === className && openSourceKind === sourceKind && (sourceKind === 'webcam' || sourceKind === 'device')) {{
     await ensureOpenSourceLive();
   }}
   toast('Hold capture stopped.');
@@ -3698,6 +3843,36 @@ function buildDeviceOptions(selected) {{
     opts.push(`<option value="${{device.replace(/"/g, '&quot;')}}"${{sel}}>${{label}}</option>`);
   }}
   return opts.join('');
+}}
+function refillDeviceSelect(selectEl, selectedValue) {{
+  if (!selectEl) return;
+  const current = String(selectedValue == null ? (selectEl.value || '') : selectedValue);
+  selectEl.innerHTML = buildDeviceOptions(current);
+  selectEl.value = current;
+}}
+async function refreshSerialPorts(shouldRerender = true, targetSelectId = '') {{
+  try {{
+    const res = await fetch(`${{baseUrl}}/serial/ports?session=${{encodeURIComponent(STATE.session)}}&_ts=${{Date.now()}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to refresh serial ports.');
+    const ports = Array.isArray(data.ports) ? data.ports : [];
+    STATE.serial_ports = ports.map((p) => ({{
+      device: String(p && p.device ? p.device : ''),
+      label: String(p && p.label ? p.label : (p && p.device ? p.device : '')),
+    }})).filter((p) => !!p.device);
+    const stillExists = STATE.serial_ports.some((p) => String(p.device || '') === String(currentSerialPort || ''));
+    if (!stillExists && currentSerialPort) {{
+      STATE.serial_ports = [{{device: String(currentSerialPort), label: String(currentSerialPort)}}].concat(STATE.serial_ports);
+    }}
+    if (shouldRerender) {{
+      render();
+    }} else if (targetSelectId) {{
+      const selectEl = document.getElementById(targetSelectId);
+      refillDeviceSelect(selectEl, currentSerialPort);
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
 }}
 function buildWebcamOptions(selected) {{
   const cams = Array.isArray(STATE.webcam_options) ? STATE.webcam_options : [];
@@ -4195,8 +4370,19 @@ function renderPreviewSettings() {{
   if (!host) return;
   host.innerHTML = buildPreviewSettingsMarkup();
   updateFlow();
+  if (previewSource === 'device') {{
+    const currentPorts = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
+    if (!currentPorts.length) {{
+      refreshSerialPorts(true).catch(() => {{}});
+    }}
+  }}
   const cancel = document.getElementById('previewSettingsCancel');
   const save = document.getElementById('previewSettingsSave');
+  const portSel = document.getElementById('previewDevicePort');
+  if (portSel) {{
+    portSel.onpointerdown = () => refreshSerialPorts(false, 'previewDevicePort');
+    portSel.onmousedown = () => refreshSerialPorts(false, 'previewDevicePort');
+  }}
   if (cancel) cancel.onclick = () => {{
     previewSettingsOpen = false;
     renderPreviewSettings();
@@ -4426,7 +4612,11 @@ async function addClass() {{
 }}
 async function deleteClass(name) {{
   if (STATE.classes.length <= 2) return;
-  const ok = window.confirm('Delete this class?');
+  const ok = await showConfirmDialog(
+    'Delete this class?',
+    `Class "${{String(name || '')}}" and all of its samples will be removed.`,
+    'Delete'
+  );
   if (!ok) return;
   try {{
     const prev = STATE.classes.slice();
@@ -4521,10 +4711,10 @@ function syncAdvancedInlineInputs() {{
     if (!el) return;
     el.value = nullish(value, nullish(el.value, ''));
   }};
-  set('advBatchInline', nullish(cfg.batch_size, 16));
-  set('advEpochsInline', nullish(cfg.epochs, 10));
-  set('advValInline', nullish(cfg.validation_split, 0.2));
-  set('advLrInline', nullish(cfg.learning_rate, 0.001));
+  set('advBatchInline', nullish(cfg.batch_size, 32));
+  set('advEpochsInline', nullish(cfg.epochs, 20));
+  set('advValInline', nullish(cfg.validation_split, 0.25));
+  set('advLrInline', nullish(cfg.learning_rate, 0.0016));
   set('advConv1Inline', nullish(cfg.conv1_filters, 8));
   set('advConv2Inline', nullish(cfg.conv2_filters, 16));
   set('advDenseInline', nullish(cfg.dense_units, 32));
@@ -4577,10 +4767,10 @@ function bindAdvancedInlineHandlers() {{
 }}
 function resetTrainCfg() {{
   STATE.train_cfg = {{
-    batch_size: 16,
-    epochs: 10,
-    validation_split: 0.2,
-    learning_rate: 0.001,
+    batch_size: 32,
+    epochs: 20,
+    validation_split: 0.25,
+    learning_rate: 0.0016,
     conv1_filters: 8,
     conv2_filters: 16,
     dense_units: 32
@@ -4613,7 +4803,13 @@ function render() {{
     const more = document.createElement('button');
     more.className = 'iconbtn more';
     more.textContent = '⋮';
-    more.onclick = () => deleteClass(name);
+    more.onclick = async (e) => {{
+      if (e) {{
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      await deleteClass(name);
+    }};
     card.appendChild(more);
     card.appendChild(head);
     const div = document.createElement('div');
@@ -4834,6 +5030,11 @@ function render() {{
       holdBtn.onpointerleave = () => stopHoldCapture();
     }}
     if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
+    if (devSel) {{
+      const selectId = `deviceSelect-${{safe}}`;
+      devSel.onpointerdown = () => refreshSerialPorts(false, selectId);
+      devSel.onmousedown = () => refreshSerialPorts(false, selectId);
+    }}
     if (settingsToggle) settingsToggle.onclick = () => toggleSourceSettings(openSourceClass);
     if (settingsSave) settingsSave.onclick = () => applySourceSettings(openSourceClass);
     if (settingsCancel) settingsCancel.onclick = () => {{
@@ -4924,7 +5125,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </script>
 </body>
 </html>
-        """,
+        ''',
         height=1600,
         scrolling=False,
     )
@@ -5201,7 +5402,7 @@ def _render_classified_import_page() -> None:
     # #endregion
     inject_teachable_style()
     st.markdown(
-        """
+        '''
 <div class="tm-hero">
   <div class="tm-hero-copy">
     <div class="tm-eyebrow">Start from classified class</div>
@@ -5209,7 +5410,7 @@ def _render_classified_import_page() -> None:
     <p>Supported layouts include <code>label/image</code> and common <code>train|val|test/label/image</code> datasets. Imported images become class samples and each label becomes a class name.</p>
   </div>
 </div>
-        """,
+        ''',
         unsafe_allow_html=True,
     )
     top_left, top_right = st.columns([1, 5])
@@ -5606,12 +5807,12 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
     source = st.session_state.tm_capture_source
     st.markdown('<div class="tm-panel tm-capture-panel">', unsafe_allow_html=True)
     st.markdown(
-        f"""
+        f'''
 <div class="tm-capture-head">
   <strong>{html_escape(source.title())}</strong>
   <span class="{_status_style('ready')}">Live</span>
 </div>
-        """,
+        ''',
         unsafe_allow_html=True,
     )
 

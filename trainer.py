@@ -11,20 +11,22 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.lite.python.util import convert_bytes_to_c_source
 
+from image_preprocess import focus_and_enhance_array
+
 
 @dataclass(frozen=True)
 class TrainConfig:
     img_size: int = 96
     color_mode: str = "grayscale"
-    batch_size: int = 16
-    epochs: int = 10
-    validation_split: float = 0.2
+    batch_size: int = 32
+    epochs: int = 20
+    validation_split: float = 0.25
     seed: int = 42
     optimizer: str = "adam"
-    learning_rate: float = 0.001
-    conv1_filters: int = 8
-    conv2_filters: int = 16
-    dense_units: int = 32
+    learning_rate: float = 0.0016
+    conv1_filters: int = 16
+    conv2_filters: int = 32
+    dense_units: int = 64
     representative_samples: int = 200
 
 
@@ -55,7 +57,7 @@ def _list_image_files(dataset_dir: Path) -> Dict[str, List[Path]]:
 
 def load_datasets(
     dataset_dir: Path, cfg: TrainConfig
-) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], List[str], Tuple[int, int, int]]:
+) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], tf.data.Dataset, List[str], Tuple[int, int, int], Dict[int, float]]:
     dataset_dir = dataset_dir.resolve()
     image_map = _list_image_files(dataset_dir)
     total_files = sum(len(files) for files in image_map.values())
@@ -112,22 +114,83 @@ def load_datasets(
         x = tf.cast(x, tf.float32) / 255.0
         return x, y
 
-    train_ds = train_ds.map(normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    channels = _channels(cfg.color_mode)
+    pad = max(2, int(cfg.img_size) // 12)
+    padded_size = int(cfg.img_size) + pad * 2
+    augmenter = tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomTranslation(
+                height_factor=0.08,
+                width_factor=0.08,
+                fill_mode="reflect",
+            ),
+            tf.keras.layers.RandomZoom(
+                height_factor=(-0.08, 0.04),
+                width_factor=(-0.08, 0.04),
+                fill_mode="reflect",
+            ),
+            tf.keras.layers.RandomRotation(
+                factor=0.035,
+                fill_mode="reflect",
+            ),
+        ],
+        name="train_augmenter",
+    )
+
+    def focus_tensor_batch(x, y):
+        def _focus_one(img):
+            return focus_and_enhance_array(img, out_size=int(cfg.img_size), color_mode=str(cfg.color_mode))
+
+        x = tf.map_fn(
+            lambda img: tf.numpy_function(_focus_one, [img], Tout=tf.float32),
+            x,
+            fn_output_signature=tf.TensorSpec((int(cfg.img_size), int(cfg.img_size), channels), tf.float32),
+        )
+        return x, y
+
+    def augment(x, y):
+        x, y = focus_tensor_batch(x, y)
+        x = tf.image.resize_with_crop_or_pad(x, padded_size, padded_size)
+        x = tf.image.random_crop(x, size=[tf.shape(x)[0], int(cfg.img_size), int(cfg.img_size), channels])
+        x = augmenter(x, training=True)
+        x = tf.image.random_brightness(x, max_delta=0.08)
+        x = tf.image.random_contrast(x, lower=0.85, upper=1.15)
+        noise = tf.random.normal(tf.shape(x), mean=0.0, stddev=0.02, dtype=tf.float32)
+        x = tf.clip_by_value(x + noise, 0.0, 1.0)
+        return x, y
+
+    total_files_f = float(total_files)
+    num_classes_f = float(max(1, len(class_names)))
+    class_weights: Dict[int, float] = {}
+    for idx, name in enumerate(class_names):
+        count = max(1, len(image_map.get(name, [])))
+        class_weights[int(idx)] = total_files_f / (num_classes_f * float(count))
+
+    calibration_ds = train_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+    train_ds = train_ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
     if val_ds is not None:
-        val_ds = val_ds.map(normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    return train_ds, val_ds, class_names, input_shape
+        val_ds = val_ds.map(focus_tensor_batch, num_parallel_calls=tf.data.AUTOTUNE).cache().prefetch(tf.data.AUTOTUNE)
+    return train_ds, val_ds, calibration_ds, class_names, input_shape, class_weights
 
 
 def build_model(input_shape: Tuple[int, int, int], num_classes: int, cfg: TrainConfig) -> tf.keras.Model:
+    reg = tf.keras.regularizers.l2(1e-4)
+    conv3_filters = max(int(cfg.conv2_filters) * 2, 64)
+    dense_units = max(int(cfg.dense_units), 64)
     model = tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=input_shape, name="input"),
-            tf.keras.layers.Conv2D(cfg.conv1_filters, (3, 3), activation="relu", padding="same"),
+            tf.keras.layers.Conv2D(cfg.conv1_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
             tf.keras.layers.MaxPooling2D((2, 2)),
-            tf.keras.layers.Conv2D(cfg.conv2_filters, (3, 3), activation="relu", padding="same"),
+            tf.keras.layers.Dropout(0.10),
+            tf.keras.layers.Conv2D(cfg.conv2_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
+            tf.keras.layers.MaxPooling2D((2, 2)),
+            tf.keras.layers.Dropout(0.15),
+            tf.keras.layers.Conv2D(conv3_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
             tf.keras.layers.MaxPooling2D((2, 2)),
             tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(cfg.dense_units, activation="relu"),
+            tf.keras.layers.Dense(dense_units, activation="relu", kernel_regularizer=reg),
+            tf.keras.layers.Dropout(0.35),
             tf.keras.layers.Dense(num_classes, activation="softmax", name="output"),
         ]
     )
@@ -142,7 +205,8 @@ def build_model(input_shape: Tuple[int, int, int], num_classes: int, cfg: TrainC
     else:
         raise ValueError(f"Unsupported optimizer: {cfg.optimizer}")
 
-    model.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    loss = tf.keras.losses.SparseCategoricalCrossentropy()
+    model.compile(optimizer=optimizer, loss=loss, metrics=["accuracy"])
     return model
 
 
@@ -188,7 +252,7 @@ def train_and_export(
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds, val_ds, labels, input_shape = load_datasets(Path(dataset_dir), cfg)
+    train_ds, val_ds, calibration_ds, labels, input_shape, class_weights = load_datasets(Path(dataset_dir), cfg)
     model = build_model(input_shape, len(labels), cfg)
 
     if progress is not None:
@@ -197,6 +261,7 @@ def train_and_export(
     fit_kwargs = {"epochs": cfg.epochs, "verbose": 1}
     if val_ds is not None:
         fit_kwargs["validation_data"] = val_ds
+    fit_kwargs["class_weight"] = class_weights
     if progress is not None:
         epochs_total = max(1, int(cfg.epochs))
 
@@ -208,7 +273,30 @@ def train_and_export(
                 except Exception:
                     pass
 
-        fit_kwargs["callbacks"] = [_Progress()]
+        callbacks: List[tf.keras.callbacks.Callback] = [_Progress()]
+    else:
+        callbacks = []
+
+    monitor_loss = "val_loss" if val_ds is not None else "loss"
+    callbacks.append(
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor_loss,
+            patience=6,
+            min_delta=1e-4,
+            restore_best_weights=True,
+            verbose=0,
+        )
+    )
+    callbacks.append(
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor=monitor_loss,
+            factor=0.5,
+            patience=3,
+            min_lr=1e-5,
+            verbose=0,
+        )
+    )
+    fit_kwargs["callbacks"] = callbacks
 
     model.fit(train_ds, **fit_kwargs)
     eval_ds = val_ds if val_ds is not None else train_ds
@@ -221,7 +309,7 @@ def train_and_export(
 
     if progress is not None:
         progress(0.9, "Converting to int8 TFLite...")
-    tflite_bytes = convert_to_int8_tflite(model, train_ds, cfg)
+    tflite_bytes = convert_to_int8_tflite(model, calibration_ds, cfg)
     tflite_path = run_dir / f"{model_base_name}.tflite"
     tflite_path.write_bytes(tflite_bytes)
 

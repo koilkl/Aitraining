@@ -19,8 +19,9 @@ import numpy as np
 from PIL import Image
 
 from camera_permission import ensure_camera_access
-from serial_device import SerialFrameReader, parse_sync_header
+from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
 from dataset_io import IMAGE_EXTS, sanitize_class_name
+from image_preprocess import focus_and_enhance_array
 
 
 @dataclass
@@ -245,6 +246,17 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": "preview unavailable"}, status=404, cors=True)
                 return
             _send_png(req, png, cors=True)
+            return
+        if path == "/serial/ports":
+            ports = []
+            try:
+                for p in list_serial_ports():
+                    label = f"{p.device} - {p.description}" if getattr(p, "description", "") else p.device
+                    ports.append({"device": str(p.device), "label": str(label)})
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "ports": ports}, cors=True)
             return
         if path == "/capture":
             session_id = (qs.get("session") or [""])[0]
@@ -547,11 +559,16 @@ class RecordController:
         if path == "/project/save":
             session_id = str(payload.get("session") or "").strip()
             save_path = str(payload.get("save_path") or "").strip()
+            project_state = payload.get("project_state")
             if not session_id or not save_path:
                 _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
                 return
             try:
-                out_path = self._project_save(session_id=session_id, save_path=Path(save_path).expanduser().resolve())
+                out_path = self._project_save(
+                    session_id=session_id,
+                    save_path=Path(save_path).expanduser().resolve(),
+                    project_state=project_state if isinstance(project_state, dict) else None,
+                )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -687,6 +704,16 @@ class RecordController:
     def _classes_meta_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_classes.json"
 
+    def _classes_infer_from_dirs(self, dataset_root: Path) -> List[str]:
+        out: List[str] = []
+        try:
+            for p in sorted(dataset_root.iterdir()):
+                if p.is_dir():
+                    out.append(str(p.name))
+        except Exception:
+            return []
+        return out
+
     def _classes_load(self, dataset_root: Path) -> List[str]:
         p = self._classes_meta_path(dataset_root)
         if p.exists():
@@ -697,6 +724,9 @@ class RecordController:
                     return [str(x) for x in classes]
             except Exception:
                 pass
+        inferred = self._classes_infer_from_dirs(dataset_root)
+        if inferred:
+            return inferred
         return ["Class 1", "Class 2"]
 
     def _classes_save(self, dataset_root: Path, classes: List[str]) -> None:
@@ -728,12 +758,24 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         classes = self._classes_load(cfg.dataset_root)
+        name = str(name).strip()
+        if not name:
+            raise ValueError("Class name is empty.")
+        actual_name = name
+        if actual_name not in classes:
+            safe_name = sanitize_class_name(actual_name)
+            for c in classes:
+                if sanitize_class_name(c) == safe_name:
+                    actual_name = c
+                    break
+        if actual_name not in classes:
+            raise ValueError("Class not found.")
         if len(classes) <= 2:
             raise ValueError("At least 2 classes are required.")
-        classes = [c for c in classes if c != name]
+        classes = [c for c in classes if c != actual_name]
         if len(classes) < 2:
             raise ValueError("At least 2 classes are required.")
-        class_dir = cfg.dataset_root / sanitize_class_name(name)
+        class_dir = cfg.dataset_root / sanitize_class_name(actual_name)
         if class_dir.exists():
             shutil.rmtree(class_dir)
         self._classes_save(cfg.dataset_root, classes)
@@ -1017,7 +1059,9 @@ class RecordController:
         labels_json.write_text(json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return out_dir
 
-    def _project_save(self, session_id: str, save_path: Path) -> Path:
+    def _project_save(
+        self, session_id: str, save_path: Path, project_state: Optional[Dict[str, Any]] = None
+    ) -> Path:
         with self._lock:
             cfg = self._configs.get(session_id)
         if cfg is None:
@@ -1040,6 +1084,7 @@ class RecordController:
             except Exception:
                 meta = {}
 
+        merged_project_state = self._project_state_payload(dataset_root, project_state=project_state)
         manifest = {
             "format": "tmproj",
             "version": 1,
@@ -1051,6 +1096,7 @@ class RecordController:
             "classes_meta": "tm_classes.json" if classes_meta.exists() else "",
             "train_latest": "tm_train_latest.json" if latest.exists() else "",
             "train_run_dir": "",
+            "project_state": "tm_project_state.json",
         }
 
         run_dir = Path(str(meta.get("run_dir") or "")).expanduser().resolve() if meta else Path()
@@ -1063,6 +1109,7 @@ class RecordController:
             tmp_path.unlink(missing_ok=True)
         with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            zf.writestr("tm_project_state.json", json.dumps(merged_project_state, ensure_ascii=False, indent=2) + "\n")
             if classes_meta.exists():
                 zf.write(classes_meta, arcname="tm_classes.json")
             if latest.exists():
@@ -1171,7 +1218,16 @@ class RecordController:
                             if cand is not None and cand.exists():
                                 meta[key] = str(cand)
                 latest_out.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            return self._project_state_payload(dataset_root)
+            project_state_in = tmp_dir / str(manifest.get("project_state") or "tm_project_state.json")
+            project_state: Optional[Dict[str, Any]] = None
+            if project_state_in.exists():
+                try:
+                    loaded = json.loads(project_state_in.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        project_state = loaded
+                except Exception:
+                    project_state = None
+            return self._project_state_payload(dataset_root, project_state=project_state)
         finally:
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
@@ -1210,6 +1266,61 @@ class RecordController:
         self._classes_save(dataset_root, ["Class 1", "Class 2"])
         return self._project_state_payload(dataset_root)
 
+    def _project_train_cfg(
+        self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        def _pick_cfg(raw: Any) -> Dict[str, Any]:
+            src = raw if isinstance(raw, dict) else {}
+            out: Dict[str, Any] = {}
+            int_fields = {
+                "batch_size": 16,
+                "epochs": 10,
+                "conv1_filters": 8,
+                "conv2_filters": 16,
+                "dense_units": 32,
+            }
+            float_fields = {
+                "validation_split": 0.2,
+                "learning_rate": 0.001,
+            }
+            for key, fallback in int_fields.items():
+                if key not in src:
+                    continue
+                try:
+                    out[key] = int(src.get(key))
+                except Exception:
+                    out[key] = int(fallback)
+            for key, fallback in float_fields.items():
+                if key not in src:
+                    continue
+                try:
+                    out[key] = float(src.get(key))
+                except Exception:
+                    out[key] = float(fallback)
+            return out
+
+        if isinstance(project_state, dict):
+            cfg = _pick_cfg(project_state.get("train_cfg"))
+            if cfg:
+                return cfg
+        run_cfg = dataset_root.parent / "runs" / "latest" / "train_config.json"
+        if run_cfg.exists():
+            try:
+                cfg = _pick_cfg(json.loads(run_cfg.read_text(encoding="utf-8")))
+                if cfg:
+                    return cfg
+            except Exception:
+                pass
+        latest = self._train_result_path(dataset_root)
+        if latest.exists():
+            try:
+                meta = json.loads(latest.read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    return _pick_cfg(meta)
+            except Exception:
+                pass
+        return {}
+
     def _sample_delete(self, session_id: str, class_name: str, filename: str) -> Dict[str, Any]:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -1224,7 +1335,7 @@ class RecordController:
         target.unlink()
         return self._class_state_payload(cfg.dataset_root, class_name)
 
-    def _project_state_payload(self, dataset_root: Path) -> Dict[str, Any]:
+    def _project_state_payload(self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         classes = self._classes_load(dataset_root)
         counts: Dict[str, int] = {}
         previews: Dict[str, List[Dict[str, str]]] = {}
@@ -1254,12 +1365,16 @@ class RecordController:
                 export_enabled = bool(tflite_path.exists())
             except Exception:
                 export_enabled = False
-        return {
+        train_cfg = self._project_train_cfg(dataset_root, project_state=project_state)
+        payload = {
             "classes": list(classes),
             "counts": counts,
             "sample_previews": previews,
             "export_enabled": "1" if export_enabled else "0",
         }
+        if train_cfg:
+            payload["train_cfg"] = train_cfg
+        return payload
 
     def _preview_model_lock(self, session_id: str) -> threading.Lock:
         with self._lock:
@@ -1318,13 +1433,12 @@ class RecordController:
         if len(shape) != 4:
             raise RuntimeError("unsupported input shape")
         _, h, w, c = shape
-        if int(c) == 1:
-            img = Image.open(_bytes_io(png)).convert("L").resize((int(w), int(h)))
-            arr = np.asarray(img, dtype=np.float32) / 255.0
-            arr = np.expand_dims(arr, axis=-1)
-        else:
-            img = Image.open(_bytes_io(png)).convert("RGB").resize((int(w), int(h)))
-            arr = np.asarray(img, dtype=np.float32) / 255.0
+        img = Image.open(_bytes_io(png)).convert("L" if int(c) == 1 else "RGB")
+        arr = focus_and_enhance_array(
+            np.asarray(img),
+            out_size=int(w),
+            color_mode="grayscale" if int(c) == 1 else "rgb",
+        )
         arr = np.expand_dims(arr, axis=0)
         qscale = 0.0
         qzp = 0
@@ -1640,9 +1754,8 @@ class RecordController:
             reader.open()
             while self._live_running(key):
                 raw = reader.read_frame(timeout_s=2.0)
-                preview_png = _raw96_preview_png(raw)
                 capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box)
-                self._live_set(key, preview_png=preview_png, capture_png=capture_png, error="")
+                self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
         except Exception as e:
             msg = str(e) or "Unable to read from serial device."
             if len(msg) > 220:
