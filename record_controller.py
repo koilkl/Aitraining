@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import zipfile
+import urllib.request
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +30,7 @@ from image_preprocess import (
     PREPROCESS_MODE_NONE,
     PREPROCESS_MODE_SIGN,
     class_clip_mode,
+    normalize_class_labels_map,
     normalize_class_preprocess,
     normalize_class_preprocess_map,
     normalize_sample_preprocess_map,
@@ -37,6 +39,51 @@ from image_preprocess import (
     prepare_inference_inputs,
 )
 
+# #region debug-point B:record-controller-device
+def _dbg_device_frame_timeout(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
+    _p = ".dbg/device-160-frame.env"
+    _u = "http://127.0.0.1:7777/event"
+    _s = "device-160-frame"
+    try:
+        try_paths = [".dbg/device-160-frame.env", ".dbg/device-frame-timeout.env"]
+        _c = ""
+        for _pp in try_paths:
+            try:
+                with open(_pp, "r", encoding="utf-8") as f:
+                    _c = f.read()
+                _p = _pp
+                break
+            except Exception:
+                continue
+        for _line in _c.splitlines():
+            if _line.startswith("DEBUG_SERVER_URL="):
+                _u = _line.split("=", 1)[1].strip() or _u
+            elif _line.startswith("DEBUG_SESSION_ID="):
+                _s = _line.split("=", 1)[1].strip() or _s
+    except Exception:
+        pass
+    try:
+        _payload = {
+            "sessionId": _s,
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": msg,
+            "data": data,
+            "ts": int(time.time() * 1000),
+        }
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.4,
+        ).read()
+    except Exception:
+        pass
+# #endregion
+
 
 @dataclass
 class SessionConfig:
@@ -44,6 +91,7 @@ class SessionConfig:
     serial_port: str
     serial_baud: int
     serial_sync: str
+    serial_frame_side: int
     webcam_index: int
     fps: float
     crop_box: Optional[Tuple[int, int, int, int]]
@@ -113,6 +161,7 @@ class RecordController:
         serial_port: Optional[str] = None,
         serial_baud: Optional[int] = None,
         serial_sync: Optional[str] = None,
+        serial_frame_side: Optional[int] = None,
     ) -> SessionConfig:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -124,6 +173,7 @@ class RecordController:
                 serial_port=str(cfg.serial_port if serial_port is None else serial_port),
                 serial_baud=int(cfg.serial_baud if serial_baud is None else serial_baud),
                 serial_sync=str(cfg.serial_sync if serial_sync is None else serial_sync),
+                serial_frame_side=int(cfg.serial_frame_side if serial_frame_side is None else serial_frame_side),
             )
             self._configs[session_id] = updated
             return updated
@@ -151,17 +201,18 @@ class RecordController:
         img = Image.fromarray(frame)
         return _to_png_bytes(img)
 
-    def preview_serial_png(self, port: str, baud: int, sync_header: str = "") -> Optional[bytes]:
+    def preview_serial_png(self, port: str, baud: int, sync_header: str = "", frame_side: int = 96) -> Optional[bytes]:
         if not port:
             return None
         try:
-            reader = SerialFrameReader(port=port, baud=int(baud), sync_header=sync_header)
+            reader = SerialFrameReader(port=port, baud=int(baud), sync_header=sync_header, frame_side=int(frame_side))
             reader.open()
             try:
                 raw = reader.read_frame(timeout_s=2.0)
             finally:
                 reader.close()
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
+            side = int(frame_side)
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side))
             img = Image.fromarray(arr, mode="L")
             return _to_png_bytes(img)
         except Exception:
@@ -308,15 +359,21 @@ class RecordController:
             serial_port_raw = (qs.get("serial_port") or [None])[0]
             serial_baud_raw = (qs.get("serial_baud") or [None])[0]
             serial_sync_raw = (qs.get("serial_sync") or [None])[0]
+            serial_frame_side_raw = (qs.get("serial_frame_side") or [None])[0]
             try:
                 if serial_sync_raw not in (None, ""):
                     parse_sync_header(serial_sync_raw)
+                if serial_frame_side_raw not in (None, ""):
+                    side = int(float(serial_frame_side_raw))
+                    if side < 8 or side > 512:
+                        raise ValueError("invalid serial_frame_side")
                 cfg = self.update_config(
                     session_id,
                     webcam_index=None if webcam_index_raw in (None, "") else int(float(webcam_index_raw)),
                     serial_port=serial_port_raw,
                     serial_baud=None if serial_baud_raw in (None, "") else int(float(serial_baud_raw)),
                     serial_sync=None if serial_sync_raw is None else str(serial_sync_raw),
+                    serial_frame_side=None if serial_frame_side_raw in (None, "") else int(float(serial_frame_side_raw)),
                 )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
@@ -329,6 +386,7 @@ class RecordController:
                     "serial_port": str(cfg.serial_port),
                     "serial_baud": str(int(cfg.serial_baud)),
                     "serial_sync": str(cfg.serial_sync),
+                    "serial_frame_side": str(int(cfg.serial_frame_side)),
                 },
                 cors=True,
             )
@@ -352,7 +410,13 @@ class RecordController:
                 return
             try:
                 self._ensure_live(session_id=session_id, source=source)
-                png = self._get_live_preview(session_id=session_id, source=source)
+                # Brief wait for the worker to produce its first frame. The serial
+                # worker may need a moment to open the port and sync to a frame boundary.
+                for _ in range(20):
+                    png = self._get_live_preview(session_id=session_id, source=source)
+                    if png is not None:
+                        break
+                    time.sleep(0.12)
                 if png is None:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
@@ -370,6 +434,8 @@ class RecordController:
                     "top_label": str(pred.get("top_label") or ""),
                     "top_prob": float(pred.get("top_prob") or 0.0),
                     "image_b64": base64.b64encode(png).decode("ascii"),
+                    "processed_image_b64": str(pred.get("processed_image_b64") or ""),
+                    "processed_variant": str(pred.get("processed_variant") or ""),
                 },
                 cors=True,
             )
@@ -514,6 +580,7 @@ class RecordController:
             "/classes/delete",
             "/samples/delete",
             "/preprocess/preview",
+            "/preprocess/save_sample",
             "/preview/predict_upload",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
@@ -544,6 +611,7 @@ class RecordController:
             filename = str(payload.get("filename") or "").strip()
             class_config = payload.get("class_config")
             sample_config = payload.get("sample_config")
+            class_labels = normalize_class_labels_map(payload.get("class_labels"))
             if not session_id or not class_name or not filename:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -554,11 +622,61 @@ class RecordController:
                     filename=filename,
                     class_config=class_config,
                     sample_config=sample_config,
+                    class_labels_request=class_labels,
                 )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1", **preview}, cors=True)
+            return
+        if path == "/preprocess/save_sample":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            filename = str(payload.get("filename") or "").strip()
+            sample_config = payload.get("sample_config")
+            class_labels = normalize_class_labels_map(payload.get("class_labels"))
+            if not session_id or not class_name or not filename:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            try:
+                result = self._preprocess_save_sample(
+                    session_id=session_id,
+                    class_name=class_name,
+                    filename=filename,
+                    sample_config=sample_config,
+                    class_labels_request=class_labels,
+                )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, result, cors=True)
+            return
+        if path == "/classes/save_labels":
+            session_id = str(payload.get("session") or "").strip()
+            class_labels = normalize_class_labels_map(payload.get("class_labels"))
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            try:
+                with self._lock:
+                    sess_cfg = self._configs.get(session_id)
+                if sess_cfg is None:
+                    _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                    return
+                classes = self._classes_load(sess_cfg.dataset_root)
+                self._classes_save(
+                    sess_cfg.dataset_root,
+                    classes,
+                    class_labels=class_labels if class_labels else None,
+                )
+                self._rebuild_processed_cache(
+                    sess_cfg.dataset_root,
+                    class_labels=class_labels if class_labels else None,
+                )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1"}, cors=True)
             return
         if path == "/preview/predict_upload":
             session_id = str(payload.get("session") or "").strip()
@@ -807,12 +925,17 @@ class RecordController:
         raw = self._classes_meta_load(dataset_root)
         return normalize_sample_preprocess_map(raw.get("sample_preprocess"))
 
+    def _class_labels_load(self, dataset_root: Path) -> Dict[str, str]:
+        raw = self._classes_meta_load(dataset_root)
+        return normalize_class_labels_map(raw.get("class_labels"))
+
     def _classes_save(
         self,
         dataset_root: Path,
         classes: List[str],
         class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
         sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        class_labels: Optional[Dict[str, str]] = None,
     ) -> None:
         p = self._classes_meta_path(dataset_root)
         payload: Dict[str, Any] = {"classes": list(classes)}
@@ -820,10 +943,14 @@ class RecordController:
         merged = normalize_class_preprocess_map(class_preprocess if class_preprocess is not None else existing)
         existing_sample = self._sample_preprocess_load(dataset_root)
         merged_sample = normalize_sample_preprocess_map(sample_preprocess if sample_preprocess is not None else existing_sample)
+        existing_labels = self._class_labels_load(dataset_root)
+        merged_labels = normalize_class_labels_map(class_labels if class_labels is not None else existing_labels)
         if merged:
             payload["class_preprocess"] = merged
         if merged_sample:
             payload["sample_preprocess"] = merged_sample
+        if class_labels is not None or existing_labels:
+            payload["class_labels"] = merged_labels
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _next_class_name(self, existing: List[str]) -> str:
@@ -843,8 +970,9 @@ class RecordController:
         classes = self._classes_load(cfg.dataset_root)
         class_preprocess = self._class_preprocess_load(cfg.dataset_root)
         sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_labels = self._class_labels_load(cfg.dataset_root)
         classes = list(classes) + [self._next_class_name(classes)]
-        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
+        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess, class_labels=class_labels)
         return classes
 
     def _classes_delete(self, session_id: str, name: str) -> List[str]:
@@ -874,13 +1002,15 @@ class RecordController:
         processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(actual_name)
         class_preprocess = self._class_preprocess_load(cfg.dataset_root)
         sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_labels = self._class_labels_load(cfg.dataset_root)
         class_preprocess.pop(actual_name, None)
         sample_preprocess.pop(actual_name, None)
+        class_labels.pop(actual_name, None)
         if class_dir.exists():
             shutil.rmtree(class_dir)
         if processed_dir.exists():
             shutil.rmtree(processed_dir)
-        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
+        self._classes_save(cfg.dataset_root, classes, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess, class_labels=class_labels)
         return classes
 
     def _classes_rename(self, session_id: str, old_name: str, new_name: str) -> List[str]:
@@ -894,6 +1024,7 @@ class RecordController:
         classes = self._classes_load(cfg.dataset_root)
         class_preprocess = self._class_preprocess_load(cfg.dataset_root)
         sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_labels = self._class_labels_load(cfg.dataset_root)
         if old_name not in classes:
             raise ValueError("Class not found.")
         if new_name in classes and new_name != old_name:
@@ -928,10 +1059,22 @@ class RecordController:
             class_preprocess[new_name] = class_preprocess.pop(old_name)
         if old_name in sample_preprocess:
             sample_preprocess[new_name] = sample_preprocess.pop(old_name)
-        self._classes_save(cfg.dataset_root, updated, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess)
+        if old_name in class_labels:
+            class_labels[new_name] = class_labels.pop(old_name)
+        self._classes_save(cfg.dataset_root, updated, class_preprocess=class_preprocess, sample_preprocess=sample_preprocess, class_labels=class_labels)
         return updated
 
     def _start_record(self, session_id: str, source: str, class_name: str) -> None:
+        # Stop any live worker that may be using the same hardware resource,
+        # then wait for it to release the resource before starting recording.
+        self._stop_live(session_id=session_id, source=source)
+        _deadline = time.time() + 2.5
+        _key = self._live_key(session_id, source)
+        while time.time() < _deadline:
+            if not self._live_running(_key):
+                break
+            time.sleep(0.05)
+
         with self._lock:
             cfg = self._configs.get(session_id)
             if cfg is None:
@@ -1045,6 +1188,20 @@ class RecordController:
         meta = json.loads(latest.read_text(encoding="utf-8"))
         tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser().resolve()
         labels = list(meta.get("labels") or []) if isinstance(meta, dict) else []
+        train_class_labels = normalize_class_labels_map(meta.get("class_labels") or {})
+        # Merge live class_labels from the dataset so classes left at the
+        # default "Sign" value (never explicitly toggled in the UI) still
+        # resolve correctly rather than falling through to the keyword
+        # heuristic in class_clip_mode, which misclassifies names containing
+        # road-direction tokens (END, LEFT, RIGHT, STRAIGHT, etc.).
+        live_class_labels = self._class_labels_load(cfg.dataset_root)
+        class_labels = {**live_class_labels, **train_class_labels}
+        label_types: List[int] = []
+        for label in labels:
+            if label in class_labels:
+                label_types.append(1 if class_labels[label] == "road" else 0)
+            else:
+                label_types.append(1 if class_clip_mode(label, class_labels=class_labels) == CLIP_MODE_JUNCTION else 0)
         img_size = int(meta.get("img_size") or 96) if isinstance(meta, dict) else 96
         color_mode = str(meta.get("color_mode") or "rgb") if isinstance(meta, dict) else "rgb"
         channels = 1 if color_mode.strip().lower() in {"l", "gray", "grayscale", "mono"} else 3
@@ -1055,7 +1212,7 @@ class RecordController:
         test_path.write_text("ok", encoding="utf-8")
         test_path.unlink(missing_ok=True)
         source_bytes = tflite_path.read_bytes()
-        from trainer import export_tflite_c_sources
+        from trainer import export_tflite_c_sources, export_tflite_resolver_header
 
         base = (model_name or "").strip() or "tm"
         safe_base = "".join([c if (c.isalnum() or c in {"_", "-", "."}) else "_" for c in base])
@@ -1077,6 +1234,7 @@ class RecordController:
             export_dir / "model_settings.cpp",
             export_dir / "model.h",
             export_dir / "model.cpp",
+            export_dir / "model_resolver.h",
             export_dir / "labels.txt",
         ]
         dedup_target_paths: List[Path] = []
@@ -1092,11 +1250,13 @@ class RecordController:
             raise ExportConflictError(conflicts)
 
         src, hdr = export_tflite_c_sources(source_bytes, array_name=array)
+        resolver_hdr = export_tflite_resolver_header(source_bytes)
         (export_dir / f"{safe_base}.tflite").write_bytes(source_bytes)
         (export_dir / h_name).write_text(hdr, encoding="utf-8")
         (export_dir / cpp_name).write_text(f'#include "{h_name}"\n\n' + src, encoding="utf-8")
         (export_dir / "model.h").write_text(hdr, encoding="utf-8")
         (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
+        (export_dir / "model_resolver.h").write_text(resolver_hdr, encoding="utf-8")
         (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
         def _c_str(s: str) -> str:
             return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -1111,14 +1271,19 @@ class RecordController:
                 f"#ifndef {h_guard}",
                 f"#define {h_guard}",
                 "",
-                "constexpr int kNumCols = " + str(int(img_size)) + ";",
-                "constexpr int kNumRows = " + str(int(img_size)) + ";",
+                "#include <stdint.h>",
+                '#include "image_provider.h"',
+                "",
+                "// Derived from image_provider.h — change OUT_WIDTH/OUT_HEIGHT there.",
+                "constexpr int kNumCols = OUT_WIDTH;",
+                "constexpr int kNumRows = OUT_HEIGHT;",
                 "constexpr int kNumChannels = " + str(int(channels)) + ";",
                 "",
                 "constexpr int kMaxImageSize = kNumCols * kNumRows * kNumChannels;",
                 "",
                 "constexpr int kCategoryCount = " + str(int(len(labels))) + ";",
                 "extern const char* kCategoryLabels[kCategoryCount];",
+                "extern const uint8_t kClassTypes[kCategoryCount];  // 0=sign, 1=road",
                 "",
                 f"#endif  // {h_guard}",
                 "",
@@ -1135,6 +1300,10 @@ class RecordController:
                 "",
                 "const char* kCategoryLabels[kCategoryCount] = {",
                 f"    {label_items},",
+                "};",
+                "",
+                "const uint8_t kClassTypes[kCategoryCount] = {",
+                f"    {', '.join([str(int(t)) for t in label_types])},",
                 "};",
                 "",
             ]
@@ -1222,12 +1391,21 @@ class RecordController:
             manifest["train_run_dir"] = "runs/latest"
         class_preprocess = normalize_class_preprocess_map(merged_project_state.get("class_preprocess"))
         sample_preprocess = normalize_sample_preprocess_map(merged_project_state.get("sample_preprocess"))
+        class_labels = normalize_class_labels_map(merged_project_state.get("class_labels"))
+        self._classes_save(
+            dataset_root,
+            self._classes_load(dataset_root),
+            class_preprocess=class_preprocess,
+            sample_preprocess=sample_preprocess,
+            class_labels=class_labels,
+        )
         if processed_cache_dir.exists():
             shutil.rmtree(processed_cache_dir)
         self._rebuild_processed_cache(
             dataset_root,
             class_preprocess=class_preprocess,
             sample_preprocess=sample_preprocess,
+            class_labels=class_labels,
         )
         if processed_cache_dir.exists():
             manifest["processed_cache_dir"] = "processed_cache"
@@ -1253,6 +1431,8 @@ class RecordController:
                     if p.is_dir():
                         continue
                     rel = p.relative_to(dataset_root)
+                    if rel.as_posix() in {"labels.txt", "labels.json"}:
+                        continue
                     zf.write(p, arcname=str(Path("dataset") / rel))
             if processed_cache_dir.exists():
                 for p in processed_cache_dir.rglob("*"):
@@ -1331,6 +1511,12 @@ class RecordController:
                     dirs = [d.name for d in dataset_root.iterdir() if d.is_dir()]
                     classes = sorted([str(x) for x in dirs]) if dirs else ["Class 1", "Class 2"]
                 self._classes_save(dataset_root, classes)
+            fixed_labels = self._classes_load(dataset_root)
+            (dataset_root / "labels.txt").write_text("\n".join(fixed_labels) + "\n", encoding="utf-8")
+            (dataset_root / "labels.json").write_text(
+                json.dumps({"labels": fixed_labels}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
             processed_cache_in = tmp_dir / str(manifest.get("processed_cache_dir") or "")
             processed_cache_out = self._processed_cache_dir(dataset_root)
@@ -1368,6 +1554,32 @@ class RecordController:
                         project_state = loaded
                 except Exception:
                     project_state = None
+            if isinstance(project_state, dict):
+                class_preprocess = normalize_class_preprocess_map(project_state.get("class_preprocess"))
+                sample_preprocess = normalize_sample_preprocess_map(project_state.get("sample_preprocess"))
+                # Only pass class_labels if explicitly present in project_state;
+                # otherwise preserve whatever was restored from tm_classes.json.
+                if "class_labels" in project_state:
+                    class_labels = normalize_class_labels_map(project_state["class_labels"])
+                else:
+                    class_labels = None
+                self._classes_save(
+                    dataset_root,
+                    self._classes_load(dataset_root),
+                    class_preprocess=class_preprocess,
+                    sample_preprocess=sample_preprocess,
+                    class_labels=class_labels,
+                )
+            else:
+                class_preprocess = self._class_preprocess_load(dataset_root)
+                sample_preprocess = self._sample_preprocess_load(dataset_root)
+                class_labels = self._class_labels_load(dataset_root)
+            self._rebuild_processed_cache(
+                dataset_root,
+                class_preprocess=class_preprocess,
+                sample_preprocess=sample_preprocess,
+                class_labels=class_labels,
+            )
             return self._project_state_payload(dataset_root, project_state=project_state)
         finally:
             if tmp_dir.exists():
@@ -1417,6 +1629,7 @@ class RecordController:
             src = raw if isinstance(raw, dict) else {}
             out: Dict[str, Any] = {}
             int_fields = {
+                "img_size": 96,
                 "batch_size": 16,
                 "epochs": 10,
                 "conv1_filters": 8,
@@ -1508,7 +1721,7 @@ class RecordController:
     def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
         return _preview_item_payload(path)
 
-    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None) -> bytes:
+    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, class_labels: Optional[Dict[str, str]] = None) -> bytes:
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
         img = Image.open(_bytes_io(png)).convert("L")
         arr = preprocess_for_label(
@@ -1518,6 +1731,7 @@ class RecordController:
             label_name=label_name,
             preprocess_mode=str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
             manual_roi=config.get("manual_roi"),
+            class_labels=class_labels,
         )
         out = np.asarray(np.clip(arr[:, :, 0] * 255.0, 0.0, 255.0), dtype=np.uint8)
         return _to_png_bytes(Image.fromarray(out, mode="L"))
@@ -1527,12 +1741,14 @@ class RecordController:
         dataset_root: Path,
         class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
         sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        class_labels: Optional[Dict[str, str]] = None,
     ) -> None:
         classes = self._classes_load(dataset_root)
         cache_root = self._processed_cache_dir(dataset_root)
         cache_root.mkdir(parents=True, exist_ok=True)
         class_preprocess = normalize_class_preprocess_map(class_preprocess if class_preprocess is not None else self._class_preprocess_load(dataset_root))
         sample_preprocess = normalize_sample_preprocess_map(sample_preprocess if sample_preprocess is not None else self._sample_preprocess_load(dataset_root))
+        class_labels = normalize_class_labels_map(class_labels if class_labels is not None else self._class_labels_load(dataset_root))
         for class_name in classes:
             src_dir = dataset_root / sanitize_class_name(class_name)
             dst_dir = cache_root / sanitize_class_name(class_name)
@@ -1551,6 +1767,7 @@ class RecordController:
                         label_name=class_name,
                         class_config=config,
                         sample_config=class_sample_map.get(src.name),
+                        class_labels=class_labels,
                     )
                     (dst_dir / f"{src.stem}.png").write_bytes(out_png)
                 except Exception:
@@ -1578,6 +1795,7 @@ class RecordController:
         filename: str,
         class_config: Any,
         sample_config: Any = None,
+        class_labels_request: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -1587,21 +1805,88 @@ class RecordController:
         src = (class_dir / Path(filename).name).resolve()
         if src.parent != class_dir.resolve() or not src.exists():
             raise FileNotFoundError("sample not found")
+        disk_labels = self._class_labels_load(cfg.dataset_root)
+        merged_labels = normalize_class_labels_map(class_labels_request if class_labels_request is not None else {})
+        effective_labels = {**disk_labels, **merged_labels} if merged_labels else disk_labels
         out_png = self._preprocess_image_png(
             src.read_bytes(),
             label_name=class_name,
             class_config=class_config,
             sample_config=sample_config,
+            class_labels=effective_labels,
         )
         return {"image_b64": base64.b64encode(out_png).decode("ascii")}
+
+    def _preprocess_save_sample(
+        self,
+        session_id: str,
+        class_name: str,
+        filename: str,
+        sample_config: Any,
+        class_labels_request: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        class_dir = (cfg.dataset_root / sanitize_class_name(class_name)).resolve()
+        src = (class_dir / Path(filename).name).resolve()
+        if src.parent != class_dir or not src.exists():
+            raise FileNotFoundError("sample not found")
+
+        class_preprocess = self._class_preprocess_load(cfg.dataset_root)
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        class_default = normalize_class_preprocess(class_preprocess.get(class_name))
+        normalized = normalize_class_preprocess(sample_config)
+
+        class_map = sample_preprocess.get(class_name, {})
+        if normalized == class_default:
+            if isinstance(class_map, dict):
+                class_map.pop(src.name, None)
+                if not class_map:
+                    sample_preprocess.pop(class_name, None)
+        else:
+            if not isinstance(class_map, dict):
+                class_map = {}
+            class_map[src.name] = normalized
+            sample_preprocess[class_name] = class_map
+
+        disk_labels = self._class_labels_load(cfg.dataset_root)
+        merged_labels = normalize_class_labels_map(class_labels_request if class_labels_request is not None else {})
+        effective_labels = {**disk_labels, **merged_labels} if merged_labels else disk_labels
+
+        self._classes_save(
+            cfg.dataset_root,
+            self._classes_load(cfg.dataset_root),
+            class_preprocess=class_preprocess,
+            sample_preprocess=sample_preprocess,
+            class_labels=effective_labels,
+        )
+
+        processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(class_name)
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        out_png = self._preprocess_image_png(
+            src.read_bytes(),
+            label_name=class_name,
+            class_config=class_default,
+            sample_config=sample_preprocess.get(class_name, {}).get(src.name),
+            class_labels=effective_labels,
+        )
+        (processed_dir / f"{src.stem}.png").write_bytes(out_png)
+        return {
+            "ok": "1",
+            "sample_preprocess": self._sample_preprocess_load(cfg.dataset_root),
+        }
 
     def _project_state_payload(self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         classes = self._classes_load(dataset_root)
         class_preprocess = self._class_preprocess_load(dataset_root)
         sample_preprocess = self._sample_preprocess_load(dataset_root)
+        class_labels = self._class_labels_load(dataset_root)
         if isinstance(project_state, dict):
             class_preprocess = normalize_class_preprocess_map(project_state.get("class_preprocess") or class_preprocess)
             sample_preprocess = normalize_sample_preprocess_map(project_state.get("sample_preprocess") or sample_preprocess)
+            class_labels = normalize_class_labels_map(project_state.get("class_labels") or class_labels)
         counts: Dict[str, int] = {}
         previews: Dict[str, List[Dict[str, str]]] = {}
         for c in classes:
@@ -1612,7 +1897,7 @@ class RecordController:
                 try:
                     files = _list_class_image_files(c_dir)
                     cnt = len(files)
-                    for p in files[:12]:
+                    for p in files:
                         try:
                             thumbs.append(_preview_item_payload(p))
                         except Exception:
@@ -1639,6 +1924,7 @@ class RecordController:
             "processed_previews": processed_previews,
             "class_preprocess": class_preprocess,
             "sample_preprocess": sample_preprocess,
+            "class_labels": class_labels,
             "export_enabled": "1" if export_enabled else "0",
         }
         if train_cfg:
@@ -1686,6 +1972,7 @@ class RecordController:
             "preprocess_mode": str(meta.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL) if isinstance(meta, dict) else PREPROCESS_MODE_AUTO_BY_LABEL,
             "manual_roi": normalize_manual_roi(meta.get("manual_roi")) if isinstance(meta, dict) else None,
             "class_preprocess": normalize_class_preprocess_map(meta.get("class_preprocess")) if isinstance(meta, dict) else {},
+            "class_labels": normalize_class_labels_map(meta.get("class_labels")) if isinstance(meta, dict) else {},
             "interpreter": interpreter,
             "input_details": input_details,
             "output_details": output_details,
@@ -1704,6 +1991,7 @@ class RecordController:
         preprocess_mode = str(preprocess_mode or model_preprocess_mode or PREPROCESS_MODE_AUTO_BY_LABEL).strip().lower()
         manual_roi = normalize_manual_roi(model.get("manual_roi"))
         class_preprocess = normalize_class_preprocess_map(model.get("class_preprocess"))
+        class_labels = normalize_class_labels_map(model.get("class_labels"))
         shape_raw = input_details.get("shape")
         shape = tuple(int(x) for x in (shape_raw if shape_raw is not None else []))
         if len(shape) != 4:
@@ -1717,6 +2005,7 @@ class RecordController:
             preprocess_mode=preprocess_mode,
             manual_roi=manual_roi,
             class_preprocess=class_preprocess,
+            class_labels=class_labels,
         )
         qscale = 0.0
         qzp = 0
@@ -1767,7 +2056,7 @@ class RecordController:
             junction_probs = variant_probs["junction"]
             probs = np.zeros_like(sign_probs)
             for idx, label_name in enumerate(labels):
-                probs[idx] = junction_probs[idx] if class_clip_mode(label_name) == CLIP_MODE_JUNCTION else sign_probs[idx]
+                probs[idx] = junction_probs[idx] if class_clip_mode(label_name, class_labels=class_labels) == CLIP_MODE_JUNCTION else sign_probs[idx]
             total = float(np.sum(probs))
             if total > 0.0:
                 probs = probs / total
@@ -1777,11 +2066,20 @@ class RecordController:
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
         top_i = int(np.argmax(probs)) if probs.size else 0
+        processed_variant = next(iter(prepared.keys()), "")
+        if preprocess_mode == PREPROCESS_MODE_AUTO_BY_LABEL and labels:
+            top_label = str(labels[top_i]) if 0 <= top_i < len(labels) else ""
+            processed_variant = "junction" if class_clip_mode(top_label, class_labels=class_labels) == CLIP_MODE_JUNCTION else "sign"
+        processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
+        processed_img = _model_input_array_to_preview_image(processed_arr)
+        processed_png = _to_png_bytes(processed_img)
         return {
             "labels": labels,
             "probs": [float(x) for x in probs.tolist()],
             "top_label": str(labels[top_i]) if 0 <= top_i < len(labels) else "",
             "top_prob": float(probs[top_i]) if probs.size else 0.0,
+            "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
+            "processed_variant": str(processed_variant or ""),
         }
 
     def _start_train(self, session_id: str, cfg: Any) -> None:
@@ -1870,6 +2168,7 @@ class RecordController:
                 manual_roi=normalize_manual_roi(cfg_dict.get("manual_roi")),
                 class_preprocess=normalize_class_preprocess_map(cfg_dict.get("class_preprocess")),
                 sample_preprocess=normalize_sample_preprocess_map(cfg_dict.get("sample_preprocess")),
+                class_labels=normalize_class_labels_map(cfg_dict.get("class_labels")),
                 use_preprocessed_dataset=True,
             )
 
@@ -1882,6 +2181,7 @@ class RecordController:
                 sess_cfg.dataset_root,
                 class_preprocess=cfg.class_preprocess,
                 sample_preprocess=cfg.sample_preprocess,
+                class_labels=cfg.class_labels,
             )
 
             def on_progress(p: float, msg: str) -> None:
@@ -1909,6 +2209,7 @@ class RecordController:
                 "manual_roi": list(cfg.manual_roi) if cfg.manual_roi is not None else None,
                 "class_preprocess": normalize_class_preprocess_map(cfg.class_preprocess),
                 "sample_preprocess": normalize_sample_preprocess_map(cfg.sample_preprocess),
+                "class_labels": normalize_class_labels_map(cfg.class_labels),
                 "trained_dataset_dir": str(processed_dataset_dir),
             }
             latest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1946,6 +2247,12 @@ class RecordController:
         return f"{session_id}:{source}"
 
     def _stop_live(self, session_id: str, source: Optional[str] = None) -> None:
+        _dbg_device_frame_timeout(
+            "C",
+            "record_controller.py:_stop_live",
+            "[DEBUG] stop live requested",
+            {"session_id": session_id, "source": source or "", "thread": threading.current_thread().name},
+        )
         with self._lock:
             keys = [self._live_key(session_id, source)] if source else [k for k in self._live if k.startswith(f"{session_id}:")]
             for key in keys:
@@ -1959,6 +2266,20 @@ class RecordController:
             raise RuntimeError("missing config")
         key = self._live_key(session_id, source)
         now = time.time()
+        _dbg_device_frame_timeout(
+            "C",
+            "record_controller.py:_ensure_live",
+            "[DEBUG] ensure live entered",
+            {
+                "session_id": session_id,
+                "source": source,
+                "key": key,
+                "serial_port": str(cfg.serial_port),
+                "serial_baud": int(cfg.serial_baud),
+                "serial_sync": str(cfg.serial_sync),
+                "thread": threading.current_thread().name,
+            },
+        )
         with self._lock:
             for stale_key, stale_state in list(self._live.items()):
                 try:
@@ -1975,6 +2296,12 @@ class RecordController:
             if cur is not None and cur.get("running"):
                 cur["last_touch"] = now
                 cur["cfg"] = cfg
+                _dbg_device_frame_timeout(
+                    "C",
+                    "record_controller.py:_ensure_live",
+                    "[DEBUG] ensure live reused running state",
+                    {"session_id": session_id, "source": source, "key": key, "thread": threading.current_thread().name},
+                )
                 return
             state = {
                 "running": True,
@@ -1986,6 +2313,12 @@ class RecordController:
                 "error": "",
             }
             self._live[key] = state
+        _dbg_device_frame_timeout(
+            "C",
+            "record_controller.py:_ensure_live",
+            "[DEBUG] ensure live started worker",
+            {"session_id": session_id, "source": source, "key": key, "thread": threading.current_thread().name},
+        )
         t = threading.Thread(target=self._live_worker, args=(key, session_id, source), daemon=True)
         t.start()
 
@@ -2063,27 +2396,77 @@ class RecordController:
             self._live_set(key, error="Serial port is not configured.")
             return
         last_error = ""
-        while self._live_running(key):
-            reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
-            try:
-                reader.open()
-                raw = reader.read_frame(timeout_s=1.5)
-                capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box)
-                self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
-                last_error = ""
-            except Exception as e:
-                msg = str(e) or "Unable to read from serial device."
-                if len(msg) > 220:
-                    msg = msg[:220] + "..."
-                if msg != last_error:
-                    self._live_set(key, error=msg)
-                    last_error = msg
-                time.sleep(0.06)
-            finally:
+        _dbg_device_frame_timeout(
+            "B",
+            "record_controller.py:_live_serial",
+            "[DEBUG] live serial worker started",
+            {
+                "key": key,
+                "serial_port": str(cfg.serial_port),
+                "serial_baud": int(cfg.serial_baud),
+                "serial_sync": str(cfg.serial_sync),
+                "thread": threading.current_thread().name,
+            },
+        )
+        reader = SerialFrameReader(
+            port=cfg.serial_port,
+            baud=int(cfg.serial_baud),
+            sync_header=cfg.serial_sync,
+            frame_side=int(cfg.serial_frame_side),
+        )
+        try:
+            reader.open()
+        except Exception as e:
+            self._live_set(key, error=str(e) or "Unable to open serial port.")
+            return
+        first_frame = True
+        try:
+            while self._live_running(key):
                 try:
-                    reader.close()
-                except Exception:
-                    pass
+                    # First frame after port-open needs longer to sync (reset_input_buffer
+                    # dropped any partial frame). Subsequent frames arrive predictably.
+                    timeout_s = 3.0 if first_frame else 0.6
+                    raw = reader.read_frame(timeout_s=timeout_s)
+                    first_frame = False
+                    capture_png = _raw96_to_png(
+                        raw,
+                        crop_box=cfg.crop_box,
+                        frame_side=int(cfg.serial_frame_side),
+                        out_side=int(cfg.serial_frame_side),
+                    )
+                    self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
+                    last_error = ""
+                    _dbg_device_frame_timeout(
+                        "B",
+                        "record_controller.py:_live_serial",
+                        "[DEBUG] live serial frame updated",
+                        {"key": key, "raw_len": len(raw), "thread": threading.current_thread().name},
+                    )
+                except Exception as e:
+                    msg = str(e) or "Unable to read from serial device."
+                    if len(msg) > 220:
+                        msg = msg[:220] + "..."
+                    if msg != last_error:
+                        self._live_set(key, error=msg)
+                        last_error = msg
+                        _dbg_device_frame_timeout(
+                            "B",
+                            "record_controller.py:_live_serial",
+                            "[DEBUG] live serial frame failed",
+                            {"key": key, "error": msg, "thread": threading.current_thread().name},
+                        )
+                    time.sleep(0.02)
+        finally:
+            try:
+                reader.close()
+            except Exception:
+                pass
+        _dbg_device_frame_timeout(
+            "C",
+            "record_controller.py:_live_serial",
+            "[DEBUG] live serial worker exited",
+            {"key": key, "thread": threading.current_thread().name},
+        )
 
     def _live_webcam(self, key: str, cfg: SessionConfig) -> None:
         permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
@@ -2131,7 +2514,12 @@ class RecordController:
         if cfg is None:
             return None
         if source == "device":
-            return self.preview_serial_png(cfg.serial_port, int(cfg.serial_baud), str(cfg.serial_sync))
+            return self.preview_serial_png(
+                cfg.serial_port,
+                int(cfg.serial_baud),
+                str(cfg.serial_sync),
+                frame_side=int(cfg.serial_frame_side),
+            )
         if source == "webcam":
             return self.preview_webcam_png(int(cfg.webcam_index))
         return None
@@ -2142,14 +2530,54 @@ class RecordController:
             return None
         if source == "device":
             try:
-                reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+                _dbg_device_frame_timeout(
+                    "B",
+                    "record_controller.py:_capture_single",
+                    "[DEBUG] device capture started",
+                    {
+                        "session_id": session_id,
+                        "source": source,
+                        "serial_port": str(cfg.serial_port),
+                        "serial_baud": int(cfg.serial_baud),
+                        "serial_sync": str(cfg.serial_sync),
+                        "thread": threading.current_thread().name,
+                    },
+                )
+                reader = SerialFrameReader(
+                    port=cfg.serial_port,
+                    baud=int(cfg.serial_baud),
+                    sync_header=cfg.serial_sync,
+                    frame_side=int(cfg.serial_frame_side),
+                )
                 reader.open()
                 try:
                     raw = reader.read_frame(timeout_s=2.0)
                 finally:
                     reader.close()
-                return _raw96_to_png(raw, crop_box=cfg.crop_box)
-            except Exception:
+                _dbg_device_frame_timeout(
+                    "B",
+                    "record_controller.py:_capture_single",
+                    "[DEBUG] device capture succeeded",
+                    {"session_id": session_id, "source": source, "raw_len": len(raw), "thread": threading.current_thread().name},
+                )
+                return _raw96_to_png(
+                    raw,
+                    crop_box=cfg.crop_box,
+                    frame_side=int(cfg.serial_frame_side),
+                    out_side=int(cfg.serial_frame_side),
+                )
+            except Exception as e:
+                _dbg_device_frame_timeout(
+                    "A",
+                    "record_controller.py:_capture_single",
+                    "[DEBUG] device capture failed",
+                    {
+                        "session_id": session_id,
+                        "source": source,
+                        "error": str(e),
+                        "thread": threading.current_thread().name,
+                    },
+                )
                 return None
         if source == "webcam":
             permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
@@ -2180,12 +2608,22 @@ class RecordController:
             return self._active.get(session_id, {}).get("recording") == "1"
 
     def _record_serial(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
-        reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+        reader = SerialFrameReader(
+            port=cfg.serial_port,
+            baud=int(cfg.serial_baud),
+            sync_header=cfg.serial_sync,
+            frame_side=int(cfg.serial_frame_side),
+        )
         try:
             reader.open()
             while self._is_recording(session_id):
                 raw = reader.read_frame(timeout_s=2.0)
-                png = _raw96_to_png(raw, crop_box=cfg.crop_box)
+                png = _raw96_to_png(
+                    raw,
+                    crop_box=cfg.crop_box,
+                    frame_side=int(cfg.serial_frame_side),
+                    out_side=int(cfg.serial_frame_side),
+                )
                 p = _save_png(cfg.dataset_root, class_name, png)
                 with self._lock:
                     cur = self._active.get(session_id)
@@ -2372,13 +2810,21 @@ def _open_working_camera(preferred_index: int, max_probe_index: int = 3):
     return None, None
 
 
-def _raw96_to_png(raw: bytes, crop_box: Optional[Tuple[int, int, int, int]]) -> bytes:
-    arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
+def _raw96_to_png(
+    raw: bytes,
+    crop_box: Optional[Tuple[int, int, int, int]],
+    *,
+    frame_side: int = 96,
+    out_side: int = 96,
+) -> bytes:
+    side = int(frame_side)
+    out_side = int(out_side)
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side))
     img = Image.fromarray(arr, mode="L")
     if crop_box is not None:
         x1, y1, x2, y2 = crop_box
         img = img.crop((x1, y1, x2, y2))
-    img = img.resize((96, 96))
+    img = img.resize((out_side, out_side))
     return _to_png_bytes(img)
 
 
@@ -2394,6 +2840,31 @@ def _to_png_bytes(img: Image.Image) -> bytes:
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     return bio.getvalue()
+
+
+def _model_input_array_to_preview_image(arr: np.ndarray) -> Image.Image:
+    vis = np.asarray(arr)
+    if vis.ndim == 3 and vis.shape[-1] == 1:
+        vis = vis[:, :, 0]
+    if vis.dtype == np.uint8:
+        u8 = vis
+    else:
+        vis = vis.astype(np.float32)
+        if vis.size == 0:
+            u8 = np.zeros((1, 1), dtype=np.uint8)
+        else:
+            vmin = float(np.min(vis))
+            vmax = float(np.max(vis))
+            if vmin >= 0.0 and vmax <= 1.0 + 1e-6:
+                u8 = np.clip(np.round(vis * 255.0), 0, 255).astype(np.uint8)
+            elif vmin >= -1.0 - 1e-6 and vmax <= 1.0 + 1e-6:
+                u8 = np.clip(np.round((vis + 1.0) * 127.5), 0, 255).astype(np.uint8)
+            else:
+                span = max(vmax - vmin, 1e-6)
+                u8 = np.clip(np.round((vis - vmin) * (255.0 / span)), 0, 255).astype(np.uint8)
+    if u8.ndim == 2:
+        return Image.fromarray(u8, mode="L")
+    return Image.fromarray(u8[:, :, :3], mode="RGB")
 
 
 def make_hold_button_html(label: str, start_url: str, stop_url: str) -> str:

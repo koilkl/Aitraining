@@ -13,6 +13,7 @@ from tensorflow.lite.python.util import convert_bytes_to_c_source
 
 from image_preprocess import (
     PREPROCESS_MODE_AUTO_BY_LABEL,
+    normalize_class_labels_map,
     normalize_class_preprocess_map,
     normalize_sample_preprocess_map,
     normalize_manual_roi,
@@ -38,7 +39,10 @@ class TrainConfig:
     manual_roi: Optional[Tuple[float, float, float, float]] = None
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None
     sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
+    class_labels: Optional[Dict[str, str]] = None
     use_preprocessed_dataset: bool = False
+    use_global_avg_pooling: bool = True
+    use_depthwise: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,7 @@ def load_datasets(
     manual_roi = normalize_manual_roi(cfg.manual_roi)
     class_preprocess = normalize_class_preprocess_map(cfg.class_preprocess)
     sample_preprocess = normalize_sample_preprocess_map(cfg.sample_preprocess)
+    class_labels = normalize_class_labels_map(cfg.class_labels)
     _ = sample_preprocess
     use_preprocessed_dataset = bool(cfg.use_preprocessed_dataset)
 
@@ -167,6 +172,7 @@ def load_datasets(
                 preprocess_mode=preprocess_mode,
                 manual_roi=manual_roi,
                 class_preprocess=class_preprocess,
+                class_labels=class_labels,
             )
 
         x = tf.map_fn(
@@ -224,18 +230,36 @@ def build_model(input_shape: Tuple[int, int, int], num_classes: int, cfg: TrainC
     reg = tf.keras.regularizers.l2(1e-4)
     conv3_filters = max(int(cfg.conv2_filters) * 2, 64)
     dense_units = max(int(cfg.dense_units), 64)
+    # Use GlobalAveragePooling2D instead of Flatten for on-device speed.
+    # Flatten produces 9216 input features for Dense (590K MACs at 96×96).
+    # GlobalAveragePooling2D reduces this to 64 features (4K MACs) — 144× fewer.
+    use_gap = bool(getattr(cfg, "use_global_avg_pooling", True))
+    use_dw = bool(getattr(cfg, "use_depthwise", False))
+    pool_or_flatten = (
+        tf.keras.layers.GlobalAveragePooling2D()
+        if use_gap
+        else tf.keras.layers.Flatten()
+    )
+    # Depthwise separable conv: ~9× fewer MACs and ~9× smaller than regular Conv2D.
+    # Ideal for microcontrollers. Use SeparableConv2D instead of Conv2D+separate depthwise.
+    Conv = lambda filters: (
+        tf.keras.layers.SeparableConv2D(filters, (3, 3), activation="relu", padding="same",
+                                        depthwise_regularizer=reg, pointwise_regularizer=reg)
+        if use_dw
+        else tf.keras.layers.Conv2D(filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg)
+    )
     model = tf.keras.Sequential(
         [
             tf.keras.layers.Input(shape=input_shape, name="input"),
-            tf.keras.layers.Conv2D(cfg.conv1_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
+            Conv(cfg.conv1_filters),
             tf.keras.layers.MaxPooling2D((2, 2)),
             tf.keras.layers.Dropout(0.10),
-            tf.keras.layers.Conv2D(cfg.conv2_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
+            Conv(cfg.conv2_filters),
             tf.keras.layers.MaxPooling2D((2, 2)),
             tf.keras.layers.Dropout(0.15),
-            tf.keras.layers.Conv2D(conv3_filters, (3, 3), activation="relu", padding="same", kernel_regularizer=reg),
+            Conv(conv3_filters),
             tf.keras.layers.MaxPooling2D((2, 2)),
-            tf.keras.layers.Flatten(),
+            pool_or_flatten,
             tf.keras.layers.Dense(dense_units, activation="relu", kernel_regularizer=reg),
             tf.keras.layers.Dropout(0.35),
             tf.keras.layers.Dense(num_classes, activation="softmax", name="output"),
@@ -286,6 +310,125 @@ def export_tflite_c_sources(tflite_model: bytes, array_name: str) -> Tuple[str, 
         use_tensorflow_license=False,
     )
     return source_code, header_code
+
+
+def _load_tflite_schema_module():
+    try:
+        from tensorflow.lite.python import schema_py_generated as schema_fb  # type: ignore
+
+        return schema_fb
+    except Exception:
+        try:
+            from tensorflow.lite.python import schema_py_generated  # type: ignore
+
+            return schema_py_generated
+        except Exception as e:
+            raise RuntimeError("Unable to import tensorflow.lite schema_py_generated.") from e
+
+
+def _resolver_method_name_for_builtin(enum_name: str) -> Optional[str]:
+    name = str(enum_name or "").strip().upper()
+    if not name or name == "CUSTOM":
+        return None
+    special = {
+        "AVERAGE_POOL_2D": "AddAveragePool2D",
+        "MAX_POOL_2D": "AddMaxPool2D",
+        "CONV_2D": "AddConv2D",
+        "DEPTHWISE_CONV_2D": "AddDepthwiseConv2D",
+        "FULLY_CONNECTED": "AddFullyConnected",
+        "SOFTMAX": "AddSoftmax",
+        "RESHAPE": "AddReshape",
+        "SHAPE": "AddShape",
+        "STRIDED_SLICE": "AddStridedSlice",
+        "PACK": "AddPack",
+    }
+    if name in special:
+        return special[name]
+
+    parts: List[str] = []
+    for token in name.split("_"):
+        tok = str(token or "").strip()
+        if not tok:
+            continue
+        if tok in {"2D", "3D", "L2"}:
+            parts.append(tok)
+        else:
+            parts.append(tok.lower().capitalize())
+    if not parts:
+        return None
+    return "Add" + "".join(parts)
+
+
+def extract_tflite_resolver_methods(tflite_model: bytes) -> List[str]:
+    schema_fb = _load_tflite_schema_module()
+    model_obj = schema_fb.Model.GetRootAsModel(tflite_model, 0)
+    builtin_names = {
+        int(value): str(name)
+        for name, value in vars(schema_fb.BuiltinOperator).items()
+        if name.isupper() and isinstance(value, int)
+    }
+    custom_code = getattr(schema_fb.BuiltinOperator, "CUSTOM", None)
+
+    methods: List[str] = []
+    seen = set()
+    subgraph_count = int(model_obj.SubgraphsLength() or 0)
+    for subgraph_idx in range(subgraph_count):
+        subgraph = model_obj.Subgraphs(subgraph_idx)
+        if subgraph is None:
+            continue
+        for op_idx in range(int(subgraph.OperatorsLength() or 0)):
+            op = subgraph.Operators(op_idx)
+            if op is None:
+                continue
+            opcode = model_obj.OperatorCodes(op.OpcodeIndex())
+            if opcode is None:
+                continue
+            builtin_code = int(opcode.BuiltinCode())
+            if custom_code is not None and builtin_code == int(custom_code):
+                custom = opcode.CustomCode()
+                custom_name = custom.decode("utf-8", errors="ignore") if isinstance(custom, (bytes, bytearray)) else str(custom or "")
+                raise RuntimeError(f"Unsupported custom TFLite op: {custom_name or 'CUSTOM'}")
+            enum_name = builtin_names.get(builtin_code, "")
+            method_name = _resolver_method_name_for_builtin(enum_name)
+            if not method_name:
+                raise RuntimeError(f"Unsupported TFLite builtin op code: {builtin_code} ({enum_name or 'UNKNOWN'})")
+            if method_name not in seen:
+                seen.add(method_name)
+                methods.append(method_name)
+    if not methods:
+        raise RuntimeError("No TFLite builtin ops found in exported model.")
+    return methods
+
+
+def export_tflite_resolver_header(tflite_model: bytes) -> str:
+    methods = extract_tflite_resolver_methods(tflite_model)
+    lines = [
+        "/*",
+        "Auto-generated by TFLiteTraining export.",
+        "Derived from the exported .tflite builtin operator table.",
+        "*/",
+        "",
+        "#ifndef TFLITE_MODEL_RESOLVER_H_",
+        "#define TFLITE_MODEL_RESOLVER_H_",
+        "",
+        '#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"',
+        "",
+        f"using ModelOpResolver = tflite::MicroMutableOpResolver<{len(methods)}>;",
+        "",
+        "inline TfLiteStatus RegisterModelOps(ModelOpResolver& resolver) {",
+    ]
+    for method in methods:
+        lines.append(f"  if (resolver.{method}() != kTfLiteOk) return kTfLiteError;")
+    lines.extend(
+        [
+            "  return kTfLiteOk;",
+            "}",
+            "",
+            "#endif  // TFLITE_MODEL_RESOLVER_H_",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def train_and_export(
@@ -363,10 +506,13 @@ def train_and_export(
     if progress is not None:
         progress(0.96, "Exporting sources...")
     source_code, header_code = export_tflite_c_sources(tflite_bytes, array_name=array_name)
+    resolver_header_code = export_tflite_resolver_header(tflite_bytes)
     model_h_path = run_dir / "model.h"
     model_cpp_path = run_dir / "model.cpp"
+    model_resolver_path = run_dir / "model_resolver.h"
     model_h_path.write_text(header_code, encoding="utf-8")
     model_cpp_path.write_text('#include "model.h"\n\n' + source_code, encoding="utf-8")
+    model_resolver_path.write_text(resolver_header_code, encoding="utf-8")
 
     (run_dir / "labels.json").write_text(json.dumps({"labels": labels}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (run_dir / "labels.txt").write_text("\n".join(labels) + "\n", encoding="utf-8")

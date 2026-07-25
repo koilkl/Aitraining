@@ -401,11 +401,43 @@ def _render_crop(crop: np.ndarray, out_size: int, color_mode: str, preserve_aspe
     return out.astype(np.float32) / 255.0
 
 
-def class_clip_mode(class_name: str) -> int:
-    name = str(class_name or "").upper()
-    junction_tokens = ("CROSS", "CROSSROAD", "INTERSECTION", "T_JUNCTION", "TJUNCTION", "THREE_WAY", "FORK")
-    if any(token in name for token in junction_tokens):
+def class_clip_mode(class_name: str, class_labels: Optional[Dict[str, str]] = None) -> int:
+    if isinstance(class_labels, dict):
+        label = class_labels.get(str(class_name or "").strip())
+        if label == "road":
+            return CLIP_MODE_JUNCTION
+        if label == "sign":
+            return CLIP_MODE_SIGN
+        # Class not in the labels dict.  If the dict is non-empty the user
+        # IS using labels — default to sign mode (matches the UI default).
+        # If the dict is empty / None, fall through to keyword matching below
+        # so projects that predate the label feature still work.
+        if class_labels:
+            return CLIP_MODE_SIGN
+    # Fallback: keyword-based heuristic (reached when class_labels is None,
+    # empty, or doesn't contain this class name).
+    name = str(class_name or "").upper(
+        
+    )
+    name = name.replace(" ", "_")
+    parts = name.split("_")
+
+    junction_tokens = {"CROSS", "CROSSROAD", "INTERSECTION", "T_JUNCTION",
+                       "TJUNCTION", "THREE_WAY", "FORK", "STRAIGHT", "LINE"}
+    if any(p in parts for p in junction_tokens):
         return CLIP_MODE_JUNCTION
+
+    # Road-direction class tokens — not junctions, but still road-mode (not signs).
+    # Use exact part matching to avoid substring false-positives
+    # (e.g. "RIGHT" matching inside "TRAFFICLIGHT").
+    road_direction_tokens = {
+        "LEFT", "RIGHT", "STRAIGHT", "AHEAD", "FORWARD",
+        "TURN", "GO", "ROUNDABOUT", "EXIT",
+        "END",
+    }
+    if any(p in road_direction_tokens for p in parts):
+        return CLIP_MODE_JUNCTION
+
     return CLIP_MODE_SIGN
 
 
@@ -492,11 +524,26 @@ def normalize_sample_preprocess_map(raw: Any) -> Dict[str, Dict[str, Dict[str, A
     return out
 
 
+def normalize_class_labels_map(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        if not name:
+            continue
+        v = str(value or "").strip().lower()
+        if v in {"road", "sign"}:
+            out[name] = v
+    return out
+
+
 def resolve_preprocess_config(
     label_name: str,
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+    class_labels: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     if class_preprocess:
         item = class_preprocess.get(str(label_name or ""))
@@ -510,7 +557,7 @@ def resolve_preprocess_config(
                 }
     mode = normalize_preprocess_mode(preprocess_mode)
     if mode == PREPROCESS_MODE_AUTO_BY_LABEL:
-        return {"mode": PREPROCESS_MODE_JUNCTION if class_clip_mode(label_name) == CLIP_MODE_JUNCTION else PREPROCESS_MODE_SIGN, "manual_roi": None}
+        return {"mode": PREPROCESS_MODE_JUNCTION if class_clip_mode(label_name, class_labels=class_labels) == CLIP_MODE_JUNCTION else PREPROCESS_MODE_SIGN, "manual_roi": None}
     return {"mode": mode, "manual_roi": normalize_manual_roi(manual_roi)}
 
 
@@ -565,12 +612,14 @@ def preprocess_for_label(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+    class_labels: Optional[Dict[str, str]] = None,
 ) -> np.ndarray:
     resolved = resolve_preprocess_config(
         label_name=label_name,
         preprocess_mode=preprocess_mode,
         manual_roi=manual_roi,
         class_preprocess=class_preprocess,
+        class_labels=class_labels,
     )
     mode = str(resolved.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
     resolved_roi = resolved.get("manual_roi")
@@ -593,6 +642,7 @@ def prepare_inference_inputs(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+    class_labels: Optional[Dict[str, str]] = None,
 ) -> Dict[str, np.ndarray]:
     mode = normalize_preprocess_mode(preprocess_mode)
     if mode == PREPROCESS_MODE_NONE:
