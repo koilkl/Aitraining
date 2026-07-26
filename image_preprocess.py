@@ -29,7 +29,8 @@ _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
 _NEAR_BLACK_THRESH = 45  # max(R,G,B) below this → converted to pure white before auto-crop
 _NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
-_BG_LUM_THRESH = 180  # max(R,G,B) above this → bright background → set to white
+_BG_LUM_THRESH = 150  # max(R,G,B) above this → bright background → white
+_BG_DIFF_MIN = 5     # B-G diff below this → no blue tint → white (even if dark)
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
 _EDGE_MIN = 18
@@ -664,13 +665,13 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     diff = b.astype(np.int16) - g.astype(np.int16)
     gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
 
-    # Mark bright pixels as pure white background.
-    # The sign is dark (low RGB) with a blue tint (B > G after WB).
-    # Background is bright (high RGB) — road markings, sky, bright surfaces.
-    # Use max channel luminance to separate: bright → white, dark → keep.
+    # Only keep pixels that are BOTH dark AND blue-tinted (the sign).
+    # - Dark:    max(R,G,B) below threshold (sign is dark object)
+    # - Blue:    B > G by at least a small margin (blue/purple tint)
+    # Everything else (bright, gray, green, black) → white background.
     max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
-    background_mask = max_rgb > _BG_LUM_THRESH
-    gray[background_mask] = 255
+    is_sign = (max_rgb < _BG_LUM_THRESH) & (diff > _BG_DIFF_MIN)
+    gray[~is_sign] = 255
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
     if roi is not None:
