@@ -28,6 +28,7 @@ _MIN_FOCUS_PIXELS = 18
 _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
 _NEAR_BLACK_THRESH = 30  # R/G/B below this → converted to pure white before auto-crop
+_NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
 _EDGE_MIN = 18
@@ -565,17 +566,19 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     if h < 8 or w < 8:
         return None
 
-    # Step 1 — Convert near-black pixels to pure white first.
-    # Dark / shadow areas can confuse the auto-crop detector (sensor noise
-    # gives them a slight colour cast).  Replacing them with pure white
-    # makes the sign the only non-background region in the frame.
+    # Step 1 — Convert near-black and near-white pixels to pure white first.
+    # Dark / shadow areas and bright-white background can both confuse the
+    # auto-crop detector.  Replacing both with pure white makes the sign
+    # the only non-background region in the frame.
     r_raw = rgb[:, :, 0].astype(np.int16)
     g_raw = rgb[:, :, 1].astype(np.int16)
     b_raw = rgb[:, :, 2].astype(np.int16)
     near_black = (r_raw < _NEAR_BLACK_THRESH) & (g_raw < _NEAR_BLACK_THRESH) & (b_raw < _NEAR_BLACK_THRESH)
+    near_white = (r_raw > _NEAR_WHITE_THRESH) & (g_raw > _NEAR_WHITE_THRESH) & (b_raw > _NEAR_WHITE_THRESH)
+    background = near_black | near_white
 
     clean_rgb = rgb.copy()
-    clean_rgb[near_black] = [255, 255, 255]
+    clean_rgb[background] = [255, 255, 255]
 
     # Step 2 — B-G difference on the cleaned image.
     # White pixels → B-G = 0 (neutral).  Blue/purple sign → B > G → bright.
@@ -659,6 +662,15 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # B-G from corrected values
     diff = b.astype(np.int16) - g.astype(np.int16)
     gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
+
+    # Force near-white and near-black input pixels to pure white in the output.
+    # Without this, white input (B-G=0 → gray=127) gets pushed toward black by
+    # the contrast stretch because it sits at the bottom of the B-G range
+    # relative to the blue/purple sign.  Black input has the same problem.
+    near_white_mask = (r.astype(np.int16) > _NEAR_WHITE_THRESH) & (g.astype(np.int16) > _NEAR_WHITE_THRESH) & (b.astype(np.int16) > _NEAR_WHITE_THRESH)
+    near_black_mask = (r.astype(np.int16) < _NEAR_BLACK_THRESH) & (g.astype(np.int16) < _NEAR_BLACK_THRESH) & (b.astype(np.int16) < _NEAR_BLACK_THRESH)
+    gray[near_white_mask] = 255
+    gray[near_black_mask] = 255
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
     if roi is not None:
