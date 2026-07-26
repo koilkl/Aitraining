@@ -27,7 +27,7 @@ _FALLBACK_CENTER_Y_FRAC = 0.42
 _MIN_FOCUS_PIXELS = 18
 _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
-_NEAR_BLACK_THRESH = 30  # R/G/B below this → converted to pure white before auto-crop
+_NEAR_BLACK_THRESH = 45  # max(R,G,B) below this → converted to pure white (background)
 _NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
@@ -573,7 +573,7 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     r_raw = rgb[:, :, 0].astype(np.int16)
     g_raw = rgb[:, :, 1].astype(np.int16)
     b_raw = rgb[:, :, 2].astype(np.int16)
-    near_black = (r_raw < _NEAR_BLACK_THRESH) & (g_raw < _NEAR_BLACK_THRESH) & (b_raw < _NEAR_BLACK_THRESH)
+    near_black = np.maximum(np.maximum(r_raw, g_raw), b_raw) < _NEAR_BLACK_THRESH
     near_white = (r_raw > _NEAR_WHITE_THRESH) & (g_raw > _NEAR_WHITE_THRESH) & (b_raw > _NEAR_WHITE_THRESH)
     background = near_black | near_white
 
@@ -668,7 +668,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # the contrast stretch because it sits at the bottom of the B-G range
     # relative to the blue/purple sign.  Black input has the same problem.
     near_white_mask = (r.astype(np.int16) > _NEAR_WHITE_THRESH) & (g.astype(np.int16) > _NEAR_WHITE_THRESH) & (b.astype(np.int16) > _NEAR_WHITE_THRESH)
-    near_black_mask = (r.astype(np.int16) < _NEAR_BLACK_THRESH) & (g.astype(np.int16) < _NEAR_BLACK_THRESH) & (b.astype(np.int16) < _NEAR_BLACK_THRESH)
+    near_black_mask = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16)) < _NEAR_BLACK_THRESH
     gray[near_white_mask] = 255
     gray[near_black_mask] = 255
 
