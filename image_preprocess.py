@@ -29,6 +29,7 @@ _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
 _NEAR_BLACK_THRESH = 45  # max(R,G,B) below this → converted to pure white (background)
 _NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
+_BG_DIFF_SIGN_THRESH = 25  # B-G diff below this → background (set to white); above → sign
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
 _EDGE_MIN = 18
@@ -663,14 +664,12 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     diff = b.astype(np.int16) - g.astype(np.int16)
     gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
 
-    # Force near-white and near-black input pixels to pure white in the output.
-    # Without this, white input (B-G=0 → gray=127) gets pushed toward black by
-    # the contrast stretch because it sits at the bottom of the B-G range
-    # relative to the blue/purple sign.  Black input has the same problem.
-    near_white_mask = (r.astype(np.int16) > _NEAR_WHITE_THRESH) & (g.astype(np.int16) > _NEAR_WHITE_THRESH) & (b.astype(np.int16) > _NEAR_WHITE_THRESH)
-    near_black_mask = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16)) < _NEAR_BLACK_THRESH
-    gray[near_white_mask] = 255
-    gray[near_black_mask] = 255
+    # Mark everything except the blue/purple sign as pure white background.
+    # Only pixels with B significantly greater than G (B-G > threshold) are
+    # kept as the sign; everything else (road, sky, shadows, foliage, etc.)
+    # becomes white.  This makes the sign the only non-background feature.
+    background_mask = diff <= _BG_DIFF_SIGN_THRESH
+    gray[background_mask] = 255
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
     if roi is not None:
