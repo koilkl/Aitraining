@@ -8,12 +8,14 @@ from PIL import Image, ImageOps
 
 CLIP_MODE_SIGN = 0
 CLIP_MODE_JUNCTION = 1
+CLIP_MODE_BLUE_DIFF = 2  # B-G channel extraction for blue/purple signs
 
 PREPROCESS_MODE_AUTO_BY_LABEL = "auto_by_label"
 PREPROCESS_MODE_MANUAL_ROI = "manual_roi"
 PREPROCESS_MODE_NONE = "none"
 PREPROCESS_MODE_SIGN = "sign"
 PREPROCESS_MODE_JUNCTION = "junction"
+PREPROCESS_MODE_BLUE_DIFF = "blue_diff"  # B-G extraction for blue/purple signs
 
 _SEARCH_LEFT_FRAC = 0.04
 _SEARCH_RIGHT_FRAC = 0.50
@@ -25,6 +27,8 @@ _FALLBACK_CENTER_Y_FRAC = 0.42
 _MIN_FOCUS_PIXELS = 18
 _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
+_NEAR_BLACK_THRESH = 30  # R/G/B below this → converted to pure white before auto-crop
+_NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
 _EDGE_MIN = 18
@@ -443,9 +447,6 @@ def normalize_preprocess_mode(mode: Any) -> str:
     if value in {
         PREPROCESS_MODE_AUTO_BY_LABEL,
         PREPROCESS_MODE_MANUAL_ROI,
-        PREPROCESS_MODE_NONE,
-        PREPROCESS_MODE_SIGN,
-        PREPROCESS_MODE_JUNCTION,
     }:
         return value
     return PREPROCESS_MODE_AUTO_BY_LABEL
@@ -503,14 +504,14 @@ def resolve_preprocess_config(
         if isinstance(item, dict):
             normalized = normalize_class_preprocess(item)
             item_mode = str(normalized.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
-            if item_mode in {PREPROCESS_MODE_SIGN, PREPROCESS_MODE_JUNCTION, PREPROCESS_MODE_MANUAL_ROI, PREPROCESS_MODE_NONE}:
+            if item_mode == PREPROCESS_MODE_MANUAL_ROI:
                 return {
                     "mode": item_mode,
                     "manual_roi": normalize_manual_roi(normalized.get("manual_roi")),
                 }
     mode = normalize_preprocess_mode(preprocess_mode)
     if mode == PREPROCESS_MODE_AUTO_BY_LABEL:
-        return {"mode": PREPROCESS_MODE_JUNCTION if class_clip_mode(label_name) == CLIP_MODE_JUNCTION else PREPROCESS_MODE_SIGN, "manual_roi": None}
+        return {"mode": PREPROCESS_MODE_AUTO_BY_LABEL, "manual_roi": None}
     return {"mode": mode, "manual_roi": normalize_manual_roi(manual_roi)}
 
 
@@ -543,6 +544,157 @@ def preprocess_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscal
     return _render_crop(crop, out_size=out_size, color_mode=color_mode, preserve_aspect=preserve_aspect)
 
 
+def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """Find the largest blue/purple region in an RGB image and return its bbox.
+
+    Pipeline:
+    1. Convert near-black (all channels < 30) and near-white (all > 200)
+       pixels to pure white so dark/bright background don't confuse detection.
+    2. Compute B-G difference on the cleaned image (white → 0, blue sign → +).
+    3. Gaussian blur → contrast stretch → binary mask (>80).
+    4. Morphological clean-up (erode 1×, dilate 2×).
+    5. Find largest contour → square crop box with 20 % padding.
+
+    Returns None when no blue/purple region is found.
+    """
+    try:
+        import cv2
+    except Exception:
+        return None  # OpenCV not available → fall back to full frame
+
+    h, w = rgb.shape[:2]
+    if h < 8 or w < 8:
+        return None
+
+    # Step 1 — Convert near-black and near-white pixels to pure white first.
+    # Dark / shadow areas and bright-white background can both confuse the
+    # auto-crop detector.  Replacing both with pure white makes the sign
+    # the only non-background region in the frame.
+    r_raw = rgb[:, :, 0].astype(np.int16)
+    g_raw = rgb[:, :, 1].astype(np.int16)
+    b_raw = rgb[:, :, 2].astype(np.int16)
+    near_black = (r_raw < _NEAR_BLACK_THRESH) & (g_raw < _NEAR_BLACK_THRESH) & (b_raw < _NEAR_BLACK_THRESH)
+    near_white = (r_raw > _NEAR_WHITE_THRESH) & (g_raw > _NEAR_WHITE_THRESH) & (b_raw > _NEAR_WHITE_THRESH)
+    background = near_black | near_white
+
+    clean_rgb = rgb.copy()
+    clean_rgb[background] = [255, 255, 255]
+
+    # Step 2 — B-G difference on the cleaned image.
+    # White pixels → B-G = 0 (neutral).  Blue/purple sign → B > G → bright.
+    r = clean_rgb[:, :, 0].astype(np.int16)
+    g = clean_rgb[:, :, 1].astype(np.int16)
+    b = clean_rgb[:, :, 2].astype(np.int16)
+    bg_gray = (b - g).astype(np.float32)
+    bg_blur = cv2.GaussianBlur(bg_gray, (5, 5), 0)
+
+    bg_min = float(bg_blur.min())
+    bg_max = float(bg_blur.max())
+    bg_span = bg_max - bg_min
+    if bg_span < 20:                            # no meaningful contrast
+        return None
+
+    stretched = ((bg_blur - bg_min) / bg_span * 255).astype(np.uint8)
+    mask = (stretched > 80).astype(np.uint8) * 255   # bright = sign, lower = sensitive
+
+    if mask.sum() < 16:
+        return None
+
+    # Morphological clean-up
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+
+    # Find contours → largest blob
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(largest))
+    if area < 16.0:                                  # too small
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(largest)
+
+    # Expand to square with 20 % padding
+    side = max(bw, bh)
+    pad = max(1, int(side * 0.20))
+    side += pad * 2
+    cx, cy = x + bw // 2, y + bh // 2
+    half = side // 2
+    x1 = max(0, cx - half)
+    y1 = max(0, cy - half)
+    x2 = min(w, x1 + side)
+    y2 = min(h, y1 + side)
+    if x2 <= x1 + 4 or y2 <= y1 + 4:
+        return None
+    return (int(x1), int(y1), int(x2), int(y2))
+
+
+def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
+                               roi: Optional[Tuple[int, int, int, int]] = None) -> np.ndarray:
+    """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
+
+    Blue/purple signs → high B, low G → B-G is large positive → bright.
+    Green/foliage       → low B,  high G → B-G is negative     → dark.
+    Grey background     → B ≈ G         → B-G ≈ 0             → mid-grey.
+
+    If *roi* is None (auto mode), finds the brightest region via projection
+    and crops to it.  If *roi* is given (manual mode), crops to that bbox.
+
+    Mapping: diff ∈ [-255, 255]  →  gray = (diff + 255) // 2  →  [0, 255].
+
+    IMPORTANT: Any change here MUST be mirrored in TFLite/image_provider.cpp.
+    """
+    src = _to_uint8_image(arr)
+    if src.ndim == 2:
+        src = src[:, :, None]
+    if src.shape[-1] < 3:
+        src = np.repeat(src[:, :, :1], 3, axis=2)
+
+    # White-balance correction — MUST match TFLite/image_provider.cpp
+    r = (src[:, :, 0].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
+    g = src[:, :, 1]
+    b = (src[:, :, 2].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
+    src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
+
+    # B-G from corrected values
+    diff = b.astype(np.int16) - g.astype(np.int16)
+    gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
+
+    # Force near-white and near-black input pixels to pure white in the output.
+    # Without this, white input (B-G=0 → gray=127) gets pushed toward black by
+    # the contrast stretch because it sits at the bottom of the B-G range
+    # relative to the blue/purple sign.  Black input has the same problem.
+    near_white_mask = (r.astype(np.int16) > _NEAR_WHITE_THRESH) & (g.astype(np.int16) > _NEAR_WHITE_THRESH) & (b.astype(np.int16) > _NEAR_WHITE_THRESH)
+    near_black_mask = (r.astype(np.int16) < _NEAR_BLACK_THRESH) & (g.astype(np.int16) < _NEAR_BLACK_THRESH) & (b.astype(np.int16) < _NEAR_BLACK_THRESH)
+    gray[near_white_mask] = 255
+    gray[near_black_mask] = 255
+
+    # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        x1 = max(0, min(gray.shape[1] - 1, x1))
+        y1 = max(0, min(gray.shape[0] - 1, y1))
+        x2 = max(x1 + 1, min(gray.shape[1], x2))
+        y2 = max(y1 + 1, min(gray.shape[0], y2))
+        gray = gray[y1:y2, x1:x2]
+    else:
+        found = _find_bg_roi(src_wb)          # WB-corrected → mask → blob
+        if found is not None:
+            x1, y1, x2, y2 = found
+            gray = gray[y1:y2, x1:x2]
+
+    # Resize
+    img = Image.fromarray(gray, mode="L")
+    img = img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+
+    # Contrast stretch — matches C++ side exactly
+    out = _contrast_stretch_u8(np.asarray(img, dtype=np.uint8))
+    return out.astype(np.float32) / 255.0
+
+
 def preprocess_manual_roi_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale", manual_roi: Any = None) -> np.ndarray:
     src = _to_uint8_image(arr)
     if src.ndim == 2:
@@ -573,17 +725,13 @@ def preprocess_for_label(
         class_preprocess=class_preprocess,
     )
     mode = str(resolved.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
-    resolved_roi = resolved.get("manual_roi")
-    if mode == PREPROCESS_MODE_NONE:
-        src = _to_uint8_image(arr)
-        if src.ndim == 2:
-            src = src[:, :, None]
-        return _render_crop(src, out_size=out_size, color_mode=color_mode, preserve_aspect=True)
+    roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
-        return preprocess_manual_roi_array(arr, out_size=out_size, color_mode=color_mode, manual_roi=resolved_roi)
-    if mode == PREPROCESS_MODE_JUNCTION:
-        return preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_JUNCTION)
-    return preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_SIGN)
+        resolved_roi = resolved.get("manual_roi")
+        src = _to_uint8_image(arr)
+        roi = manual_roi_to_pixels(src.shape[0], src.shape[1], resolved_roi)
+    # Always B-G; mode only controls how the ROI is chosen
+    return preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi)
 
 
 def prepare_inference_inputs(
@@ -595,25 +743,11 @@ def prepare_inference_inputs(
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, np.ndarray]:
     mode = normalize_preprocess_mode(preprocess_mode)
-    if mode == PREPROCESS_MODE_NONE:
-        return {"full": preprocess_for_label(arr, out_size=out_size, color_mode=color_mode, preprocess_mode=PREPROCESS_MODE_NONE)}
+    roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
-        return {
-            PREPROCESS_MODE_MANUAL_ROI: preprocess_manual_roi_array(
-                arr,
-                out_size=out_size,
-                color_mode=color_mode,
-                manual_roi=manual_roi,
-            )
-        }
-    if mode == PREPROCESS_MODE_SIGN:
-        return {"sign": preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_SIGN)}
-    if mode == PREPROCESS_MODE_JUNCTION:
-        return {"junction": preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_JUNCTION)}
-    return {
-        "sign": preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_SIGN),
-        "junction": preprocess_array(arr, out_size=out_size, color_mode=color_mode, clip_mode=CLIP_MODE_JUNCTION),
-    }
+        src = _to_uint8_image(arr)
+        roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
+    return {"default": preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi)}
 
 
 def focus_and_enhance_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale") -> np.ndarray:

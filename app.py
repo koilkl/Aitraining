@@ -2025,10 +2025,11 @@ def _render_tm_old_frontend_html(
       background: transparent;
       color: var(--muted);
       border-radius: 999px;
-      padding: 6px 10px;
-      font-size: 12px;
+      padding: 6px 8px;
+      font-size: 11px;
       font-weight: 700;
       cursor: pointer;
+      white-space: nowrap;
     }}
     .preview-mode-tab.active {{
       background: var(--surface-elevated);
@@ -2556,8 +2557,6 @@ def _render_tm_old_frontend_html(
           <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
           <div class="preview-mode-tabs" id="previewModeTabs">
             <button class="preview-mode-tab" type="button" data-preview-mode="auto_by_label">Auto</button>
-            <button class="preview-mode-tab" type="button" data-preview-mode="sign">Sign</button>
-            <button class="preview-mode-tab" type="button" data-preview-mode="junction">Junction</button>
           </div>
           <div class="preview-controls-right">
             <button class="iconbtn source-settings" type="button" id="previewSettingsToggle" title="Input settings">⚙</button>
@@ -3018,7 +3017,7 @@ function restoreTrainCfgFromStorage() {{
     if ('conv1_filters' in data) next.conv1_filters = clampInt(data.conv1_filters, 1, 256, nullish(prev.conv1_filters, 8));
     if ('conv2_filters' in data) next.conv2_filters = clampInt(data.conv2_filters, 1, 512, nullish(prev.conv2_filters, 16));
     if ('dense_units' in data) next.dense_units = clampInt(data.dense_units, 1, 2048, nullish(prev.dense_units, 32));
-    if (data.preprocess_mode === 'auto_by_label' || data.preprocess_mode === 'manual_roi' || data.preprocess_mode === 'none') {{
+    if (data.preprocess_mode === 'auto_by_label' || data.preprocess_mode === 'manual_roi') {{
       next.preprocess_mode = String(data.preprocess_mode);
     }}
     if (Array.isArray(data.manual_roi) && data.manual_roi.length === 4) {{
@@ -3034,7 +3033,7 @@ function persistTrainCfgStorage() {{
 }}
 function normalizeClassPreprocessConfig(raw) {{
   const src = raw && typeof raw === 'object' ? raw : {{}};
-  const mode = ['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(src.mode || ''))
+  const mode = ['auto_by_label', 'manual_roi'].includes(String(src.mode || ''))
     ? String(src.mode)
     : 'auto_by_label';
   let manual = null;
@@ -3147,10 +3146,7 @@ function selectedClassSampleFilename(className) {{
   return sample ? String(previewFilename(sample) || '') : '';
 }}
 function classPreprocessModeLabel(mode) {{
-  if (mode === 'sign') return 'Sign ROI';
-  if (mode === 'junction') return 'Junction ROI';
   if (mode === 'manual_roi') return 'Manual ROI';
-  if (mode === 'none') return 'Full Frame';
   return 'Auto';
 }}
 function samplePreprocessStatus(className, filename) {{
@@ -3192,6 +3188,35 @@ function restoreClassPreprocessScroll() {{
   const pane = document.getElementById('classPreprocessRightPane');
   if (!pane) return;
   pane.scrollTop = Math.max(0, Number(classPreprocessScrollTop || 0));
+}}
+function getClassPreprocessGridColumnCount() {{
+  const grid = document.querySelector('#classPreprocessModal .class-preprocess-grid');
+  if (!grid) return 1;
+  try {{
+    const cols = String(window.getComputedStyle(grid).gridTemplateColumns || '')
+      .split(' ')
+      .map((part) => String(part || '').trim())
+      .filter(Boolean);
+    return Math.max(1, cols.length || 1);
+  }} catch (e) {{
+    return 1;
+  }}
+}}
+function moveClassPreprocessSample(delta) {{
+  if (!classPreprocessOpen || !classPreprocessClass) return;
+  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[classPreprocessClass]) || []);
+  if (!items.length) return;
+  if (!maybeDiscardClassPreprocessDraft()) return;
+  rememberClassPreprocessScroll();
+  const nextIndex = Math.max(0, Math.min(items.length - 1, Number(classPreprocessSampleIndex || 0) + Number(delta || 0)));
+  if (nextIndex === Number(classPreprocessSampleIndex || 0)) return;
+  classPreprocessSampleIndex = nextIndex;
+  classPreprocessDraft = normalizeClassPreprocessConfig(
+    getSampleEffectivePreprocessConfig(classPreprocessClass, selectedClassSampleFilename(classPreprocessClass))
+  );
+  classPreprocessDirty = false;
+  renderClassPreprocessModal();
+  refreshClassProcessedPreview();
 }}
 async function refreshClassProcessedPreview() {{
   if (!classPreprocessOpen || !classPreprocessClass) return;
@@ -3302,7 +3327,7 @@ function closeClassPreprocessEditor(force = false) {{
     }};
   }}
   function applyClassPreprocessMode(mode) {{
-    const nextMode = ['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(mode || ''))
+    const nextMode = ['auto_by_label', 'manual_roi'].includes(String(mode || ''))
       ? String(mode)
       : 'auto_by_label';
     rememberClassPreprocessScroll();
@@ -3480,11 +3505,8 @@ function renderClassPreprocessModal() {{
           <label>
             Preprocess Mode
             <select id="classPreprocessMode">
-              <option value="auto_by_label"${{cfg.mode === 'auto_by_label' ? ' selected' : ''}}>Auto by Label</option>
-              <option value="sign"${{cfg.mode === 'sign' ? ' selected' : ''}}>Sign</option>
-              <option value="junction"${{cfg.mode === 'junction' ? ' selected' : ''}}>Junction</option>
+              <option value="auto_by_label"${{cfg.mode === 'auto_by_label' ? ' selected' : ''}}>Auto (find sign)</option>
               <option value="manual_roi"${{cfg.mode === 'manual_roi' ? ' selected' : ''}}>Manual ROI</option>
-              <option value="none"${{cfg.mode === 'none' ? ' selected' : ''}}>Full Frame</option>
             </select>
           </label>
           <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
@@ -3579,10 +3601,7 @@ function renderClassPreprocessModal() {{
     const key = String(e.key || '').toUpperCase();
     const modeMap = {{
       F1: 'auto_by_label',
-      F2: 'sign',
-      F3: 'junction',
-      F4: 'manual_roi',
-      F5: 'none',
+      F2: 'manual_roi',
     }};
     const nextMode = modeMap[key];
     if (nextMode) {{
@@ -3610,25 +3629,35 @@ function renderClassPreprocessModal() {{
       }}
       return;
     }}
-    const step = e.shiftKey ? 0.05 : 0.01;
-    if (key === 'ARROWLEFT') {{
+    // ← → = navigate sequential   |   ↑ ↓ = navigate by row   |   Shift+arrows = nudge ROI
+    if (key === 'ARROWLEFT' || key === 'ARROWRIGHT' || key === 'ARROWUP' || key === 'ARROWDOWN') {{
       e.preventDefault();
-      nudgeClassPreprocessRoi(-step, 0);
-      return;
-    }}
-    if (key === 'ARROWRIGHT') {{
-      e.preventDefault();
-      nudgeClassPreprocessRoi(step, 0);
-      return;
-    }}
-    if (key === 'ARROWUP') {{
-      e.preventDefault();
-      nudgeClassPreprocessRoi(0, -step);
-      return;
-    }}
-    if (key === 'ARROWDOWN') {{
-      e.preventDefault();
-      nudgeClassPreprocessRoi(0, step);
+      // Shift held → nudge ROI (manual mode only)
+      if (e.shiftKey && classPreprocessDraft && String(classPreprocessDraft.mode || '') === 'manual_roi') {{
+        const step = 0.05;
+        if (key === 'ARROWLEFT')  nudgeClassPreprocessRoi(-step, 0);
+        if (key === 'ARROWRIGHT') nudgeClassPreprocessRoi( step, 0);
+        if (key === 'ARROWUP')    nudgeClassPreprocessRoi(0, -step);
+        if (key === 'ARROWDOWN')  nudgeClassPreprocessRoi(0,  step);
+        return;
+      }}
+      // No Shift → navigate samples: ← → = prev/next, ↑ ↓ = previous/next row
+      if (key === 'ARROWLEFT' || key === 'LEFT') {{
+        moveClassPreprocessSample(-1);
+        return;
+      }}
+      if (key === 'ARROWRIGHT' || key === 'RIGHT') {{
+        moveClassPreprocessSample(1);
+        return;
+      }}
+      if (key === 'ARROWUP' || key === 'UP') {{
+        moveClassPreprocessSample(-getClassPreprocessGridColumnCount());
+        return;
+      }}
+      if (key === 'ARROWDOWN' || key === 'DOWN') {{
+        moveClassPreprocessSample(getClassPreprocessGridColumnCount());
+        return;
+      }}
     }}
   }});
 restoreTrainCfgFromStorage();
