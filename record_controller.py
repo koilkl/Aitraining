@@ -1506,12 +1506,13 @@ class RecordController:
         return _preview_item_payload(path)
 
     def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None) -> bytes:
+        class_cfg = class_config if isinstance(class_config, dict) else {}
         src_cfg = sample_config if isinstance(sample_config, dict) else {}
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
         mode = str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
-        # User-adjustable thresholds (with defaults matching image_preprocess.py constants)
-        bg_lum_thresh = int(src_cfg.get("bg_lum_thresh", _BG_LUM_THRESH))
-        bg_diff_min   = int(src_cfg.get("bg_diff_min",   _BG_DIFF_MIN))
+        # User-adjustable thresholds from class-level config (shared across samples)
+        bg_lum_thresh = int(class_cfg.get("bg_lum_thresh", _BG_LUM_THRESH)) if class_cfg else _BG_LUM_THRESH
+        bg_diff_min   = int(class_cfg.get("bg_diff_min",   _BG_DIFF_MIN))   if class_cfg else _BG_DIFF_MIN
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None

@@ -3454,6 +3454,11 @@ function renderClassPreprocessModal() {{
   }}
   const sample = selectedClassSample(classPreprocessClass);
   const sampleFilename = sample ? String(previewFilename(sample) || '') : '';
+  const classThresh = getClassPreprocessConfig(classPreprocessClass);
+  const classPreprocessThresholds = {{
+    bg_lum_thresh: classThresh.bg_lum_thresh != null ? classThresh.bg_lum_thresh : 150,
+    bg_diff_min:   classThresh.bg_diff_min   != null ? classThresh.bg_diff_min   : 5,
+  }};
   const cfg = normalizeClassPreprocessConfig(
     classPreprocessDraft || getSampleEffectivePreprocessConfig(classPreprocessClass, sampleFilename)
   );
@@ -3516,8 +3521,8 @@ function renderClassPreprocessModal() {{
           <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
         </div>
         <div class="class-preprocess-fields">
-          <label title="Max brightness to consider as sign (50-255). Lower = stricter sign detection.">Lum Thresh <span style="color:var(--muted)">${{cfg.bg_lum_thresh || 150}}</span><input id="classPreprocessLum" type="range" min="50" max="255" value="${{cfg.bg_lum_thresh || 150}}" step="1"/></label>
-          <label title="Minimum B-G difference for sign (0-100). Higher = only stronger blue pixels count as sign.">B-G Min <span style="color:var(--muted)">${{cfg.bg_diff_min || 5}}</span><input id="classPreprocessDiffMin" type="range" min="0" max="100" value="${{cfg.bg_diff_min || 5}}" step="1"/></label>
+          <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" step="1"/></label>
+          <label title="Minimum B-G difference for sign (0-100). Higher = stricter.">B-G Min <input id="classPreprocessDiffMinNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_diff_min || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_diff_min || 5}}" step="1"/></label>
         </div>
         <div class="class-preprocess-fields">
           <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
@@ -3583,18 +3588,51 @@ function renderClassPreprocessModal() {{
   if (modeSel) modeSel.onchange = () => {{
       applyClassPreprocessMode(modeSel.value);
   }};
-  const lumSlider = document.getElementById('classPreprocessLum');
-  const diffSlider = document.getElementById('classPreprocessDiffMin');
-  const onThresholdChange = () => {{
-    if (!classPreprocessDraft) classPreprocessDraft = normalizeClassPreprocessConfig({{}});
-    classPreprocessDraft.bg_lum_thresh = Number(lumSlider.value);
-    classPreprocessDraft.bg_diff_min = Number(diffSlider.value);
-    classPreprocessDirty = true;
+  const lumSlider   = document.getElementById('classPreprocessLum');
+  const diffSlider   = document.getElementById('classPreprocessDiffMin');
+  const lumNum       = document.getElementById('classPreprocessLumNum');
+  const diffNum      = document.getElementById('classPreprocessDiffMinNum');
+  let thresholdTimer = null;
+  const applyThresholds = (lum, diff) => {{
+    const existing = getClassPreprocessConfig(classPreprocessClass);
+    existing.bg_lum_thresh = lum;
+    existing.bg_diff_min   = diff;
+    setClassPreprocessConfig(classPreprocessClass, existing);
     renderClassPreprocessModal();
     refreshClassProcessedPreview();
   }};
-  if (lumSlider) lumSlider.oninput = onThresholdChange;
-  if (diffSlider) diffSlider.oninput = onThresholdChange;
+  const debouncedApply = (lum, diff) => {{
+    if (thresholdTimer) clearTimeout(thresholdTimer);
+    thresholdTimer = setTimeout(() => applyThresholds(lum, diff), 250);
+  }};
+  const syncSliders = (lum, diff) => {{
+    if (lumSlider)  lumSlider.value  = lum;
+    if (diffSlider) diffSlider.value = diff;
+    if (lumNum)     lumNum.value     = lum;
+    if (diffNum)    diffNum.value    = diff;
+  }};
+  if (lumSlider) lumSlider.oninput = () => {{
+    const v = Number(lumSlider.value);
+    if (lumNum) lumNum.value = v;
+    debouncedApply(v, Number(diffSlider ? diffSlider.value : 5));
+  }};
+  if (diffSlider) diffSlider.oninput = () => {{
+    const v = Number(diffSlider.value);
+    if (diffNum) diffNum.value = v;
+    debouncedApply(Number(lumSlider ? lumSlider.value : 150), v);
+  }};
+  if (lumNum) lumNum.onchange = () => {{
+    let v = Number(lumNum.value);
+    if (!isFinite(v) || v < 50) v = 150; else if (v > 255) v = 255;
+    syncSliders(v, Number(diffSlider ? diffSlider.value : 5));
+    applyThresholds(v, Number(diffSlider ? diffSlider.value : 5));
+  }};
+  if (diffNum) diffNum.onchange = () => {{
+    let v = Number(diffNum.value);
+    if (!isFinite(v) || v < 0) v = 5; else if (v > 100) v = 100;
+    syncSliders(Number(lumSlider ? lumSlider.value : 150), v);
+    applyThresholds(Number(lumSlider ? lumSlider.value : 150), v);
+  }};
   host.querySelectorAll('[data-preprocess-sample]').forEach((btn) => {{
     btn.onclick = () => {{
       if (!maybeDiscardClassPreprocessDraft()) return;
