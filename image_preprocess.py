@@ -655,10 +655,31 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     if src.shape[-1] < 3:
         src = np.repeat(src[:, :, :1], 3, axis=2)
 
-    # White-balance correction — MUST match TFLite/image_provider.cpp
-    r = (src[:, :, 0].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
-    g = src[:, :, 1]
-    b = (src[:, :, 2].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
+    # ── Auto White Balance (Gray World) ──
+    # Same algorithm as TFLite/image_provider.cpp.
+    # Assume the average scene colour is grey → compute per-channel gains
+    # to equalise R, G, B means.  Gains are clamped to [0.5, 3.0].
+    r_raw = src[:, :, 0].astype(np.float32)
+    g_raw = src[:, :, 1].astype(np.float32)
+    b_raw = src[:, :, 2].astype(np.float32)
+
+    # Skip near-black pixels (shadows skew the average)
+    valid = ~((r_raw < 10) & (g_raw < 10) & (b_raw < 10))
+    if np.count_nonzero(valid) > 100:
+        avg_r = r_raw[valid].mean()
+        avg_g = g_raw[valid].mean()
+        avg_b = b_raw[valid].mean()
+        if avg_r > 0 and avg_g > 0 and avg_b > 0:
+            gain_r = np.clip(avg_g / avg_r, 0.5, 3.0)
+            gain_b = np.clip(avg_g / avg_b, 0.5, 3.0)
+        else:
+            gain_r = gain_b = 2.0
+    else:
+        gain_r = gain_b = 2.0  # fallback to fixed ×2.0
+
+    r = (r_raw * gain_r).clip(0, 255).astype(np.uint8)
+    g = g_raw.astype(np.uint8)
+    b = (b_raw * gain_b).clip(0, 255).astype(np.uint8)
     src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
 
     # B-G from corrected values
