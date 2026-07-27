@@ -22,18 +22,16 @@ from camera_permission import ensure_camera_access
 from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
 from dataset_io import IMAGE_EXTS, sanitize_class_name
 from image_preprocess import (
-    CLIP_MODE_JUNCTION,
     PREPROCESS_MODE_AUTO_BY_LABEL,
-    PREPROCESS_MODE_JUNCTION,
     PREPROCESS_MODE_MANUAL_ROI,
-    PREPROCESS_MODE_NONE,
-    PREPROCESS_MODE_SIGN,
-    class_clip_mode,
+    _BG_LUM_THRESH,
+    _BG_DIFF_MIN,
     normalize_class_preprocess,
     normalize_class_preprocess_map,
     normalize_sample_preprocess_map,
     normalize_manual_roi,
-    preprocess_for_label,
+    manual_roi_to_pixels,
+    preprocess_blue_diff_array,
     prepare_inference_inputs,
 )
 
@@ -161,9 +159,7 @@ class RecordController:
                 raw = reader.read_frame(timeout_s=2.0)
             finally:
                 reader.close()
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
-            img = Image.fromarray(arr, mode="L")
-            return _to_png_bytes(img)
+            return _raw96_preview_png(raw)
         except Exception:
             return None
 
@@ -1228,6 +1224,7 @@ class RecordController:
             dataset_root,
             class_preprocess=class_preprocess,
             sample_preprocess=sample_preprocess,
+            global_preprocess_mode=str(merged_project_state.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
         )
         if processed_cache_dir.exists():
             manifest["processed_cache_dir"] = "processed_cache"
@@ -1442,7 +1439,7 @@ class RecordController:
                 except Exception:
                     out[key] = float(fallback)
             preprocess_mode = str(src.get("preprocess_mode") or "").strip().lower()
-            if preprocess_mode in {"auto_by_label", "manual_roi", "none", "sign", "junction"}:
+            if preprocess_mode in {"auto_by_label", "manual_roi"}:
                 out["preprocess_mode"] = preprocess_mode
             manual_roi = normalize_manual_roi(src.get("manual_roi"))
             if manual_roi is not None:
@@ -1509,17 +1506,23 @@ class RecordController:
         return _preview_item_payload(path)
 
     def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None) -> bytes:
+        src_cfg = sample_config if isinstance(sample_config, dict) else {}
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
-        img = Image.open(_bytes_io(png)).convert("L")
-        arr = preprocess_for_label(
-            np.asarray(img),
-            out_size=96,
-            color_mode="grayscale",
-            label_name=label_name,
-            preprocess_mode=str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
-            manual_roi=config.get("manual_roi"),
-        )
-        out = np.asarray(np.clip(arr[:, :, 0] * 255.0, 0.0, 255.0), dtype=np.uint8)
+        mode = str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
+        # User-adjustable thresholds (with defaults matching image_preprocess.py constants)
+        bg_lum_thresh = int(src_cfg.get("bg_lum_thresh", _BG_LUM_THRESH))
+        bg_diff_min   = int(src_cfg.get("bg_diff_min",   _BG_DIFF_MIN))
+        # Always B-G; keep RGB colour information.
+        img = Image.open(_bytes_io(png)).convert("RGB")
+        roi = None
+        if mode == PREPROCESS_MODE_MANUAL_ROI:
+            src = np.asarray(img)
+            roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
+        arr = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
+                                         bg_lum_thresh=bg_lum_thresh, bg_diff_min=bg_diff_min)
+        out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
+        if out.ndim == 3:
+            out = out[:, :, 0]
         return _to_png_bytes(Image.fromarray(out, mode="L"))
 
     def _rebuild_processed_cache(
@@ -1527,6 +1530,7 @@ class RecordController:
         dataset_root: Path,
         class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
         sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        global_preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     ) -> None:
         classes = self._classes_load(dataset_root)
         cache_root = self._processed_cache_dir(dataset_root)
@@ -1541,8 +1545,9 @@ class RecordController:
             dst_dir.mkdir(parents=True, exist_ok=True)
             if not src_dir.exists():
                 continue
-            config = class_preprocess.get(class_name, {})
+            config = class_preprocess.get(class_name, {"mode": global_preprocess_mode})
             class_sample_map = sample_preprocess.get(class_name, {})
+            processed_count = 0
             for src in _list_class_image_files(src_dir):
                 try:
                     png = src.read_bytes()
@@ -1553,8 +1558,13 @@ class RecordController:
                         sample_config=class_sample_map.get(src.name),
                     )
                     (dst_dir / f"{src.stem}.png").write_bytes(out_png)
-                except Exception:
-                    continue
+                    processed_count += 1
+                except Exception as e:
+                    import logging
+                    logging.warning(f"preprocess failed for {src.name}: {e}")
+            if processed_count == 0 and len(list(_list_class_image_files(src_dir))) > 0:
+                import logging
+                logging.warning(f"No files processed for class '{class_name}' — check preprocess mode '{config.get('mode')}'")
 
     def _processed_previews_payload(self, dataset_root: Path, classes: List[str]) -> Dict[str, List[Dict[str, str]]]:
         out: Dict[str, List[Dict[str, str]]] = {}
@@ -1709,7 +1719,8 @@ class RecordController:
         if len(shape) != 4:
             raise RuntimeError("unsupported input shape")
         _, h, w, c = shape
-        img = Image.open(_bytes_io(png)).convert("L" if int(c) == 1 else "RGB")
+        # Always RGB — B-G difference is computed inside the pipeline.
+        img = Image.open(_bytes_io(png)).convert("RGB")
         prepared = prepare_inference_inputs(
             np.asarray(img),
             out_size=int(w),
@@ -1761,18 +1772,7 @@ class RecordController:
             return expv / float(np.sum(expv) + 1e-12)
 
         variant_probs = {name: _invoke_one(arr) for name, arr in prepared.items()}
-
-        if preprocess_mode == PREPROCESS_MODE_AUTO_BY_LABEL and "sign" in variant_probs and "junction" in variant_probs and labels:
-            sign_probs = variant_probs["sign"]
-            junction_probs = variant_probs["junction"]
-            probs = np.zeros_like(sign_probs)
-            for idx, label_name in enumerate(labels):
-                probs[idx] = junction_probs[idx] if class_clip_mode(label_name) == CLIP_MODE_JUNCTION else sign_probs[idx]
-            total = float(np.sum(probs))
-            if total > 0.0:
-                probs = probs / total
-        else:
-            probs = next(iter(variant_probs.values()))
+        probs = next(iter(variant_probs.values()))
 
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
@@ -1882,6 +1882,7 @@ class RecordController:
                 sess_cfg.dataset_root,
                 class_preprocess=cfg.class_preprocess,
                 sample_preprocess=cfg.sample_preprocess,
+                global_preprocess_mode=cfg.preprocess_mode,
             )
 
             def on_progress(p: float, msg: str) -> None:
@@ -2373,18 +2374,34 @@ def _open_working_camera(preferred_index: int, max_probe_index: int = 3):
 
 
 def _raw96_to_png(raw: bytes, crop_box: Optional[Tuple[int, int, int, int]]) -> bytes:
-    arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
-    img = Image.fromarray(arr, mode="L")
-    if crop_box is not None:
-        x1, y1, x2, y2 = crop_box
-        img = img.crop((x1, y1, x2, y2))
-    img = img.resize((96, 96))
+    n = len(raw)
+    if n == 96 * 96 * 3:
+        # RGB frame from IMX219_RGB_Serial example
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96, 3))
+        img = Image.fromarray(arr, mode="RGB")
+        if crop_box is not None:
+            x1, y1, x2, y2 = crop_box
+            img = img.crop((x1, y1, x2, y2))
+        img = img.resize((96, 96))
+    else:
+        # Grayscale / B-G frame (legacy)
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
+        img = Image.fromarray(arr, mode="L")
+        if crop_box is not None:
+            x1, y1, x2, y2 = crop_box
+            img = img.crop((x1, y1, x2, y2))
+        img = img.resize((96, 96))
     return _to_png_bytes(img)
 
 
 def _raw96_preview_png(raw: bytes) -> bytes:
-    arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
-    img = Image.fromarray(arr, mode="L").resize((288, 288), Image.NEAREST)
+    n = len(raw)
+    if n == 96 * 96 * 3:
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96, 3))
+        img = Image.fromarray(arr, mode="RGB").resize((288, 288), Image.NEAREST)
+    else:
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
+        img = Image.fromarray(arr, mode="L").resize((288, 288), Image.NEAREST)
     return _to_png_bytes(img)
 
 

@@ -461,6 +461,11 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     manual_roi = normalize_manual_roi(src.get("manual_roi"))
     if manual_roi is not None:
         out["manual_roi"] = list(manual_roi)
+    # Preserve user-adjustable thresholds (clamped to valid range)
+    bg_lum = int(src.get("bg_lum_thresh", _BG_LUM_THRESH))
+    bg_diff = int(src.get("bg_diff_min", _BG_DIFF_MIN))
+    out["bg_lum_thresh"] = max(50, min(255, bg_lum))
+    out["bg_diff_min"] = max(0, min(100, bg_diff))
     return out
 
 
@@ -635,7 +640,9 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
-                               roi: Optional[Tuple[int, int, int, int]] = None) -> np.ndarray:
+                               roi: Optional[Tuple[int, int, int, int]] = None,
+                               bg_lum_thresh: int = 150,
+                               bg_diff_min: int = 5) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
 
     Blue/purple signs → high B, low G → B-G is large positive → bright.
@@ -691,7 +698,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # - Blue:    B > G by at least a small margin (blue/purple tint)
     # Everything else (bright, gray, green, black) → white background.
     max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
-    is_sign = (max_rgb < _BG_LUM_THRESH) & (diff > _BG_DIFF_MIN)
+    is_sign = (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
     gray[~is_sign] = 255
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale

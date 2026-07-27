@@ -3048,7 +3048,11 @@ function normalizeClassPreprocessConfig(raw) {{
     manual[0] = Math.min(manual[0], manual[2] - 0.01);
     manual[1] = Math.min(manual[1], manual[3] - 0.01);
   }}
-  return {{ mode, manual_roi: manual }};
+  let bg_lum = Number(src.bg_lum_thresh);
+  if (!isFinite(bg_lum) || bg_lum < 50) bg_lum = 150; else if (bg_lum > 255) bg_lum = 255;
+  let bg_diff = Number(src.bg_diff_min);
+  if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 100) bg_diff = 100;
+  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_min: bg_diff }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3512,6 +3516,10 @@ function renderClassPreprocessModal() {{
           <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
         </div>
         <div class="class-preprocess-fields">
+          <label title="Max brightness to consider as sign (50-255). Lower = stricter sign detection.">Lum Thresh <span style="color:var(--muted)">${{cfg.bg_lum_thresh || 150}}</span><input id="classPreprocessLum" type="range" min="50" max="255" value="${{cfg.bg_lum_thresh || 150}}" step="1"/></label>
+          <label title="Minimum B-G difference for sign (0-100). Higher = only stronger blue pixels count as sign.">B-G Min <span style="color:var(--muted)">${{cfg.bg_diff_min || 5}}</span><input id="classPreprocessDiffMin" type="range" min="0" max="100" value="${{cfg.bg_diff_min || 5}}" step="1"/></label>
+        </div>
+        <div class="class-preprocess-fields">
           <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
           <label>ROI Y1<input id="classPreprocessY1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[1].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
           <label>ROI X2<input id="classPreprocessX2" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[2].toFixed(2) : '1.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
@@ -3575,6 +3583,18 @@ function renderClassPreprocessModal() {{
   if (modeSel) modeSel.onchange = () => {{
       applyClassPreprocessMode(modeSel.value);
   }};
+  const lumSlider = document.getElementById('classPreprocessLum');
+  const diffSlider = document.getElementById('classPreprocessDiffMin');
+  const onThresholdChange = () => {{
+    if (!classPreprocessDraft) classPreprocessDraft = normalizeClassPreprocessConfig({{}});
+    classPreprocessDraft.bg_lum_thresh = Number(lumSlider.value);
+    classPreprocessDraft.bg_diff_min = Number(diffSlider.value);
+    classPreprocessDirty = true;
+    renderClassPreprocessModal();
+    refreshClassProcessedPreview();
+  }};
+  if (lumSlider) lumSlider.oninput = onThresholdChange;
+  if (diffSlider) diffSlider.oninput = onThresholdChange;
   host.querySelectorAll('[data-preprocess-sample]').forEach((btn) => {{
     btn.onclick = () => {{
       if (!maybeDiscardClassPreprocessDraft()) return;
