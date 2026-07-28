@@ -30,7 +30,7 @@ _MIN_SIDE_FRAC = 0.50
 _DARK_OFFSET = 10
 _NEAR_BLACK_THRESH = 45  # max(R,G,B) below this → converted to pure white before auto-crop
 _NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
-_BG_LUM_THRESH = 150  # max(R,G,B) above this → bright background → white
+_BG_LUM_THRESH = 100  # max(R,G,B) above this → bright background → white
 _BG_DIFF_MIN = 15    # |B-G| magnitude below this → low saturation → white
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
@@ -475,9 +475,9 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     if manual_roi is not None:
         out["manual_roi"] = list(manual_roi)
     # Preserve user-adjustable thresholds (clamped to valid range)
-    bg_lum = int(src.get("bg_lum_thresh", _BG_LUM_THRESH))
+    bg_lum = int(src.get("bg_lum_thresh", 100))
     bg_diff = int(src.get("bg_diff_abs", _BG_DIFF_MIN))  # magnitude mode
-    bg_dark = int(src.get("bg_dark_thresh", 20))
+    bg_dark = int(src.get("bg_dark_thresh", 0))
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
     out["bg_diff_abs"] = max(0, min(255, bg_diff))  # |B-G| magnitude
     out["bg_dark_thresh"] = max(0, min(100, bg_dark))
@@ -659,21 +659,13 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
-                               bg_lum_thresh: int = 150,
-                               bg_diff_abs: int = 15,
-                               bg_dark_thresh: int = 20) -> np.ndarray:
-    """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
+                               bg_dark_thresh: int = 0,
+                               bg_lum_thresh: int = 100) -> np.ndarray:
+    """Simplified pipeline for all-black signs on white background.
 
-    Blue/purple signs → high B, low G → B-G is large positive → bright.
-    Green/foliage       → low B,  high G → B-G is negative     → dark.
-    Grey background     → B ≈ G         → B-G ≈ 0             → mid-grey.
-
-    If *roi* is None (auto mode), finds the brightest region via projection
-    and crops to it.  If *roi* is given (manual mode), crops to that bbox.
-
-    Mapping: diff = B-G  →  gray = |diff|  →  [0, 255]  (absolute magnitude).
-
-    IMPORTANT: Any change here MUST be mirrored in TFLite/image_provider.cpp.
+    Uses raw G channel (best SNR in green-biased lighting).
+    Sign = dark pixels (G between dark_thresh and lum_thresh).
+    No colour processing needed — black is black in any light.
     """
     src = _to_uint8_image(arr)
     if src.ndim == 2:
@@ -681,67 +673,21 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     if src.shape[-1] < 3:
         src = np.repeat(src[:, :, :1], 3, axis=2)
 
-    # ── Dynamic Auto White Balance (Gray World) ──
-    # Compute per-image WB gains so every frame is colour-balanced
-    # regardless of lighting.  Gains clamped to [0.5, 4.0].
-    # Same algorithm used on MCU (image_provider.cpp) for consistency.
-    r_raw = src[:, :, 0].astype(np.float32)
-    g_raw = src[:, :, 1].astype(np.float32)
-    b_raw = src[:, :, 2].astype(np.float32)
+    # Use raw G channel as luminance — best SNR in green lighting.
+    # Black sign absorbs all light → low G.  White paper reflects → high G.
+    gray = src[:, :, 1].astype(np.uint8)
 
-    valid = ~((r_raw < 10) & (g_raw < 10) & (b_raw < 10))  # skip pure black
-    if np.count_nonzero(valid) > 100:
-        mr, mg, mb = r_raw[valid].mean(), g_raw[valid].mean(), b_raw[valid].mean()
-        if mr > 0 and mg > 0 and mb > 0:
-            dyn_wb_r = float(np.clip(mg / mr, 0.5, 4.0))
-            dyn_wb_b = float(np.clip(mg / mb, 0.5, 4.0))
-        else:
-            dyn_wb_r = dyn_wb_b = 2.0
-    else:
-        dyn_wb_r = dyn_wb_b = 2.0
-
-    r = (r_raw * dyn_wb_r).clip(0, 255).astype(np.uint8)
-    g = g_raw.astype(np.uint8)
-    b = (b_raw * dyn_wb_b).clip(0, 255).astype(np.uint8)
-    src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
-
-    # B-G absolute magnitude (color saturation).
-    # Purple sign → |B-G| large regardless of green/blue sensor bias.
-    # Neutral background (white/gray/road) → |B-G| ≈ 0.
-    diff = b.astype(np.int16) - g.astype(np.int16)   # signed, [-255, 255]
-    diff_abs = np.abs(diff).astype(np.uint8)           # magnitude, [0, 255]
-    gray = diff_abs
-
-    # Mark non-sign pixels as white background.
-    # Sign = dark (max channel below threshold) AND blue-tinted (B > G + margin).
-    # With stronger WB (×3.0), the sign's B-G separation is much larger, so the
-    # default thresholds should work without tuning.
-    max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
-    import os as _os
-    _enable_mask = _os.environ.get('TM_SKIP_MASK', '0') != '1'
-    if _enable_mask:
-        # Sign = not-too-dark AND not-too-bright AND blue-tinted
-        is_sign = (max_rgb > bg_dark_thresh) & (max_rgb < bg_lum_thresh) & (diff_abs > bg_diff_abs)
-    else:
-        is_sign = diff_abs > bg_diff_abs
+    # Simple dark/lum mask: keep only mid-brightness pixels (the sign).
+    # Too dark (below dark_thresh) → shadow/noise → white.
+    # Too bright (above lum_thresh) → paper/background → white.
+    is_sign = (gray > bg_dark_thresh) & (gray < bg_lum_thresh)
     sign_pct = is_sign.mean() * 100
-    bg_pct = (max_rgb < bg_dark_thresh).mean() * 100
-    bright_pct = (max_rgb > bg_lum_thresh).mean() * 100
-    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & |B-G|>{bg_diff_abs})  dyn_wb={dyn_wb_r:.2f}xR {dyn_wb_b:.2f}xB")
-    # DEBUG: save pre-mask gray to /tmp for inspection
-    from PIL import Image as PILImage
-    PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_pre_mask.png')
+    too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
+    too_bright_pct = (gray >= bg_lum_thresh).mean() * 100
+    print(f"[MASK] sign={sign_pct:.1f}% dark={too_dark_pct:.1f}% bright={too_bright_pct:.1f}%  (G>{bg_dark_thresh} & G<{bg_lum_thresh})")
     gray[~is_sign] = 255
-    PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_post_mask.png')
-    with open('/tmp/debug_bg_params.txt', 'w') as f:
-        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_abs(magnitude)={bg_diff_abs}\ndyn_wb_r={dyn_wb_r:.2f}\ndyn_wb_b={dyn_wb_b:.2f}\nsign_pct={sign_pct:.1f}%\n")
-        f.write(f"r range=[{r.min()},{r.max()}] avg={r.mean():.0f}\n")
-        f.write(f"g range=[{g.min()},{g.max()}] avg={g.mean():.0f}\n")
-        f.write(f"b range=[{b.min()},{b.max()}] avg={b.mean():.0f}\n")
-        f.write(f"diff range=[{diff.min()},{diff.max()}] avg={diff.mean():.0f}\n")
-        f.write(f"max_rgb range=[{max_rgb.min()},{max_rgb.max()}] avg={max_rgb.mean():.0f}\n")
 
-    # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
+    # Crop: shadow search finds dark sign against white background
     if roi is not None:
         x1, y1, x2, y2 = roi
         x1 = max(0, min(gray.shape[1] - 1, x1))
@@ -750,12 +696,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y2 = max(y1 + 1, min(gray.shape[0], y2))
         gray = gray[y1:y2, x1:x2]
     else:
-        # Shadow-based search on the MASKED image (after user's threshold adjustments).
-        # Sign pixels keep their |B-G| magnitude; background pixels are 255.
-        # The sign is the only dark object → _focus_bbox finds it reliably.
-        # Use G channel for shadow search — best SNR in green-biased lighting.
-        # Dark sign absorbs green → low G.  White background reflects → high G.
-        x1, y1, x2, y2 = _focus_bbox(g.astype(np.uint8))
+        # _focus_bbox: dark-object + edge detection in center search window
+        x1, y1, x2, y2 = _focus_bbox(gray)
         gray = gray[y1:y2, x1:x2]
 
     # Resize
@@ -765,9 +707,6 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Contrast stretch — matches C++ side exactly
     out_arr = np.asarray(img, dtype=np.uint8)
     out = _contrast_stretch_u8(out_arr)
-    # DEBUG: save final output
-    from PIL import Image as PILImage
-    PILImage.fromarray(out, mode='L').save('/tmp/debug_bg_final.png')
     result = out.astype(np.float32) / 255.0
     return np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
 

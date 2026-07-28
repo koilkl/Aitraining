@@ -3049,12 +3049,10 @@ function normalizeClassPreprocessConfig(raw) {{
     manual[1] = Math.min(manual[1], manual[3] - 0.01);
   }}
   let bg_lum = Number(src.bg_lum_thresh);
-  if (!isFinite(bg_lum) || bg_lum < 50) bg_lum = 150; else if (bg_lum > 255) bg_lum = 255;
-  let bg_diff = Number(src.bg_diff_abs);
-  if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 255) bg_diff = 255;
+  if (!isFinite(bg_lum) || bg_lum < 50) bg_lum = 100; else if (bg_lum > 255) bg_lum = 255;
   let bg_dark = Number(src.bg_dark_thresh);
-  if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 20; else if (bg_dark > 100) bg_dark = 100;
-  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark }};
+  if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 0; else if (bg_dark > 100) bg_dark = 100;
+  return {{ mode, manual_roi: manual, bg_dark_thresh: bg_dark, bg_lum_thresh: bg_lum }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3528,8 +3526,8 @@ function renderClassPreprocessModal() {{
           <label title="WB Blue gain (0.5-6.0). Higher = stronger blue boost for sign.">WB B <input id="classPreprocessWbBlueNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_blue || 2.0}}" style="width:55px"/><input id="classPreprocessWbBlue" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_blue || 2.0}}" step="0.1"/></label>
         </div>
         <div class="class-preprocess-fields">
-          <label title="Min brightness for sign (0-100). Pixels darker than this become white.">Dark Thr <input id="classPreprocessDarkNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" style="width:55px"/><input id="classPreprocessDark" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" step="1"/></label>
-          <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" step="1"/></label>
+          <label title="Min brightness for sign (0-100). Pixels darker than this become white.">Dark Thr <input id="classPreprocessDarkNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 0}}" style="width:55px"/><input id="classPreprocessDark" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 0}}" step="1"/></label>
+          <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 100}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 100}}" step="1"/></label>
           <label title="Min |B-G| magnitude for sign (0-100). Higher = stricter.">B-G Abs <input id="classPreprocessDiffMinNum" type="number" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" step="1"/></label>
         </div>
         <div class="class-preprocess-fields">
@@ -3605,9 +3603,8 @@ function renderClassPreprocessModal() {{
   let thresholdTimer = null;
   const applyThresholds = () => {{
     const existing = getClassPreprocessConfig(classPreprocessClass);
-    existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 150);
-    existing.bg_diff_abs   = Number(diffSlider ? diffSlider.value : 5);
-    existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 20);
+    existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 100);
+    existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 0);
     setClassPreprocessConfig(classPreprocessClass, existing);
     renderClassPreprocessModal();
     refreshClassProcessedPreview();
@@ -3622,11 +3619,11 @@ function renderClassPreprocessModal() {{
   if (diffSlider) diffSlider.oninput = () => {{ if (diffNum) diffNum.value = diffSlider.value; debouncedApply(); }};
   if (darkSlider) darkSlider.oninput = () => {{ if (darkNum) darkNum.value = darkSlider.value; debouncedApply(); }};
   if (darkNum) darkNum.onchange = () => {{
-    let v = Number(darkNum.value); if (!isFinite(v) || v < 0) v = 20; else if (v > 100) v = 100;
+    let v = Number(darkNum.value); if (!isFinite(v) || v < 0) v = 0; else if (v > 100) v = 100;
     darkSlider.value = v; applyThresholds();
   }};
   if (lumNum) lumNum.onchange = () => {{
-    let v = Number(lumNum.value); if (!isFinite(v) || v < 50) v = 150; else if (v > 255) v = 255;
+    let v = Number(lumNum.value); if (!isFinite(v) || v < 50) v = 100; else if (v > 255) v = 255;
     lumSlider.value = v; applyThresholds();
   }};
   if (diffNum) diffNum.onchange = () => {{

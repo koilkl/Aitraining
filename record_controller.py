@@ -1511,10 +1511,9 @@ class RecordController:
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
         mode = str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
         # User-adjustable thresholds from class-level config (shared across samples)
-        bg_lum_thresh = int(class_cfg.get("bg_lum_thresh", _BG_LUM_THRESH)) if class_cfg else _BG_LUM_THRESH
-        bg_diff_abs   = int(class_cfg.get("bg_diff_abs",   _BG_DIFF_MIN))   if class_cfg else _BG_DIFF_MIN
-        bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 20)) if class_cfg else 20
-        print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} diff={bg_diff_abs} (dynamic AWB)")
+        bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 0)) if class_cfg else 20
+        bg_lum_thresh  = int(class_cfg.get("bg_lum_thresh", 100)) if class_cfg else 180
+        print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} (G-channel)")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None
@@ -1522,8 +1521,8 @@ class RecordController:
             src = np.asarray(img)
             roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
         arr = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
-                                         bg_lum_thresh=bg_lum_thresh, bg_diff_abs=bg_diff_abs,
-                                         bg_dark_thresh=bg_dark_thresh)
+                                         bg_dark_thresh=bg_dark_thresh,
+                                         bg_lum_thresh=bg_lum_thresh)
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
