@@ -661,7 +661,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_dark_thresh: int = 0,
                                bg_lum_thresh: int = 100,
-                               return_crop_box: bool = False):
+                               return_crop_box: bool = False,
+                               fast_mode: bool = False):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -688,19 +689,22 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     print(f"[MASK] sign={sign_pct:.1f}% dark={too_dark_pct:.1f}% bright={too_bright_pct:.1f}%  (G>{bg_dark_thresh} & G<{bg_lum_thresh})")
     gray[~is_sign] = 255
 
-    # Crop: shadow search finds dark sign against white background
+    # Crop: shadow search (live preview) or center crop (batch/cache)
+    h_orig, w_orig = gray.shape[:2]
     if roi is not None:
         x1, y1, x2, y2 = roi
         x1 = max(0, min(gray.shape[1] - 1, x1))
         y1 = max(0, min(gray.shape[0] - 1, y1))
         x2 = max(x1 + 1, min(gray.shape[1], x2))
         y2 = max(y1 + 1, min(gray.shape[0], y2))
+    elif fast_mode:
+        # Fast: simple center crop (for batch cache rebuild)
+        x1, y1, x2, y2 = _center_bbox(h_orig, w_orig, frac=0.60)
     else:
-        # _focus_bbox: dark-object + edge detection in center search window
+        # Live: _focus_bbox dark-object + edge detection in center window
         x1, y1, x2, y2 = _focus_bbox(gray)
 
     # Save normalized crop box for ROI overlay display
-    h_orig, w_orig = gray.shape[:2]
     crop_norm = (x1 / w_orig, y1 / h_orig, x2 / w_orig, y2 / h_orig)
 
     gray = gray[y1:y2, x1:x2]

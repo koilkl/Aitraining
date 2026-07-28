@@ -1505,7 +1505,7 @@ class RecordController:
     def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
         return _preview_item_payload(path)
 
-    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False):
+    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False, fast_mode: bool = False):
         class_cfg = class_config if isinstance(class_config, dict) else {}
         src_cfg = sample_config if isinstance(sample_config, dict) else {}
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
@@ -1523,7 +1523,8 @@ class RecordController:
         arr, crop_norm = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
                                          bg_dark_thresh=bg_dark_thresh,
                                          bg_lum_thresh=bg_lum_thresh,
-                                         return_crop_box=True)
+                                         return_crop_box=True,
+                                         fast_mode=fast_mode)
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
@@ -1562,6 +1563,7 @@ class RecordController:
                         png,
                         label_name=class_name,
                         class_config=config,
+                        fast_mode=True,
                         sample_config=class_sample_map.get(src.name),
                     )
                     (dst_dir / f"{src.stem}.png").write_bytes(out_png)
