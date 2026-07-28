@@ -3467,7 +3467,6 @@ function renderClassPreprocessModal() {{
     bg_dark_thresh: classThresh.bg_dark_thresh != null ? classThresh.bg_dark_thresh : 20,
     wb_red:        classThresh.wb_red        != null ? classThresh.wb_red        : 2.0,
     wb_blue:       classThresh.wb_blue       != null ? classThresh.wb_blue       : 2.0,
-    center_roi_frac: classThresh.center_roi_frac != null ? classThresh.center_roi_frac : 0.60,
   }};
   const cfg = normalizeClassPreprocessConfig(
     classPreprocessDraft || getSampleEffectivePreprocessConfig(classPreprocessClass, sampleFilename)
