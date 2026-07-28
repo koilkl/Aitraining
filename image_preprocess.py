@@ -30,7 +30,7 @@ _DARK_OFFSET = 10
 _NEAR_BLACK_THRESH = 45  # max(R,G,B) below this → converted to pure white before auto-crop
 _NEAR_WHITE_THRESH = 200  # R/G/B above this → kept as white (avoids stretch-to-black)
 _BG_LUM_THRESH = 150  # max(R,G,B) above this → bright background → white
-_BG_DIFF_MIN = 5     # B-G diff below this → no blue tint → white (even if dark)
+_BG_DIFF_MIN = 15    # |B-G| magnitude below this → low saturation → white
 _CONTRAST_MIN_SPAN = 24
 _EDGE_PERCENTILE = 0.90
 _EDGE_MIN = 18
@@ -463,10 +463,10 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
         out["manual_roi"] = list(manual_roi)
     # Preserve user-adjustable thresholds (clamped to valid range)
     bg_lum = int(src.get("bg_lum_thresh", _BG_LUM_THRESH))
-    bg_diff = int(src.get("bg_diff_min", _BG_DIFF_MIN))
+    bg_diff = int(src.get("bg_diff_abs", _BG_DIFF_MIN))  # magnitude mode
     bg_dark = int(src.get("bg_dark_thresh", 20))
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
-    out["bg_diff_min"] = max(0, min(255, bg_diff))
+    out["bg_diff_abs"] = max(0, min(255, bg_diff))  # |B-G| magnitude
     out["bg_dark_thresh"] = max(0, min(100, bg_dark))
     # Preserve user-adjustable WB gains
     wb_r = float(src.get("wb_red", 2.0))
@@ -649,7 +649,7 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_lum_thresh: int = 150,
-                               bg_diff_min: int = 5,
+                               bg_diff_abs: int = 15,
                                bg_dark_thresh: int = 20,
                                wb_red: float = 2.0,
                                wb_blue: float = 2.0) -> np.ndarray:
@@ -662,7 +662,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     If *roi* is None (auto mode), finds the brightest region via projection
     and crops to it.  If *roi* is given (manual mode), crops to that bbox.
 
-    Mapping: diff ∈ [-255, 255]  →  gray = (diff + 255) // 2  →  [0, 255].
+    Mapping: diff = B-G  →  gray = |diff|  →  [0, 255]  (absolute magnitude).
 
     IMPORTANT: Any change here MUST be mirrored in TFLite/image_provider.cpp.
     """
@@ -680,9 +680,12 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     b = (src[:, :, 2].astype(np.float32) * wb_blue).clip(0, 255).astype(np.uint8)
     src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
 
-    # B-G from corrected values
-    diff = b.astype(np.int16) - g.astype(np.int16)
-    gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
+    # B-G absolute magnitude (color saturation).
+    # Purple sign → |B-G| large regardless of green/blue sensor bias.
+    # Neutral background (white/gray/road) → |B-G| ≈ 0.
+    diff = b.astype(np.int16) - g.astype(np.int16)   # signed, [-255, 255]
+    diff_abs = np.abs(diff).astype(np.uint8)           # magnitude, [0, 255]
+    gray = diff_abs
 
     # Mark non-sign pixels as white background.
     # Sign = dark (max channel below threshold) AND blue-tinted (B > G + margin).
@@ -693,20 +696,20 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     _enable_mask = _os.environ.get('TM_SKIP_MASK', '0') != '1'
     if _enable_mask:
         # Sign = not-too-dark AND not-too-bright AND blue-tinted
-        is_sign = (max_rgb > bg_dark_thresh) & (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
+        is_sign = (max_rgb > bg_dark_thresh) & (max_rgb < bg_lum_thresh) & (diff_abs > bg_diff_abs)
     else:
-        is_sign = diff > bg_diff_min
+        is_sign = diff_abs > bg_diff_abs
     sign_pct = is_sign.mean() * 100
     bg_pct = (max_rgb < bg_dark_thresh).mean() * 100
     bright_pct = (max_rgb > bg_lum_thresh).mean() * 100
-    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & diff>{bg_diff_min})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
+    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & diff>{bg_diff_abs})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
     # DEBUG: save pre-mask gray to /tmp for inspection
     from PIL import Image as PILImage
     PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_pre_mask.png')
     gray[~is_sign] = 255
     PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_post_mask.png')
     with open('/tmp/debug_bg_params.txt', 'w') as f:
-        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_min={bg_diff_min}\nwb_red={wb_red}\nwb_blue={wb_blue}\nsign_pct={sign_pct:.1f}%\n")
+        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_abs(magnitude)={bg_diff_abs}\nwb_red={wb_red}\nwb_blue={wb_blue}\nsign_pct={sign_pct:.1f}%\n")
         f.write(f"r range=[{r.min()},{r.max()}] avg={r.mean():.0f}\n")
         f.write(f"g range=[{g.min()},{g.max()}] avg={g.mean():.0f}\n")
         f.write(f"b range=[{b.min()},{b.max()}] avg={b.mean():.0f}\n")

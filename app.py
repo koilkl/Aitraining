@@ -3050,7 +3050,7 @@ function normalizeClassPreprocessConfig(raw) {{
   }}
   let bg_lum = Number(src.bg_lum_thresh);
   if (!isFinite(bg_lum) || bg_lum < 50) bg_lum = 150; else if (bg_lum > 255) bg_lum = 255;
-  let bg_diff = Number(src.bg_diff_min);
+  let bg_diff = Number(src.bg_diff_abs);
   if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 255) bg_diff = 255;
   let bg_dark = Number(src.bg_dark_thresh);
   if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 20; else if (bg_dark > 100) bg_dark = 100;
@@ -3058,7 +3058,7 @@ function normalizeClassPreprocessConfig(raw) {{
   if (!isFinite(wb_r) || wb_r < 0.5) wb_r = 2.0; else if (wb_r > 6.0) wb_r = 6.0;
   let wb_b = Number(src.wb_blue);
   if (!isFinite(wb_b) || wb_b < 0.5) wb_b = 2.0; else if (wb_b > 6.0) wb_b = 6.0;
-  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_min: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b }};
+  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3463,7 +3463,7 @@ function renderClassPreprocessModal() {{
   const classThresh = getClassPreprocessConfig(classPreprocessClass);
   const classPreprocessThresholds = {{
     bg_lum_thresh: classThresh.bg_lum_thresh != null ? classThresh.bg_lum_thresh : 150,
-    bg_diff_min:   classThresh.bg_diff_min   != null ? classThresh.bg_diff_min   : 5,
+    bg_diff_abs:   classThresh.bg_diff_abs   != null ? classThresh.bg_diff_abs   : 5,
     bg_dark_thresh: classThresh.bg_dark_thresh != null ? classThresh.bg_dark_thresh : 20,
     wb_red:        classThresh.wb_red        != null ? classThresh.wb_red        : 2.0,
     wb_blue:       classThresh.wb_blue       != null ? classThresh.wb_blue       : 2.0,
@@ -3536,7 +3536,7 @@ function renderClassPreprocessModal() {{
         <div class="class-preprocess-fields">
           <label title="Min brightness for sign (0-100). Pixels darker than this become white.">Dark Thr <input id="classPreprocessDarkNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" style="width:55px"/><input id="classPreprocessDark" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" step="1"/></label>
           <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" step="1"/></label>
-          <label title="Minimum B-G difference for sign (0-100). Higher = stricter.">B-G Min <input id="classPreprocessDiffMinNum" type="number" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_min || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_min || 5}}" step="1"/></label>
+          <label title="Min |B-G| magnitude for sign (0-100). Higher = stricter.">B-G Abs <input id="classPreprocessDiffMinNum" type="number" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" step="1"/></label>
         </div>
         <div class="class-preprocess-fields">
           <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
@@ -3616,7 +3616,7 @@ function renderClassPreprocessModal() {{
   const applyThresholds = () => {{
     const existing = getClassPreprocessConfig(classPreprocessClass);
     existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 150);
-    existing.bg_diff_min   = Number(diffSlider ? diffSlider.value : 5);
+    existing.bg_diff_abs   = Number(diffSlider ? diffSlider.value : 5);
     existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 20);
     existing.wb_red        = Number(wbRedSlider ? wbRedSlider.value : 2.0);
     existing.wb_blue       = Number(wbBlueSlider ? wbBlueSlider.value : 2.0);
