@@ -464,8 +464,10 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     # Preserve user-adjustable thresholds (clamped to valid range)
     bg_lum = int(src.get("bg_lum_thresh", _BG_LUM_THRESH))
     bg_diff = int(src.get("bg_diff_min", _BG_DIFF_MIN))
+    bg_dark = int(src.get("bg_dark_thresh", 20))
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
-    out["bg_diff_min"] = max(0, min(100, bg_diff))
+    out["bg_diff_min"] = max(0, min(255, bg_diff))
+    out["bg_dark_thresh"] = max(0, min(100, bg_dark))
     # Preserve user-adjustable WB gains
     wb_r = float(src.get("wb_red", 2.0))
     wb_b = float(src.get("wb_blue", 2.0))
@@ -648,6 +650,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_lum_thresh: int = 150,
                                bg_diff_min: int = 5,
+                               bg_dark_thresh: int = 20,
                                wb_red: float = 2.0,
                                wb_blue: float = 2.0) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
@@ -686,10 +689,29 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # With stronger WB (×3.0), the sign's B-G separation is much larger, so the
     # default thresholds should work without tuning.
     max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
-    is_sign = (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
+    import os as _os
+    _enable_mask = _os.environ.get('TM_SKIP_MASK', '0') != '1'
+    if _enable_mask:
+        # Sign = not-too-dark AND not-too-bright AND blue-tinted
+        is_sign = (max_rgb > bg_dark_thresh) & (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
+    else:
+        is_sign = diff > bg_diff_min
     sign_pct = is_sign.mean() * 100
-    print(f"[B-G MASK] sign_pixels={sign_pct:.1f}%  (lum<{bg_lum_thresh} & diff>{bg_diff_min})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
+    bg_pct = (max_rgb < bg_dark_thresh).mean() * 100
+    bright_pct = (max_rgb > bg_lum_thresh).mean() * 100
+    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & diff>{bg_diff_min})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
+    # DEBUG: save pre-mask gray to /tmp for inspection
+    from PIL import Image as PILImage
+    PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_pre_mask.png')
     gray[~is_sign] = 255
+    PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_post_mask.png')
+    with open('/tmp/debug_bg_params.txt', 'w') as f:
+        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_min={bg_diff_min}\nwb_red={wb_red}\nwb_blue={wb_blue}\nsign_pct={sign_pct:.1f}%\n")
+        f.write(f"r range=[{r.min()},{r.max()}] avg={r.mean():.0f}\n")
+        f.write(f"g range=[{g.min()},{g.max()}] avg={g.mean():.0f}\n")
+        f.write(f"b range=[{b.min()},{b.max()}] avg={b.mean():.0f}\n")
+        f.write(f"diff range=[{diff.min()},{diff.max()}] avg={diff.mean():.0f}\n")
+        f.write(f"max_rgb range=[{max_rgb.min()},{max_rgb.max()}] avg={max_rgb.mean():.0f}\n")
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
     if roi is not None:
@@ -710,7 +732,11 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     img = img.resize((int(out_size), int(out_size)), Image.BILINEAR)
 
     # Contrast stretch — matches C++ side exactly
-    out = _contrast_stretch_u8(np.asarray(img, dtype=np.uint8))
+    out_arr = np.asarray(img, dtype=np.uint8)
+    out = _contrast_stretch_u8(out_arr)
+    # DEBUG: save final output
+    from PIL import Image as PILImage
+    PILImage.fromarray(out, mode='L').save('/tmp/debug_bg_final.png')
     return out.astype(np.float32) / 255.0
 
 

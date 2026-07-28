@@ -3051,12 +3051,14 @@ function normalizeClassPreprocessConfig(raw) {{
   let bg_lum = Number(src.bg_lum_thresh);
   if (!isFinite(bg_lum) || bg_lum < 50) bg_lum = 150; else if (bg_lum > 255) bg_lum = 255;
   let bg_diff = Number(src.bg_diff_min);
-  if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 100) bg_diff = 100;
+  if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 255) bg_diff = 255;
+  let bg_dark = Number(src.bg_dark_thresh);
+  if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 20; else if (bg_dark > 100) bg_dark = 100;
   let wb_r = Number(src.wb_red);
   if (!isFinite(wb_r) || wb_r < 0.5) wb_r = 2.0; else if (wb_r > 6.0) wb_r = 6.0;
   let wb_b = Number(src.wb_blue);
   if (!isFinite(wb_b) || wb_b < 0.5) wb_b = 2.0; else if (wb_b > 6.0) wb_b = 6.0;
-  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_min: bg_diff, wb_red: wb_r, wb_blue: wb_b }};
+  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_min: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3462,6 +3464,7 @@ function renderClassPreprocessModal() {{
   const classPreprocessThresholds = {{
     bg_lum_thresh: classThresh.bg_lum_thresh != null ? classThresh.bg_lum_thresh : 150,
     bg_diff_min:   classThresh.bg_diff_min   != null ? classThresh.bg_diff_min   : 5,
+    bg_dark_thresh: classThresh.bg_dark_thresh != null ? classThresh.bg_dark_thresh : 20,
     wb_red:        classThresh.wb_red        != null ? classThresh.wb_red        : 2.0,
     wb_blue:       classThresh.wb_blue       != null ? classThresh.wb_blue       : 2.0,
   }};
@@ -3531,8 +3534,9 @@ function renderClassPreprocessModal() {{
           <label title="WB Blue gain (0.5-6.0). Higher = stronger blue boost for sign.">WB B <input id="classPreprocessWbBlueNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_blue || 2.0}}" style="width:55px"/><input id="classPreprocessWbBlue" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_blue || 2.0}}" step="0.1"/></label>
         </div>
         <div class="class-preprocess-fields">
+          <label title="Min brightness for sign (0-100). Pixels darker than this become white.">Dark Thr <input id="classPreprocessDarkNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" style="width:55px"/><input id="classPreprocessDark" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 20}}" step="1"/></label>
           <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 150}}" step="1"/></label>
-          <label title="Minimum B-G difference for sign (0-100). Higher = stricter.">B-G Min <input id="classPreprocessDiffMinNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_diff_min || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_diff_min || 5}}" step="1"/></label>
+          <label title="Minimum B-G difference for sign (0-100). Higher = stricter.">B-G Min <input id="classPreprocessDiffMinNum" type="number" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_min || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_min || 5}}" step="1"/></label>
         </div>
         <div class="class-preprocess-fields">
           <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
@@ -3602,6 +3606,8 @@ function renderClassPreprocessModal() {{
   const diffSlider   = document.getElementById('classPreprocessDiffMin');
   const lumNum       = document.getElementById('classPreprocessLumNum');
   const diffNum      = document.getElementById('classPreprocessDiffMinNum');
+  const darkSlider   = document.getElementById('classPreprocessDark');
+  const darkNum      = document.getElementById('classPreprocessDarkNum');
   const wbRedSlider  = document.getElementById('classPreprocessWbRed');
   const wbBlueSlider = document.getElementById('classPreprocessWbBlue');
   const wbRedNum     = document.getElementById('classPreprocessWbRedNum');
@@ -3611,6 +3617,7 @@ function renderClassPreprocessModal() {{
     const existing = getClassPreprocessConfig(classPreprocessClass);
     existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 150);
     existing.bg_diff_min   = Number(diffSlider ? diffSlider.value : 5);
+    existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 20);
     existing.wb_red        = Number(wbRedSlider ? wbRedSlider.value : 2.0);
     existing.wb_blue       = Number(wbBlueSlider ? wbBlueSlider.value : 2.0);
     setClassPreprocessConfig(classPreprocessClass, existing);
@@ -3625,12 +3632,17 @@ function renderClassPreprocessModal() {{
   // Lum/B-G slider + number sync
   if (lumSlider) lumSlider.oninput = () => {{ if (lumNum) lumNum.value = lumSlider.value; debouncedApply(); }};
   if (diffSlider) diffSlider.oninput = () => {{ if (diffNum) diffNum.value = diffSlider.value; debouncedApply(); }};
+  if (darkSlider) darkSlider.oninput = () => {{ if (darkNum) darkNum.value = darkSlider.value; debouncedApply(); }};
+  if (darkNum) darkNum.onchange = () => {{
+    let v = Number(darkNum.value); if (!isFinite(v) || v < 0) v = 20; else if (v > 100) v = 100;
+    darkSlider.value = v; applyThresholds();
+  }};
   if (lumNum) lumNum.onchange = () => {{
     let v = Number(lumNum.value); if (!isFinite(v) || v < 50) v = 150; else if (v > 255) v = 255;
     lumSlider.value = v; applyThresholds();
   }};
   if (diffNum) diffNum.onchange = () => {{
-    let v = Number(diffNum.value); if (!isFinite(v) || v < 0) v = 5; else if (v > 100) v = 100;
+    let v = Number(diffNum.value); if (!isFinite(v) || v < 0) v = 5; else if (v > 255) v = 255;
     diffSlider.value = v; applyThresholds();
   }};
 
