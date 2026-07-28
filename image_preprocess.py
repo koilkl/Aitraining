@@ -482,11 +482,6 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     out["bg_diff_abs"] = max(0, min(255, bg_diff))  # |B-G| magnitude
     out["bg_dark_thresh"] = max(0, min(100, bg_dark))
 
-    # Preserve user-adjustable WB gains
-    wb_r = float(src.get("wb_red", 2.0))
-    wb_b = float(src.get("wb_blue", 2.0))
-    out["wb_red"] = max(0.5, min(6.0, wb_r))
-    out["wb_blue"] = max(0.5, min(6.0, wb_b))
     return out
 
 
@@ -564,7 +559,9 @@ def preprocess_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscal
         x1, y1, x2, y2 = _junction_bbox(gray.shape[0], gray.shape[1])
         preserve_aspect = True
     else:
-        x1, y1, x2, y2 = _focus_bbox(gray)
+        # Use G channel for shadow search — best SNR in green-biased lighting.
+        # Dark sign absorbs green → low G.  White background reflects → high G.
+        x1, y1, x2, y2 = _focus_bbox(g.astype(np.uint8))
         preserve_aspect = False
     crop = src[y1:y2, x1:x2]
     if crop.size == 0:
@@ -664,9 +661,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_lum_thresh: int = 150,
                                bg_diff_abs: int = 15,
-                               bg_dark_thresh: int = 20,
-                               wb_red: float = 2.0,
-                               wb_blue: float = 2.0) -> np.ndarray:
+                               bg_dark_thresh: int = 20) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
 
     Blue/purple signs → high B, low G → B-G is large positive → bright.
@@ -686,12 +681,28 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     if src.shape[-1] < 3:
         src = np.repeat(src[:, :, :1], 3, axis=2)
 
-    # White-balance correction — MUST match TFLite/image_provider.cpp
-    # Global WB gains (sensor calibration, same for all classes).
-    # Default R×2.0, B×2.0 to match MCU.  Adjustable in the UI.
-    r = (src[:, :, 0].astype(np.float32) * wb_red).clip(0, 255).astype(np.uint8)
-    g = src[:, :, 1]
-    b = (src[:, :, 2].astype(np.float32) * wb_blue).clip(0, 255).astype(np.uint8)
+    # ── Dynamic Auto White Balance (Gray World) ──
+    # Compute per-image WB gains so every frame is colour-balanced
+    # regardless of lighting.  Gains clamped to [0.5, 4.0].
+    # Same algorithm used on MCU (image_provider.cpp) for consistency.
+    r_raw = src[:, :, 0].astype(np.float32)
+    g_raw = src[:, :, 1].astype(np.float32)
+    b_raw = src[:, :, 2].astype(np.float32)
+
+    valid = ~((r_raw < 10) & (g_raw < 10) & (b_raw < 10))  # skip pure black
+    if np.count_nonzero(valid) > 100:
+        mr, mg, mb = r_raw[valid].mean(), g_raw[valid].mean(), b_raw[valid].mean()
+        if mr > 0 and mg > 0 and mb > 0:
+            dyn_wb_r = float(np.clip(mg / mr, 0.5, 4.0))
+            dyn_wb_b = float(np.clip(mg / mb, 0.5, 4.0))
+        else:
+            dyn_wb_r = dyn_wb_b = 2.0
+    else:
+        dyn_wb_r = dyn_wb_b = 2.0
+
+    r = (r_raw * dyn_wb_r).clip(0, 255).astype(np.uint8)
+    g = g_raw.astype(np.uint8)
+    b = (b_raw * dyn_wb_b).clip(0, 255).astype(np.uint8)
     src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
 
     # B-G absolute magnitude (color saturation).
@@ -716,7 +727,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     sign_pct = is_sign.mean() * 100
     bg_pct = (max_rgb < bg_dark_thresh).mean() * 100
     bright_pct = (max_rgb > bg_lum_thresh).mean() * 100
-    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & diff>{bg_diff_abs})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
+    print(f"[B-G MASK] sign={sign_pct:.1f}% too_dark={bg_pct:.1f}% too_bright={bright_pct:.1f}%  (lum>{bg_dark_thresh} & lum<{bg_lum_thresh} & |B-G|>{bg_diff_abs})  dyn_wb={dyn_wb_r:.2f}xR {dyn_wb_b:.2f}xB")
     # DEBUG: save pre-mask gray to /tmp for inspection
     from PIL import Image as PILImage
     PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_pre_mask.png')
@@ -742,7 +753,9 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         # Shadow-based search on the MASKED image (after user's threshold adjustments).
         # Sign pixels keep their |B-G| magnitude; background pixels are 255.
         # The sign is the only dark object → _focus_bbox finds it reliably.
-        x1, y1, x2, y2 = _focus_bbox(gray)
+        # Use G channel for shadow search — best SNR in green-biased lighting.
+        # Dark sign absorbs green → low G.  White background reflects → high G.
+        x1, y1, x2, y2 = _focus_bbox(g.astype(np.uint8))
         gray = gray[y1:y2, x1:x2]
 
     # Resize

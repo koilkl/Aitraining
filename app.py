@@ -3054,11 +3054,7 @@ function normalizeClassPreprocessConfig(raw) {{
   if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 255) bg_diff = 255;
   let bg_dark = Number(src.bg_dark_thresh);
   if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 20; else if (bg_dark > 100) bg_dark = 100;
-  let wb_r = Number(src.wb_red);
-  if (!isFinite(wb_r) || wb_r < 0.5) wb_r = 2.0; else if (wb_r > 6.0) wb_r = 6.0;
-  let wb_b = Number(src.wb_blue);
-  if (!isFinite(wb_b) || wb_b < 0.5) wb_b = 2.0; else if (wb_b > 6.0) wb_b = 6.0;
-  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b }};
+  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3465,9 +3461,7 @@ function renderClassPreprocessModal() {{
     bg_lum_thresh: classThresh.bg_lum_thresh != null ? classThresh.bg_lum_thresh : 150,
     bg_diff_abs:   classThresh.bg_diff_abs   != null ? classThresh.bg_diff_abs   : 5,
     bg_dark_thresh: classThresh.bg_dark_thresh != null ? classThresh.bg_dark_thresh : 20,
-    wb_red:        classThresh.wb_red        != null ? classThresh.wb_red        : 2.0,
-    wb_blue:       classThresh.wb_blue       != null ? classThresh.wb_blue       : 2.0,
-  }};
+}};
   const cfg = normalizeClassPreprocessConfig(
     classPreprocessDraft || getSampleEffectivePreprocessConfig(classPreprocessClass, sampleFilename)
   );
@@ -3608,18 +3602,12 @@ function renderClassPreprocessModal() {{
   const diffNum      = document.getElementById('classPreprocessDiffMinNum');
   const darkSlider   = document.getElementById('classPreprocessDark');
   const darkNum      = document.getElementById('classPreprocessDarkNum');
-  const wbRedSlider  = document.getElementById('classPreprocessWbRed');
-  const wbBlueSlider = document.getElementById('classPreprocessWbBlue');
-  const wbRedNum     = document.getElementById('classPreprocessWbRedNum');
-  const wbBlueNum    = document.getElementById('classPreprocessWbBlueNum');
   let thresholdTimer = null;
   const applyThresholds = () => {{
     const existing = getClassPreprocessConfig(classPreprocessClass);
     existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 150);
     existing.bg_diff_abs   = Number(diffSlider ? diffSlider.value : 5);
     existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 20);
-    existing.wb_red        = Number(wbRedSlider ? wbRedSlider.value : 2.0);
-    existing.wb_blue       = Number(wbBlueSlider ? wbBlueSlider.value : 2.0);
     setClassPreprocessConfig(classPreprocessClass, existing);
     renderClassPreprocessModal();
     refreshClassProcessedPreview();
@@ -3647,16 +3635,7 @@ function renderClassPreprocessModal() {{
   }};
 
   // WB slider + number sync
-  if (wbRedSlider) wbRedSlider.oninput = () => {{ if (wbRedNum) wbRedNum.value = wbRedSlider.value; debouncedApply(); }};
-  if (wbBlueSlider) wbBlueSlider.oninput = () => {{ if (wbBlueNum) wbBlueNum.value = wbBlueSlider.value; debouncedApply(); }};
-  if (wbRedNum) wbRedNum.onchange = () => {{
-    let v = Number(wbRedNum.value); if (!isFinite(v) || v < 0.5) v = 2.0; else if (v > 6.0) v = 6.0;
-    wbRedSlider.value = v; applyThresholds();
-  }};
-  if (wbBlueNum) wbBlueNum.onchange = () => {{
-    let v = Number(wbBlueNum.value); if (!isFinite(v) || v < 0.5) v = 2.0; else if (v > 6.0) v = 6.0;
-    wbBlueSlider.value = v; applyThresholds();
-  }};
+
   host.querySelectorAll('[data-preprocess-sample]').forEach((btn) => {{
     btn.onclick = () => {{
       if (!maybeDiscardClassPreprocessDraft()) return;
