@@ -739,11 +739,10 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y2 = max(y1 + 1, min(gray.shape[0], y2))
         gray = gray[y1:y2, x1:x2]
     else:
-        # Shadow-based search: find dark object (sign) against bright background.
-        # _focus_bbox looks for dark regions with edges in the upper-left search
-        # window (4-50% width, 14-62% height).  Works regardless of colour bias.
-        lum = np.asarray(Image.fromarray(src_wb, mode='RGB').convert('L'), dtype=np.uint8)
-        x1, y1, x2, y2 = _focus_bbox(lum)
+        # Shadow-based search on the MASKED image (after user's threshold adjustments).
+        # Sign pixels keep their |B-G| magnitude; background pixels are 255.
+        # The sign is the only dark object → _focus_bbox finds it reliably.
+        x1, y1, x2, y2 = _focus_bbox(gray)
         gray = gray[y1:y2, x1:x2]
 
     # Resize
