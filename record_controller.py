@@ -1513,6 +1513,8 @@ class RecordController:
         # User-adjustable thresholds from class-level config (shared across samples)
         bg_lum_thresh = int(class_cfg.get("bg_lum_thresh", _BG_LUM_THRESH)) if class_cfg else _BG_LUM_THRESH
         bg_diff_min   = int(class_cfg.get("bg_diff_min",   _BG_DIFF_MIN))   if class_cfg else _BG_DIFF_MIN
+        wb_red_gain   = float(class_cfg.get("wb_red", 3.0)) if class_cfg else 3.0
+        wb_blue_gain  = float(class_cfg.get("wb_blue", 3.0)) if class_cfg else 3.0
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None
@@ -1520,7 +1522,8 @@ class RecordController:
             src = np.asarray(img)
             roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
         arr = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
-                                         bg_lum_thresh=bg_lum_thresh, bg_diff_min=bg_diff_min)
+                                         bg_lum_thresh=bg_lum_thresh, bg_diff_min=bg_diff_min,
+                                         wb_red=wb_red_gain, wb_blue=wb_blue_gain)
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]

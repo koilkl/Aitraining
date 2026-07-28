@@ -466,6 +466,11 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     bg_diff = int(src.get("bg_diff_min", _BG_DIFF_MIN))
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
     out["bg_diff_min"] = max(0, min(100, bg_diff))
+    # Preserve user-adjustable WB gains
+    wb_r = float(src.get("wb_red", 3.0))
+    wb_b = float(src.get("wb_blue", 3.0))
+    out["wb_red"] = max(0.5, min(6.0, wb_r))
+    out["wb_blue"] = max(0.5, min(6.0, wb_b))
     return out
 
 
@@ -642,7 +647,9 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_lum_thresh: int = 150,
-                               bg_diff_min: int = 5) -> np.ndarray:
+                               bg_diff_min: int = 5,
+                               wb_red: float = 3.0,
+                               wb_blue: float = 3.0) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
 
     Blue/purple signs → high B, low G → B-G is large positive → bright.
@@ -663,19 +670,21 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         src = np.repeat(src[:, :, :1], 3, axis=2)
 
     # White-balance correction — MUST match TFLite/image_provider.cpp
-    r = (src[:, :, 0].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
+    # Default R×3.0, B×3.0 — stronger than the MCU's ×2.0 to compensate for
+    # sensor green bias.  Adjustable in the UI (class preprocessing modal).
+    r = (src[:, :, 0].astype(np.float32) * wb_red).clip(0, 255).astype(np.uint8)
     g = src[:, :, 1]
-    b = (src[:, :, 2].astype(np.float32) * 2.0).clip(0, 255).astype(np.uint8)
+    b = (src[:, :, 2].astype(np.float32) * wb_blue).clip(0, 255).astype(np.uint8)
     src_wb = np.stack([r, g, b], axis=-1)     # WB-corrected RGB
 
     # B-G from corrected values
     diff = b.astype(np.int16) - g.astype(np.int16)
     gray = np.clip((diff + 255) // 2, 0, 255).astype(np.uint8)
 
-    # Only keep pixels that are BOTH dark AND blue-tinted (the sign).
-    # - Dark:    max(R,G,B) below threshold (sign is dark object)
-    # - Blue:    B > G by at least a small margin (blue/purple tint)
-    # Everything else (bright, gray, green, black) → white background.
+    # Mark non-sign pixels as white background.
+    # Sign = dark (max channel below threshold) AND blue-tinted (B > G + margin).
+    # With stronger WB (×3.0), the sign's B-G separation is much larger, so the
+    # default thresholds should work without tuning.
     max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
     is_sign = (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
     gray[~is_sign] = 255
