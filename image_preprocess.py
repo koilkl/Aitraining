@@ -734,7 +734,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     gray[~is_sign] = 255
     PILImage.fromarray(gray, mode='L').save('/tmp/debug_bg_post_mask.png')
     with open('/tmp/debug_bg_params.txt', 'w') as f:
-        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_abs(magnitude)={bg_diff_abs}\nwb_red={wb_red}\nwb_blue={wb_blue}\nsign_pct={sign_pct:.1f}%\n")
+        f.write(f"bg_dark_thresh={bg_dark_thresh}\nbg_lum_thresh={bg_lum_thresh}\nbg_diff_abs(magnitude)={bg_diff_abs}\ndyn_wb_r={dyn_wb_r:.2f}\ndyn_wb_b={dyn_wb_b:.2f}\nsign_pct={sign_pct:.1f}%\n")
         f.write(f"r range=[{r.min()},{r.max()}] avg={r.mean():.0f}\n")
         f.write(f"g range=[{g.min()},{g.max()}] avg={g.mean():.0f}\n")
         f.write(f"b range=[{b.min()},{b.max()}] avg={b.mean():.0f}\n")
