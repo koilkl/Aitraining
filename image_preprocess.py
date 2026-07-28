@@ -687,8 +687,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         src = np.repeat(src[:, :, :1], 3, axis=2)
 
     # White-balance correction — MUST match TFLite/image_provider.cpp
-    # Default R×3.0, B×3.0 — stronger than the MCU's ×2.0 to compensate for
-    # sensor green bias.  Adjustable in the UI (class preprocessing modal).
+    # Global WB gains (sensor calibration, same for all classes).
+    # Default R×2.0, B×2.0 to match MCU.  Adjustable in the UI.
     r = (src[:, :, 0].astype(np.float32) * wb_red).clip(0, 255).astype(np.uint8)
     g = src[:, :, 1]
     b = (src[:, :, 2].astype(np.float32) * wb_blue).clip(0, 255).astype(np.uint8)
@@ -755,7 +755,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # DEBUG: save final output
     from PIL import Image as PILImage
     PILImage.fromarray(out, mode='L').save('/tmp/debug_bg_final.png')
-    return out.astype(np.float32) / 255.0
+    result = out.astype(np.float32) / 255.0
+    return np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
 
 
 def preprocess_manual_roi_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale", manual_roi: Any = None) -> np.ndarray:
