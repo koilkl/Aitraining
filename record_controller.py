@@ -1513,8 +1513,9 @@ class RecordController:
         # User-adjustable thresholds from class-level config (shared across samples)
         bg_lum_thresh = int(class_cfg.get("bg_lum_thresh", _BG_LUM_THRESH)) if class_cfg else _BG_LUM_THRESH
         bg_diff_min   = int(class_cfg.get("bg_diff_min",   _BG_DIFF_MIN))   if class_cfg else _BG_DIFF_MIN
-        wb_red_gain   = float(class_cfg.get("wb_red", 3.0)) if class_cfg else 3.0
-        wb_blue_gain  = float(class_cfg.get("wb_blue", 3.0)) if class_cfg else 3.0
+        wb_red_gain   = float(class_cfg.get("wb_red", 2.0)) if class_cfg else 2.0
+        wb_blue_gain  = float(class_cfg.get("wb_blue", 2.0)) if class_cfg else 2.0
+        print(f"[PREPROCESS] lum={bg_lum_thresh} diff_min={bg_diff_min} wb_r={wb_red_gain:.1f} wb_b={wb_blue_gain:.1f}")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None

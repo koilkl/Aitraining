@@ -467,8 +467,8 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
     out["bg_diff_min"] = max(0, min(100, bg_diff))
     # Preserve user-adjustable WB gains
-    wb_r = float(src.get("wb_red", 3.0))
-    wb_b = float(src.get("wb_blue", 3.0))
+    wb_r = float(src.get("wb_red", 2.0))
+    wb_b = float(src.get("wb_blue", 2.0))
     out["wb_red"] = max(0.5, min(6.0, wb_r))
     out["wb_blue"] = max(0.5, min(6.0, wb_b))
     return out
@@ -648,8 +648,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_lum_thresh: int = 150,
                                bg_diff_min: int = 5,
-                               wb_red: float = 3.0,
-                               wb_blue: float = 3.0) -> np.ndarray:
+                               wb_red: float = 2.0,
+                               wb_blue: float = 2.0) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
 
     Blue/purple signs → high B, low G → B-G is large positive → bright.
@@ -687,6 +687,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # default thresholds should work without tuning.
     max_rgb = np.maximum(np.maximum(r.astype(np.int16), g.astype(np.int16)), b.astype(np.int16))
     is_sign = (max_rgb < bg_lum_thresh) & (diff > bg_diff_min)
+    sign_pct = is_sign.mean() * 100
+    print(f"[B-G MASK] sign_pixels={sign_pct:.1f}%  (lum<{bg_lum_thresh} & diff>{bg_diff_min})  wb={wb_red:.1f}xR {wb_blue:.1f}xB")
     gray[~is_sign] = 255
 
     # Crop: use WB-corrected RGB for mask detection, then crop B-G grayscale
