@@ -1516,7 +1516,6 @@ class RecordController:
         bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 20)) if class_cfg else 20
         wb_red_gain   = float(class_cfg.get("wb_red", 2.0)) if class_cfg else 2.0
         wb_blue_gain  = float(class_cfg.get("wb_blue", 2.0)) if class_cfg else 2.0
-        center_roi_frac = float(class_cfg.get("center_roi_frac", 0.60)) if class_cfg else 0.60
         print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} diff={bg_diff_abs} wb_r={wb_red_gain:.1f} wb_b={wb_blue_gain:.1f}")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
@@ -1527,8 +1526,7 @@ class RecordController:
         arr = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
                                          bg_lum_thresh=bg_lum_thresh, bg_diff_abs=bg_diff_abs,
                                          bg_dark_thresh=bg_dark_thresh,
-                                         wb_red=wb_red_gain, wb_blue=wb_blue_gain,
-                                         center_roi_frac=center_roi_frac)
+                                         wb_red=wb_red_gain, wb_blue=wb_blue_gain)
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]

@@ -3054,13 +3054,11 @@ function normalizeClassPreprocessConfig(raw) {{
   if (!isFinite(bg_diff) || bg_diff < 0) bg_diff = 5; else if (bg_diff > 255) bg_diff = 255;
   let bg_dark = Number(src.bg_dark_thresh);
   if (!isFinite(bg_dark) || bg_dark < 0) bg_dark = 20; else if (bg_dark > 100) bg_dark = 100;
-  let crf = Number(src.center_roi_frac);
-  if (!isFinite(crf) || crf < 0.20) crf = 0.60; else if (crf > 0.95) crf = 0.95;
   let wb_r = Number(src.wb_red);
   if (!isFinite(wb_r) || wb_r < 0.5) wb_r = 2.0; else if (wb_r > 6.0) wb_r = 6.0;
   let wb_b = Number(src.wb_blue);
   if (!isFinite(wb_b) || wb_b < 0.5) wb_b = 2.0; else if (wb_b > 6.0) wb_b = 6.0;
-  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b, center_roi_frac: crf }};
+  return {{ mode, manual_roi: manual, bg_lum_thresh: bg_lum, bg_diff_abs: bg_diff, bg_dark_thresh: bg_dark, wb_red: wb_r, wb_blue: wb_b }};
 }}
 function getClassPreprocessConfig(className) {{
   const all = STATE.class_preprocess && typeof STATE.class_preprocess === 'object' ? STATE.class_preprocess : {{}};
@@ -3533,8 +3531,7 @@ function renderClassPreprocessModal() {{
           <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
         </div>
         <div class="class-preprocess-fields">
-          <label title="Center crop fraction (0.20-0.95). Sign is in the middle.">Center <input id="classPreprocessCenterNum" type="number" min="0.20" max="0.95" step="0.05" value="${{classPreprocessThresholds.center_roi_frac || 0.60}}" style="width:55px"/><input id="classPreprocessCenter" type="range" min="0.20" max="0.95" value="${{classPreprocessThresholds.center_roi_frac || 0.60}}" step="0.05"/></label>
-          <label title="WB Red gain (0.5-6.0). Higher = less green, more red. Default 2.0.">WB R <input id="classPreprocessWbRedNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_red || 2.0}}" style="width:55px"/><input id="classPreprocessWbRed" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_red || 2.0}}" step="0.1"/></label>
+<label title="WB Red gain (0.5-6.0). Higher = less green, more red. Default 2.0.">WB R <input id="classPreprocessWbRedNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_red || 2.0}}" style="width:55px"/><input id="classPreprocessWbRed" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_red || 2.0}}" step="0.1"/></label>
           <label title="WB Blue gain (0.5-6.0). Higher = stronger blue boost for sign.">WB B <input id="classPreprocessWbBlueNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_blue || 2.0}}" style="width:55px"/><input id="classPreprocessWbBlue" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_blue || 2.0}}" step="0.1"/></label>
         </div>
         <div class="class-preprocess-fields">
@@ -3612,8 +3609,6 @@ function renderClassPreprocessModal() {{
   const diffNum      = document.getElementById('classPreprocessDiffMinNum');
   const darkSlider   = document.getElementById('classPreprocessDark');
   const darkNum      = document.getElementById('classPreprocessDarkNum');
-  const centerSlider = document.getElementById('classPreprocessCenter');
-  const centerNum    = document.getElementById('classPreprocessCenterNum');
   const wbRedSlider  = document.getElementById('classPreprocessWbRed');
   const wbBlueSlider = document.getElementById('classPreprocessWbBlue');
   const wbRedNum     = document.getElementById('classPreprocessWbRedNum');
@@ -3624,7 +3619,6 @@ function renderClassPreprocessModal() {{
     existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 150);
     existing.bg_diff_abs   = Number(diffSlider ? diffSlider.value : 5);
     existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 20);
-    existing.center_roi_frac = Number(centerSlider ? centerSlider.value : 0.60);
     existing.wb_red        = Number(wbRedSlider ? wbRedSlider.value : 2.0);
     existing.wb_blue       = Number(wbBlueSlider ? wbBlueSlider.value : 2.0);
     setClassPreprocessConfig(classPreprocessClass, existing);
@@ -3654,11 +3648,6 @@ function renderClassPreprocessModal() {{
   }};
 
   // WB slider + number sync
-  if (centerSlider) centerSlider.oninput = () => {{ if (centerNum) centerNum.value = centerSlider.value; debouncedApply(); }};
-  if (centerNum) centerNum.onchange = () => {{
-    let v = Number(centerNum.value); if (!isFinite(v) || v < 0.20) v = 0.60; else if (v > 0.95) v = 0.95;
-    centerSlider.value = v; applyThresholds();
-  }};
   if (wbRedSlider) wbRedSlider.oninput = () => {{ if (wbRedNum) wbRedNum.value = wbRedSlider.value; debouncedApply(); }};
   if (wbBlueSlider) wbBlueSlider.oninput = () => {{ if (wbBlueNum) wbBlueNum.value = wbBlueSlider.value; debouncedApply(); }};
   if (wbRedNum) wbRedNum.onchange = () => {{

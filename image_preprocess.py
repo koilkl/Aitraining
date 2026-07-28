@@ -17,13 +17,13 @@ PREPROCESS_MODE_SIGN = "sign"
 PREPROCESS_MODE_JUNCTION = "junction"
 PREPROCESS_MODE_BLUE_DIFF = "blue_diff"  # B-G extraction for blue/purple signs
 
-_SEARCH_LEFT_FRAC = 0.04
-_SEARCH_RIGHT_FRAC = 0.50
-_SEARCH_TOP_FRAC = 0.14
-_SEARCH_BOTTOM_FRAC = 0.62
+_SEARCH_LEFT_FRAC = 0.15
+_SEARCH_RIGHT_FRAC = 0.85
+_SEARCH_TOP_FRAC = 0.15
+_SEARCH_BOTTOM_FRAC = 0.85
 _FALLBACK_SIDE_FRAC = 0.24
-_FALLBACK_CENTER_X_FRAC = 0.22
-_FALLBACK_CENTER_Y_FRAC = 0.42
+_FALLBACK_CENTER_X_FRAC = 0.50
+_FALLBACK_CENTER_Y_FRAC = 0.50
 _CENTER_ROI_FRAC = 0.60  # fraction of image to keep from center for sign crop
 _MIN_FOCUS_PIXELS = 18
 _MIN_SIDE_FRAC = 0.50
@@ -39,8 +39,8 @@ _EDGE_RELAX = 8
 _SIGN_CENTER_BIAS_X_FRAC = 0.10
 _SIGN_CENTER_BIAS_Y_FRAC = -0.03
 _SIGN_PROJECTION_FRAC = 0.16
-_SIGN_PRIOR_CENTER_X_FRAC = 0.52
-_SIGN_PRIOR_CENTER_Y_FRAC = 0.34
+_SIGN_PRIOR_CENTER_X_FRAC = 0.50
+_SIGN_PRIOR_CENTER_Y_FRAC = 0.50
 _SIGN_PRIOR_SIGMA_X_FRAC = 0.18
 _SIGN_PRIOR_SIGMA_Y_FRAC = 0.16
 _SIGN_LOCAL_PEAK_RATIO = 0.68
@@ -481,9 +481,7 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
     out["bg_diff_abs"] = max(0, min(255, bg_diff))  # |B-G| magnitude
     out["bg_dark_thresh"] = max(0, min(100, bg_dark))
-    # Center ROI fraction
-    crf = float(src.get("center_roi_frac", 0.60))
-    out["center_roi_frac"] = max(0.20, min(0.95, crf))
+
     # Preserve user-adjustable WB gains
     wb_r = float(src.get("wb_red", 2.0))
     wb_b = float(src.get("wb_blue", 2.0))
@@ -668,8 +666,7 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                bg_diff_abs: int = 15,
                                bg_dark_thresh: int = 20,
                                wb_red: float = 2.0,
-                               wb_blue: float = 2.0,
-                               center_roi_frac: float = 0.60) -> np.ndarray:
+                               wb_blue: float = 2.0) -> np.ndarray:
     """B-G difference pipeline — identical to ESP32-P4 image_provider.cpp.
 
     Blue/purple signs → high B, low G → B-G is large positive → bright.
@@ -742,8 +739,11 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y2 = max(y1 + 1, min(gray.shape[0], y2))
         gray = gray[y1:y2, x1:x2]
     else:
-        # Center ROI: sign is always in middle of frame after capture
-        x1, y1, x2, y2 = _center_bbox(gray.shape[0], gray.shape[1], frac=center_roi_frac)
+        # Shadow-based search: find dark object (sign) against bright background.
+        # _focus_bbox looks for dark regions with edges in the upper-left search
+        # window (4-50% width, 14-62% height).  Works regardless of colour bias.
+        lum = np.asarray(Image.fromarray(src_wb, mode='RGB').convert('L'), dtype=np.uint8)
+        x1, y1, x2, y2 = _focus_bbox(lum)
         gray = gray[y1:y2, x1:x2]
 
     # Resize
