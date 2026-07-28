@@ -3467,7 +3467,6 @@ function renderClassPreprocessModal() {{
   const classThresh = getClassPreprocessConfig(classPreprocessClass);
   const classPreprocessThresholds = {{
     bg_lum_thresh: classThresh.bg_lum_thresh != null ? classThresh.bg_lum_thresh : 150,
-    bg_diff_abs:   classThresh.bg_diff_abs   != null ? classThresh.bg_diff_abs   : 5,
     bg_dark_thresh: classThresh.bg_dark_thresh != null ? classThresh.bg_dark_thresh : 20,
 }};
   const cfg = normalizeClassPreprocessConfig(
@@ -3532,13 +3531,10 @@ function renderClassPreprocessModal() {{
           <button class="btn btn-primary class-preprocess-mode-save" type="button" id="classPreprocessSave"${{sampleFilename && dirty ? '' : ' disabled'}}>${{dirty ? 'Save Sample' : 'Saved'}}</button>
         </div>
         <div class="class-preprocess-fields">
-<label title="WB Red gain (0.5-6.0). Higher = less green, more red. Default 2.0.">WB R <input id="classPreprocessWbRedNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_red || 2.0}}" style="width:55px"/><input id="classPreprocessWbRed" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_red || 2.0}}" step="0.1"/></label>
-          <label title="WB Blue gain (0.5-6.0). Higher = stronger blue boost for sign.">WB B <input id="classPreprocessWbBlueNum" type="number" min="0.5" max="6.0" step="0.1" value="${{classPreprocessThresholds.wb_blue || 2.0}}" style="width:55px"/><input id="classPreprocessWbBlue" type="range" min="0.5" max="6.0" value="${{classPreprocessThresholds.wb_blue || 2.0}}" step="0.1"/></label>
         </div>
         <div class="class-preprocess-fields">
           <label title="Min brightness for sign (0-100). Pixels darker than this become white.">Dark Thr <input id="classPreprocessDarkNum" type="number" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 0}}" style="width:55px"/><input id="classPreprocessDark" type="range" min="0" max="100" value="${{classPreprocessThresholds.bg_dark_thresh || 0}}" step="1"/></label>
           <label title="Max brightness to consider as sign (50-255). Lower = stricter.">Lum Thr <input id="classPreprocessLumNum" type="number" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 100}}" style="width:55px"/><input id="classPreprocessLum" type="range" min="50" max="255" value="${{classPreprocessThresholds.bg_lum_thresh || 100}}" step="1"/></label>
-          <label title="Min |B-G| magnitude for sign (0-100). Higher = stricter.">B-G Abs <input id="classPreprocessDiffMinNum" type="number" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" style="width:55px"/><input id="classPreprocessDiffMin" type="range" min="0" max="255" value="${{classPreprocessThresholds.bg_diff_abs || 5}}" step="1"/></label>
         </div>
         <div class="class-preprocess-fields">
           <label>ROI X1<input id="classPreprocessX1" type="number" min="0" max="1" step="0.01" value="${{roi ? roi[0].toFixed(2) : '0.00'}}" ${{cfg.mode === 'manual_roi' ? '' : 'disabled'}}/></label>
@@ -3605,11 +3601,9 @@ function renderClassPreprocessModal() {{
       applyClassPreprocessMode(modeSel.value);
   }};
   const lumSlider   = document.getElementById('classPreprocessLum');
-  const diffSlider   = document.getElementById('classPreprocessDiffMin');
   const lumNum       = document.getElementById('classPreprocessLumNum');
-  const diffNum      = document.getElementById('classPreprocessDiffMinNum');
-  const darkSlider   = document.getElementById('classPreprocessDark');
   const darkNum      = document.getElementById('classPreprocessDarkNum');
+  const darkSlider   = document.getElementById('classPreprocessDark');
   let thresholdTimer = null;
   const applyThresholds = () => {{
     const existing = getClassPreprocessConfig(classPreprocessClass);
@@ -3626,7 +3620,6 @@ function renderClassPreprocessModal() {{
 
   // Lum/B-G slider + number sync
   if (lumSlider) lumSlider.oninput = () => {{ if (lumNum) lumNum.value = lumSlider.value; debouncedApply(); }};
-  if (diffSlider) diffSlider.oninput = () => {{ if (diffNum) diffNum.value = diffSlider.value; debouncedApply(); }};
   if (darkSlider) darkSlider.oninput = () => {{ if (darkNum) darkNum.value = darkSlider.value; debouncedApply(); }};
   if (darkNum) darkNum.onchange = () => {{
     let v = Number(darkNum.value); if (!isFinite(v) || v < 0) v = 0; else if (v > 100) v = 100;
@@ -3636,9 +3629,6 @@ function renderClassPreprocessModal() {{
     let v = Number(lumNum.value); if (!isFinite(v) || v < 50) v = 100; else if (v > 255) v = 255;
     lumSlider.value = v; applyThresholds();
   }};
-  if (diffNum) diffNum.onchange = () => {{
-    let v = Number(diffNum.value); if (!isFinite(v) || v < 0) v = 5; else if (v > 255) v = 255;
-    diffSlider.value = v; applyThresholds();
   }};
 
   // WB slider + number sync
