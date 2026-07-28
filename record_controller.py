@@ -1505,7 +1505,7 @@ class RecordController:
     def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
         return _preview_item_payload(path)
 
-    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None) -> bytes:
+    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False):
         class_cfg = class_config if isinstance(class_config, dict) else {}
         src_cfg = sample_config if isinstance(sample_config, dict) else {}
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
@@ -1520,13 +1520,17 @@ class RecordController:
         if mode == PREPROCESS_MODE_MANUAL_ROI:
             src = np.asarray(img)
             roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
-        arr = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
+        arr, crop_norm = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
                                          bg_dark_thresh=bg_dark_thresh,
-                                         bg_lum_thresh=bg_lum_thresh)
+                                         bg_lum_thresh=bg_lum_thresh,
+                                         return_crop_box=True)
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
-        return _to_png_bytes(Image.fromarray(out, mode="L"))
+        png_bytes = _to_png_bytes(Image.fromarray(out, mode="L"))
+        if return_crop:
+            return {"png": png_bytes, "crop": list(crop_norm)}
+        return png_bytes
 
     def _rebuild_processed_cache(
         self,
@@ -1600,13 +1604,17 @@ class RecordController:
         src = (class_dir / Path(filename).name).resolve()
         if src.parent != class_dir.resolve() or not src.exists():
             raise FileNotFoundError("sample not found")
-        out_png = self._preprocess_image_png(
+        result = self._preprocess_image_png(
             src.read_bytes(),
             label_name=class_name,
             class_config=class_config,
             sample_config=sample_config,
+            return_crop=True,
         )
-        return {"image_b64": base64.b64encode(out_png).decode("ascii")}
+        return {
+            "image_b64": base64.b64encode(result["png"]).decode("ascii"),
+            "crop": result.get("crop"),
+        }
 
     def _project_state_payload(self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         classes = self._classes_load(dataset_root)

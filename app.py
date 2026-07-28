@@ -2929,6 +2929,7 @@ let classPreprocessProcessedSrc = '';
 let classPreprocessBusy = false;
 let classPreprocessScrollTop = 0;
 let classPreprocessDirty = false;
+let classPreprocessAutoCrop = null;  // auto-detected crop box (normalized 0-1)
 let navMenuOpen = false;
 let navMenuBound = false;
 let resizeBound = false;
@@ -3247,12 +3248,16 @@ async function refreshClassProcessedPreview() {{
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to render preprocess preview.');
     classPreprocessProcessedSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+    // Save auto-crop ROI (normalized 0-1) for overlay display
+    classPreprocessAutoCrop = Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null;
   }} catch (err) {{
     classPreprocessProcessedSrc = '';
     toast(String(err && err.message ? err.message : err));
   }} finally {{
     classPreprocessBusy = false;
     renderClassPreprocessModal();
+    // Update ROI overlay with auto-detected crop box
+    updateClassPreprocessOverlay(null);
   }}
 }}
 function openClassPreprocessEditor(className) {{
@@ -3360,7 +3365,10 @@ function closeClassPreprocessEditor(force = false) {{
 function updateClassPreprocessOverlay(roi) {{
   const overlay = document.getElementById('classPreprocessOverlay');
   if (!overlay) return;
-    const valid = Array.isArray(roi) && roi.length === 4 && classPreprocessDraft && String(classPreprocessDraft.mode || 'auto_by_label') === 'manual_roi';
+  // Show crop box for manual ROI OR auto-detected crop
+  const isManual = Array.isArray(roi) && roi.length === 4 && classPreprocessDraft && String(classPreprocessDraft.mode || 'auto_by_label') === 'manual_roi';
+  const effectiveRoi = isManual ? roi : classPreprocessAutoCrop;
+  const valid = Array.isArray(effectiveRoi) && effectiveRoi.length === 4;
   if (!valid) {{
     overlay.style.display = 'none';
     return;
@@ -3370,15 +3378,17 @@ function updateClassPreprocessOverlay(roi) {{
       overlay.style.display = 'none';
       return;
     }}
-  const x1 = Math.max(0, Math.min(1, Number(roi[0] || 0)));
-  const y1 = Math.max(0, Math.min(1, Number(roi[1] || 0)));
-  const x2 = Math.max(x1, Math.min(1, Number(roi[2] || x1)));
-  const y2 = Math.max(y1, Math.min(1, Number(roi[3] || y1)));
+  const x1 = Math.max(0, Math.min(1, Number(effectiveRoi[0] || 0)));
+  const y1 = Math.max(0, Math.min(1, Number(effectiveRoi[1] || 0)));
+  const x2 = Math.max(x1, Math.min(1, Number(effectiveRoi[2] || x1)));
+  const y2 = Math.max(y1, Math.min(1, Number(effectiveRoi[3] || y1)));
   overlay.style.display = 'block';
     overlay.style.left = `${{rect.offsetX + x1 * rect.width}}px`;
     overlay.style.top = `${{rect.offsetY + y1 * rect.height}}px`;
     overlay.style.width = `${{Math.max(0, (x2 - x1) * rect.width)}}px`;
     overlay.style.height = `${{Math.max(0, (y2 - y1) * rect.height)}}px`;
+    // Green border = auto-detected, blue border = manual ROI
+    overlay.style.borderColor = isManual ? 'var(--accent)' : '#4caf50';
 }}
 function syncClassPreprocessRoiInputs(roi) {{
   if (!Array.isArray(roi) || roi.length !== 4) return;
@@ -3495,7 +3505,7 @@ function renderClassPreprocessModal() {{
                   ? `<img id="classPreprocessImage" src="${{escapeHtml(previewSrc(sample))}}" alt="Raw sample"/>`
                   : `<div class="preview-empty">This class has no samples yet.</div>`
               }}
-                <div class="roi-overlay" id="classPreprocessOverlay" style="display:${{roi && cfg.mode === 'manual_roi' ? 'block' : 'none'}};"></div>
+                <div class="roi-overlay" id="classPreprocessOverlay" style="display:${{(roi && cfg.mode === 'manual_roi') || classPreprocessAutoCrop ? 'block' : 'none'}};"></div>
             </div>
           </div>
           <div class="class-preprocess-visual-pane">

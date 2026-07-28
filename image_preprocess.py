@@ -660,7 +660,8 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_dark_thresh: int = 0,
-                               bg_lum_thresh: int = 100) -> np.ndarray:
+                               bg_lum_thresh: int = 100,
+                               return_crop_box: bool = False):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -694,11 +695,15 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y1 = max(0, min(gray.shape[0] - 1, y1))
         x2 = max(x1 + 1, min(gray.shape[1], x2))
         y2 = max(y1 + 1, min(gray.shape[0], y2))
-        gray = gray[y1:y2, x1:x2]
     else:
         # _focus_bbox: dark-object + edge detection in center search window
         x1, y1, x2, y2 = _focus_bbox(gray)
-        gray = gray[y1:y2, x1:x2]
+
+    # Save normalized crop box for ROI overlay display
+    h_orig, w_orig = gray.shape[:2]
+    crop_norm = (x1 / w_orig, y1 / h_orig, x2 / w_orig, y2 / h_orig)
+
+    gray = gray[y1:y2, x1:x2]
 
     # Resize
     img = Image.fromarray(gray, mode="L")
@@ -708,7 +713,10 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     out_arr = np.asarray(img, dtype=np.uint8)
     out = _contrast_stretch_u8(out_arr)
     result = out.astype(np.float32) / 255.0
-    return np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
+    image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
+    if return_crop_box:
+        return image, crop_norm
+    return image
 
 
 def preprocess_manual_roi_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale", manual_roi: Any = None) -> np.ndarray:
