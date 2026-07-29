@@ -6403,6 +6403,8 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </body>
 </html>
         ''',
+        height=1600,
+        scrolling=False,
     )
 
 
@@ -7173,7 +7175,7 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
         start_url = f"{base}/start?session={q_sess}&source={q_source}&class={q_class}"
         stop_url = f"{base}/stop?session={q_sess}"
         html = make_hold_button_html("Hold to Record", start_url=start_url, stop_url=stop_url)
-        st.components.v1.html(html)
+        st.components.v1.html(html, height=88)
         st.markdown("</div>", unsafe_allow_html=True)
     with capture_right:
         st.markdown('<div class="tm-capture-side-head">Samples</div>', unsafe_allow_html=True)
