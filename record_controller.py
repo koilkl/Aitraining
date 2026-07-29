@@ -42,6 +42,7 @@ class SessionConfig:
     serial_port: str
     serial_baud: int
     serial_sync: str
+    serial_frame_side: int
     webcam_index: int
     fps: float
     crop_box: Optional[Tuple[int, int, int, int]]
@@ -111,6 +112,7 @@ class RecordController:
         serial_port: Optional[str] = None,
         serial_baud: Optional[int] = None,
         serial_sync: Optional[str] = None,
+        serial_frame_side: Optional[int] = None,
     ) -> SessionConfig:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -122,6 +124,7 @@ class RecordController:
                 serial_port=str(cfg.serial_port if serial_port is None else serial_port),
                 serial_baud=int(cfg.serial_baud if serial_baud is None else serial_baud),
                 serial_sync=str(cfg.serial_sync if serial_sync is None else serial_sync),
+                serial_frame_side=int(cfg.serial_frame_side if serial_frame_side is None else serial_frame_side),
             )
             self._configs[session_id] = updated
             return updated
@@ -149,17 +152,20 @@ class RecordController:
         img = Image.fromarray(frame)
         return _to_png_bytes(img)
 
-    def preview_serial_png(self, port: str, baud: int, sync_header: str = "") -> Optional[bytes]:
+    def preview_serial_png(self, port: str, baud: int, sync_header: str = "", frame_side: int = 96) -> Optional[bytes]:
         if not port:
             return None
         try:
-            reader = SerialFrameReader(port=port, baud=int(baud), sync_header=sync_header)
+            reader = SerialFrameReader(port=port, baud=int(baud), sync_header=sync_header, frame_side=int(frame_side))
             reader.open()
             try:
                 raw = reader.read_frame(timeout_s=2.0)
             finally:
                 reader.close()
-            return _raw96_preview_png(raw)
+            side = int(frame_side)
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side))
+            img = Image.fromarray(arr, mode="L")
+            return _to_png_bytes(img)
         except Exception:
             return None
 
@@ -304,15 +310,21 @@ class RecordController:
             serial_port_raw = (qs.get("serial_port") or [None])[0]
             serial_baud_raw = (qs.get("serial_baud") or [None])[0]
             serial_sync_raw = (qs.get("serial_sync") or [None])[0]
+            serial_frame_side_raw = (qs.get("serial_frame_side") or [None])[0]
             try:
                 if serial_sync_raw not in (None, ""):
                     parse_sync_header(serial_sync_raw)
+                if serial_frame_side_raw not in (None, ""):
+                    side = int(float(serial_frame_side_raw))
+                    if side < 8 or side > 512:
+                        raise ValueError("invalid serial_frame_side")
                 cfg = self.update_config(
                     session_id,
                     webcam_index=None if webcam_index_raw in (None, "") else int(float(webcam_index_raw)),
                     serial_port=serial_port_raw,
                     serial_baud=None if serial_baud_raw in (None, "") else int(float(serial_baud_raw)),
                     serial_sync=None if serial_sync_raw is None else str(serial_sync_raw),
+                    serial_frame_side=None if serial_frame_side_raw in (None, "") else int(float(serial_frame_side_raw)),
                 )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
@@ -325,6 +337,7 @@ class RecordController:
                     "serial_port": str(cfg.serial_port),
                     "serial_baud": str(int(cfg.serial_baud)),
                     "serial_sync": str(cfg.serial_sync),
+                    "serial_frame_side": str(int(cfg.serial_frame_side)),
                 },
                 cors=True,
             )
@@ -2078,11 +2091,11 @@ class RecordController:
             return
         last_error = ""
         while self._live_running(key):
-            reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+            reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side))
             try:
                 reader.open()
                 raw = reader.read_frame(timeout_s=1.5)
-                capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box)
+                capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
                 self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
                 last_error = ""
             except Exception as e:
@@ -2145,7 +2158,7 @@ class RecordController:
         if cfg is None:
             return None
         if source == "device":
-            return self.preview_serial_png(cfg.serial_port, int(cfg.serial_baud), str(cfg.serial_sync))
+            return self.preview_serial_png(cfg.serial_port, int(cfg.serial_baud), str(cfg.serial_sync), frame_side=int(cfg.serial_frame_side))
         if source == "webcam":
             return self.preview_webcam_png(int(cfg.webcam_index))
         return None
@@ -2156,13 +2169,13 @@ class RecordController:
             return None
         if source == "device":
             try:
-                reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+                reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side))
                 reader.open()
                 try:
                     raw = reader.read_frame(timeout_s=2.0)
                 finally:
                     reader.close()
-                return _raw96_to_png(raw, crop_box=cfg.crop_box)
+                return _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
             except Exception:
                 return None
         if source == "webcam":
@@ -2194,12 +2207,12 @@ class RecordController:
             return self._active.get(session_id, {}).get("recording") == "1"
 
     def _record_serial(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
-        reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync)
+        reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side))
         try:
             reader.open()
             while self._is_recording(session_id):
                 raw = reader.read_frame(timeout_s=2.0)
-                png = _raw96_to_png(raw, crop_box=cfg.crop_box)
+                png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
                 p = _save_png(cfg.dataset_root, class_name, png)
                 with self._lock:
                     cur = self._active.get(session_id)
@@ -2386,24 +2399,28 @@ def _open_working_camera(preferred_index: int, max_probe_index: int = 3):
     return None, None
 
 
-def _raw96_to_png(raw: bytes, crop_box: Optional[Tuple[int, int, int, int]]) -> bytes:
+def _raw96_to_png(
+    raw: bytes,
+    crop_box: Optional[Tuple[int, int, int, int]],
+    *,
+    frame_side: int = 96,
+    out_side: int = 96,
+) -> bytes:
     n = len(raw)
-    if n == 96 * 96 * 3:
-        # RGB frame from IMX219_RGB_Serial example
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96, 3))
+    side = int(frame_side)
+    out_side = int(out_side)
+    if n == side * side * 3:
+        # RGB frame from data-collection sketch
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side, 3))
         img = Image.fromarray(arr, mode="RGB")
-        if crop_box is not None:
-            x1, y1, x2, y2 = crop_box
-            img = img.crop((x1, y1, x2, y2))
-        img = img.resize((96, 96))
     else:
-        # Grayscale / B-G frame (legacy)
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
+        # Grayscale / B-G frame (inference sketch)
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side))
         img = Image.fromarray(arr, mode="L")
-        if crop_box is not None:
-            x1, y1, x2, y2 = crop_box
-            img = img.crop((x1, y1, x2, y2))
-        img = img.resize((96, 96))
+    if crop_box is not None:
+        x1, y1, x2, y2 = crop_box
+        img = img.crop((x1, y1, x2, y2))
+    img = img.resize((out_side, out_side))
     return _to_png_bytes(img)
 
 

@@ -11,9 +11,7 @@ import glob
 
 
 HEADER = bytes([0xAA, 0x55, 0xAA])  # default frame sync header
-FRAME_W = 96
-FRAME_H = 96
-FRAME_SIZE = FRAME_W * FRAME_H
+DEFAULT_FRAME_SIDE = 96
 
 
 @dataclass(frozen=True)
@@ -23,10 +21,16 @@ class SerialPortInfo:
 
 
 class SerialFrameReader:
-    def __init__(self, port: str, baud: int, sync_header: bytes | str | None = None) -> None:
+    def __init__(self, port: str, baud: int, sync_header: bytes | str | None = None,
+                 frame_side: int = DEFAULT_FRAME_SIDE) -> None:
         self._port = port
         self._baud = int(baud)
         self._header = parse_sync_header(sync_header)
+        side = int(frame_side)
+        if side < 8 or side > 512:
+            raise ValueError("Invalid frame_side.")
+        self._frame_side = side
+        self._frame_size = int(side) * int(side)
         self._ser = None
         self._buf = bytearray()
 
@@ -72,7 +76,7 @@ class SerialFrameReader:
                         self._buf = self._buf[-keep:] if keep else bytearray()
                     break
                 after = idx + header_len
-                need = after + FRAME_SIZE
+                need = after + self._frame_size
                 if len(self._buf) < need:
                     if idx > 0:
                         del self._buf[:idx]
@@ -125,14 +129,16 @@ def read_frame_png_from_serial(
     baud: int,
     sync_header: bytes | str | None = None,
     timeout_s: float = 3.0,
+    frame_side: int = DEFAULT_FRAME_SIDE,
 ) -> bytes:
-    reader = SerialFrameReader(port=port, baud=baud, sync_header=sync_header)
+    reader = SerialFrameReader(port=port, baud=baud, sync_header=sync_header, frame_side=frame_side)
     reader.open()
     try:
         frame = reader.read_frame(timeout_s=timeout_s)
     finally:
         reader.close()
-    arr = np.frombuffer(frame, dtype=np.uint8).reshape((FRAME_H, FRAME_W))
+    side = int(frame_side)
+    arr = np.frombuffer(frame, dtype=np.uint8).reshape((side, side))
     img = Image.fromarray(arr, mode="L")
     return _to_png_bytes(img)
 

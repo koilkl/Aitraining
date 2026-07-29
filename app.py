@@ -317,6 +317,8 @@ def _init_session() -> None:
         st.session_state.tm_serial_baud = 115200
     if "tm_serial_sync" not in st.session_state:
         st.session_state.tm_serial_sync = "AA 55 AA"
+    if "tm_serial_frame_side" not in st.session_state:
+        st.session_state.tm_serial_frame_side = 96
     if "tm_last_device_frame" not in st.session_state:
         st.session_state.tm_last_device_frame = None
     if "tm_capture_open" not in st.session_state:
@@ -916,6 +918,7 @@ def _render_new_project() -> None:
                         serial_port=st.session_state.tm_serial_port,
                         serial_baud=int(st.session_state.tm_serial_baud),
                         serial_sync=str(st.session_state.tm_serial_sync),
+                        serial_frame_side=int(st.session_state.tm_serial_frame_side),
                         webcam_index=int(st.session_state.tm_webcam_index),
                         fps=float(st.session_state.tm_record_fps),
                         crop_box=st.session_state.tm_record_crop_box,
@@ -1216,6 +1219,7 @@ def _render_tm_old_frontend_html(
     current_serial_port: str,
     current_serial_baud: int,
     current_serial_sync: str,
+    current_serial_frame_side: int,
     webcam_options: List[Dict[str, str]],
     current_webcam_index: int,
     sample_previews: Dict[str, List[Dict[str, str]]],
@@ -1237,12 +1241,14 @@ def _render_tm_old_frontend_html(
         "current_serial_port": str(current_serial_port or ""),
         "current_serial_baud": int(current_serial_baud),
         "current_serial_sync": str(current_serial_sync or "AA 55 AA"),
+        "current_serial_frame_side": int(current_serial_frame_side),
         "webcam_options": webcam_options,
         "current_webcam_index": int(current_webcam_index),
         "sample_previews": sample_previews,
         "initial_open_source_class": str(initial_open_source_class or ""),
         "initial_open_source_kind": str(initial_open_source_kind or ""),
         "train_cfg": {
+            "img_size": int(train_cfg.img_size),
             "batch_size": int(train_cfg.batch_size),
             "epochs": int(train_cfg.epochs),
             "validation_split": float(train_cfg.validation_split),
@@ -2909,6 +2915,7 @@ let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
 let currentSerialSync = String(STATE.current_serial_sync || 'AA 55 AA');
+let currentSerialFrameSide = Number(STATE.current_serial_frame_side || 96);
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
@@ -3009,6 +3016,7 @@ function restoreTrainCfgFromStorage() {{
       if (!isFinite(n)) return fallback;
       return Math.max(lo, Math.min(hi, n));
     }};
+    if ('img_size' in data) next.img_size = clampInt(data.img_size, 32, 224, nullish(prev.img_size, 96));
     if ('batch_size' in data) next.batch_size = clampInt(data.batch_size, 1, 512, nullish(prev.batch_size, 32));
     if ('epochs' in data) next.epochs = clampInt(data.epochs, 1, 1000, nullish(prev.epochs, 20));
     if ('validation_split' in data) next.validation_split = clampFloat(data.validation_split, 0, 0.5, nullish(prev.validation_split, 0.25));
@@ -4987,10 +4995,14 @@ function buildSerialBaudOptions(selected) {{
   const values = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
   return values.map((baud) => `<option value="${{baud}}"${{Number(selected) === baud ? ' selected' : ''}}>${{baud}}</option>`).join('');
 }}
+function buildSerialFrameSideOptions(selected) {{
+  const values = [96, 160];
+  return values.map((side) => `<option value="${{side}}"${{Number(selected) === side ? ' selected' : ''}}>${{side}}×${{side}}</option>`).join('');
+}}
 function deviceHelpText() {{
   const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
   if (!ports.length) return 'No compatible serial UART device is currently detected. Connect the board or install the required USB serial driver first.';
-  return 'Choose the serial port connected to your device before capturing. Sync is the hex frame header used to find the start of each serial image packet, for example AA 55 AA.';
+  return 'Choose the serial port connected to your device before capturing. Image Size must match the firmware output exactly (e.g. 96×96 or 160×160). Sync is the hex frame header used to find the start of each serial image packet, for example AA 55 AA.';
 }}
 function webcamHelpText() {{
   return 'Use the settings button (⚙) to choose the camera source for live capture.';
@@ -5001,6 +5013,10 @@ function buildSourceSettingsMarkup(className) {{
     return `
       <div class="source-settings-panel" id="sourceSettingsPanel-${{cssSafe(className)}}">
         <div class="source-settings-grid">
+          <label>
+            Image Size
+            <select id="sourceFrameSide-${{cssSafe(className)}}">${{buildSerialFrameSideOptions(currentSerialFrameSide)}}</select>
+          </label>
           <label>
             Baud Rate
             <select id="sourceBaud-${{cssSafe(className)}}">${{buildSerialBaudOptions(currentSerialBaud)}}</select>
@@ -5097,6 +5113,35 @@ async function changeSerialSync(className, value) {{
     syncSourceActionButtons(className);
   }}
 }}
+async function changeSerialFrameSide(className, value) {{
+  const nextSide = Number(value || currentSerialFrameSide || 96);
+  currentSerialFrameSide = nextSide;
+  STATE.current_serial_frame_side = currentSerialFrameSide;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'device';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_frame_side=${{encodeURIComponent(String(currentSerialFrameSide))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update device image size.');
+    currentSerialFrameSide = Number(data.serial_frame_side || currentSerialFrameSide || 96);
+    STATE.current_serial_frame_side = currentSerialFrameSide;
+    if (openSourceClass === className && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
 function toggleSourceSettings(className) {{
   if (openSourceClass !== className || !openSourceKind || openSourceKind === 'upload') return;
   sourceSettingsOpen = !sourceSettingsOpen;
@@ -5106,8 +5151,10 @@ async function applySourceSettings(className) {{
   if (openSourceClass !== className) return;
   try {{
     if (openSourceKind === 'device') {{
+      const sideEl = document.getElementById(`sourceFrameSide-${{cssSafe(className)}}`);
       const baudEl = document.getElementById(`sourceBaud-${{cssSafe(className)}}`);
       const syncEl = document.getElementById(`sourceSync-${{cssSafe(className)}}`);
+      await changeSerialFrameSide(className, sideEl ? sideEl.value : String(currentSerialFrameSide));
       await changeSerialBaud(className, baudEl ? baudEl.value : String(currentSerialBaud));
       await changeSerialSync(className, syncEl ? syncEl.value : String(currentSerialSync));
     }} else if (openSourceKind === 'webcam') {{
@@ -5444,6 +5491,25 @@ async function setSerialSyncGlobal(value) {{
     toast(String(err && err.message ? err.message : err));
   }}
 }}
+async function setSerialFrameSideGlobal(value) {{
+  currentSerialFrameSide = Number(value || currentSerialFrameSide || 96);
+  STATE.current_serial_frame_side = currentSerialFrameSide;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_frame_side=${{encodeURIComponent(String(currentSerialFrameSide))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update device image size.');
+    currentSerialFrameSide = Number(data.serial_frame_side || currentSerialFrameSide || 96);
+    STATE.current_serial_frame_side = currentSerialFrameSide;
+    if (openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 function buildPreviewSettingsMarkup() {{
   if (!previewSettingsOpen || !STATE.export_enabled) return '';
   const exportFields = `
@@ -5493,6 +5559,10 @@ function buildPreviewSettingsMarkup() {{
           <label>
             Device Port
             <select id="previewDevicePort">${{buildDeviceOptions(currentSerialPort)}}</select>
+          </label>
+          <label>
+            Image Size
+            <select id="previewDeviceFrameSide">${{buildSerialFrameSideOptions(currentSerialFrameSide)}}</select>
           </label>
           <label>
             Baud Rate
@@ -5580,9 +5650,11 @@ function renderPreviewSettings() {{
       persistExportSettings();
       if (previewSource === 'device') {{
         const portEl = document.getElementById('previewDevicePort');
+        const sideEl = document.getElementById('previewDeviceFrameSide');
         const baudEl = document.getElementById('previewDeviceBaud');
         const syncEl = document.getElementById('previewDeviceSync');
         await setDevicePortGlobal(portEl ? portEl.value : currentSerialPort);
+        await setSerialFrameSideGlobal(sideEl ? sideEl.value : String(currentSerialFrameSide));
         await setSerialBaudGlobal(baudEl ? baudEl.value : String(currentSerialBaud));
         await setSerialSyncGlobal(syncEl ? syncEl.value : String(currentSerialSync));
       }} else if (previewSource === 'webcam') {{
@@ -6436,6 +6508,7 @@ def _render_image_project() -> None:
             serial_port=st.session_state.tm_serial_port,
             serial_baud=int(st.session_state.tm_serial_baud),
             serial_sync=str(st.session_state.tm_serial_sync),
+            serial_frame_side=int(st.session_state.tm_serial_frame_side),
             webcam_index=int(st.session_state.tm_webcam_index),
             fps=float(st.session_state.tm_record_fps),
             crop_box=st.session_state.tm_record_crop_box,
@@ -6667,6 +6740,7 @@ def _render_image_project() -> None:
         current_serial_port=str(st.session_state.tm_serial_port),
         current_serial_baud=int(st.session_state.tm_serial_baud),
         current_serial_sync=str(st.session_state.tm_serial_sync),
+        current_serial_frame_side=int(st.session_state.tm_serial_frame_side),
         webcam_options=webcam_options,
         current_webcam_index=int(st.session_state.tm_webcam_index),
         sample_previews=sample_previews,
@@ -6920,6 +6994,7 @@ def _render_tm_class_panel() -> None:
             serial_port=st.session_state.tm_serial_port,
             serial_baud=int(st.session_state.tm_serial_baud),
             serial_sync=str(st.session_state.tm_serial_sync),
+            serial_frame_side=int(st.session_state.tm_serial_frame_side),
             webcam_index=int(st.session_state.tm_webcam_index),
             fps=float(st.session_state.tm_record_fps),
             crop_box=st.session_state.tm_record_crop_box,
