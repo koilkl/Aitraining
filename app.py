@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
-
+import streamlit.components.v1 as components
 
 from camera_permission import ensure_camera_access, get_camera_access_status
 from trainer import TrainConfig, new_run_dir, train_and_export
@@ -1039,7 +1039,7 @@ def _tm_clear_query_params() -> None:
 
 
 def _tm_render_page_scroll_reset() -> None:
-    st.html(
+    components.html(
         '''
         <script>
         function resetFrameBox(node) {
@@ -1076,13 +1076,13 @@ def _tm_render_page_scroll_reset() -> None:
         } catch (e) {}
         </script>
         ''',
-        width=0,
+        height=0,
     )
 
 
 def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
     safe_reason = html_escape(str(reason or "image-project-mount"))
-    st.html(
+    components.html(
         f'''
         <script>
         (function() {{
@@ -1112,7 +1112,7 @@ def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
         }})();
         </script>
         ''',
-        width=0,
+        height=0,
     )
 
 
@@ -1276,7 +1276,7 @@ def _render_tm_old_frontend_html(
     payload["debug_server_url"] = debug_server_url
     payload["debug_session_id"] = debug_session_id
     data = _json.dumps(payload)
-    st.html(
+    components.html(
         f'''
 <!doctype html>
 <html>
@@ -6500,7 +6500,8 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </body>
 </html>
         ''',
-        unsafe_allow_javascript=True,
+        height=1600,
+        scrolling=False,
     )
 
 
@@ -7274,7 +7275,7 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
         start_url = f"{base}/start?session={q_sess}&source={q_source}&class={q_class}"
         stop_url = f"{base}/stop?session={q_sess}"
         html = make_hold_button_html("Hold to Record", start_url=start_url, stop_url=stop_url)
-        st.html(html)
+        components.html(html, height=88)
         st.markdown("</div>", unsafe_allow_html=True)
     with capture_right:
         st.markdown('<div class="tm-capture-side-head">Samples</div>', unsafe_allow_html=True)
