@@ -1073,7 +1073,6 @@ def _tm_render_page_scroll_reset() -> None:
         } catch (e) {}
         </script>
         ''',
-        height=0,
         width=0,
     )
 
@@ -1110,7 +1109,6 @@ def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
         }})();
         </script>
         ''',
-        height=0,
         width=0,
     )
 
@@ -6405,7 +6403,6 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </body>
 </html>
         ''',
-        height=1600,
         scrolling=False,
     )
 
