@@ -1039,7 +1039,7 @@ def _tm_clear_query_params() -> None:
 
 
 def _tm_render_page_scroll_reset() -> None:
-    st.iframe(srcdoc=
+    st.html(
         '''
         <script>
         function resetFrameBox(node) {
@@ -1082,7 +1082,7 @@ def _tm_render_page_scroll_reset() -> None:
 
 def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
     safe_reason = html_escape(str(reason or "image-project-mount"))
-    st.iframe(srcdoc=
+    st.html(
         f'''
         <script>
         (function() {{
@@ -1276,7 +1276,7 @@ def _render_tm_old_frontend_html(
     payload["debug_server_url"] = debug_server_url
     payload["debug_session_id"] = debug_session_id
     data = _json.dumps(payload)
-    st.iframe(srcdoc=
+    st.html(
         f'''
 <!doctype html>
 <html>
@@ -6500,8 +6500,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </body>
 </html>
         ''',
-        height=1600,
-        scrolling=False,
+        unsafe_allow_javascript=True,
     )
 
 
@@ -7275,7 +7274,7 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
         start_url = f"{base}/start?session={q_sess}&source={q_source}&class={q_class}"
         stop_url = f"{base}/stop?session={q_sess}"
         html = make_hold_button_html("Hold to Record", start_url=start_url, stop_url=stop_url)
-        st.iframe(srcdoc=html, height=88)
+        st.html(html)
         st.markdown("</div>", unsafe_allow_html=True)
     with capture_right:
         st.markdown('<div class="tm-capture-side-head">Samples</div>', unsafe_allow_html=True)
