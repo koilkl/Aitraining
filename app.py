@@ -3637,9 +3637,8 @@ function renderClassPreprocessModal() {{
     let v = Number(lumNum.value); if (!isFinite(v) || v < 50) v = 100; else if (v > 255) v = 255;
     lumSlider.value = v; applyThresholds();
   }};
-  }};
 
-  // WB slider + number sync
+
 
   host.querySelectorAll('[data-preprocess-sample]').forEach((btn) => {{
     btn.onclick = () => {{
