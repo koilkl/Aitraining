@@ -2559,6 +2559,7 @@ def _render_tm_old_frontend_html(
         </div>
         <div class="preview-controls">
           <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
+          <label class="preview-toggle"><input id="previewRoiToggle" type="checkbox"/><span>ROI</span></label>
           <div class="preview-mode-tabs" id="previewModeTabs">
             <button class="preview-mode-tab" type="button" data-preview-mode="auto_by_label">Auto</button>
           </div>
@@ -2919,6 +2920,7 @@ let currentSerialFrameSide = Number(STATE.current_serial_frame_side || 96);
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
+let previewShowRoi = false;
 let previewUploadImageSrc = '';
 let previewUploadImageB64 = '';
 let previewUploadFilename = '';
@@ -3737,6 +3739,7 @@ function restorePreviewState() {{
     if (['auto_by_label', 'sign', 'junction', 'manual_roi', 'none'].includes(String(data.preprocess || ''))) {{
       previewPreprocessMode = String(data.preprocess);
     }}
+    previewShowRoi = !!data.showRoi;
   }} catch (e) {{}}
 }}
 function persistPreviewState() {{
@@ -3744,7 +3747,8 @@ function persistPreviewState() {{
     window.localStorage.setItem(previewStorageKey, JSON.stringify({{
       inputOn: !!previewInputOn,
       source: String(previewSource || 'webcam'),
-      preprocess: String(previewPreprocessMode || 'auto_by_label')
+      preprocess: String(previewPreprocessMode || 'auto_by_label'),
+      showRoi: !!previewShowRoi
     }}));
   }} catch (e) {{}}
 }}
@@ -5340,7 +5344,9 @@ async function refreshPreviewPrediction(token) {{
     const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&_ts=${{Date.now()}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
-    const src = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+    const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+    const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
+    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
     if (pane) {{
       if (!pane.dataset.ready) {{
         pane.innerHTML = `<img id="${{imgId}}" alt="Preview"/>`;
@@ -5357,7 +5363,8 @@ async function refreshPreviewPrediction(token) {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      note.textContent = top ? `Top: ${{top}} (${{p}}%)` : '';
+      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      note.textContent = top ? `Top: ${{top}} (${{p}}%)${{roiMsg}}` : roiMsg.trim();
     }}
   }} catch (err) {{
     if (note) note.textContent = String(err && err.message ? err.message : err);
@@ -5388,7 +5395,9 @@ async function runPreviewUploadPrediction() {{
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
-    const src = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
+    const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
+    const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
+    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
     if (pane) {{
       pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
       pane.dataset.ready = '1';
@@ -5397,7 +5406,8 @@ async function runPreviewUploadPrediction() {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)` : `Upload: ${{String(previewUploadFilename || 'image')}}`;
+      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)${{roiMsg}}` : `Upload: ${{String(previewUploadFilename || 'image')}}${{roiMsg}}`;
     }}
   }} catch (err) {{
     if (note) note.textContent = String(err && err.message ? err.message : err);
@@ -5689,9 +5699,10 @@ function renderPreviewCard() {{
   const note = document.getElementById('previewNote');
   const output = document.getElementById('previewOutput');
   const toggle = document.getElementById('previewInputToggle');
+  const roiToggle = document.getElementById('previewRoiToggle');
   const settingsBtn = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
-  if (!pane || !note || !output || !toggle || !settingsBtn) return;
+  if (!pane || !note || !output || !toggle || !settingsBtn || !roiToggle) return;
   if (!STATE.export_enabled) {{
     stopPreviewPredictLoop();
     previewSettingsOpen = false;
@@ -5702,6 +5713,8 @@ function renderPreviewCard() {{
     note.textContent = 'You must train a model on the left before you can preview it here.';
     toggle.checked = false;
     toggle.disabled = true;
+    roiToggle.checked = false;
+    roiToggle.disabled = true;
     settingsBtn.disabled = true;
     modeTabs.forEach((btn) => {{
       btn.disabled = true;
@@ -5710,6 +5723,7 @@ function renderPreviewCard() {{
     return;
   }}
   toggle.disabled = false;
+  roiToggle.disabled = false;
   settingsBtn.disabled = false;
   modeTabs.forEach((btn) => {{
     const active = String(btn.getAttribute('data-preview-mode') || '') === String(previewPreprocessMode || 'auto_by_label');
@@ -5717,6 +5731,7 @@ function renderPreviewCard() {{
     btn.classList.toggle('active', active);
   }});
   toggle.checked = !!previewInputOn;
+  roiToggle.checked = !!previewShowRoi;
   renderPreviewSettings();
   if (!pane.dataset.ready) {{
     const src = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
@@ -5738,15 +5753,25 @@ function renderPreviewCard() {{
 }}
 function bindPreviewControls() {{
   const toggle = document.getElementById('previewInputToggle');
+  const roiToggle = document.getElementById('previewRoiToggle');
   const settings = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
-  if (!toggle || !settings) return;
+  if (!toggle || !roiToggle || !settings) return;
   if (toggle.dataset.bound === '1') return;
   toggle.dataset.bound = '1';
+  roiToggle.dataset.bound = '1';
   toggle.onchange = () => {{
     previewInputOn = !!toggle.checked;
     persistPreviewState();
     renderPreviewCard();
+  }};
+  roiToggle.onchange = () => {{
+    previewShowRoi = !!roiToggle.checked;
+    persistPreviewState();
+    if (previewInputOn) {{
+      if (previewPredictTimer) stopPreviewPredictLoop();
+      startPreviewPredictLoop();
+    }}
   }};
   settings.onclick = () => {{
     previewSettingsOpen = !previewSettingsOpen;

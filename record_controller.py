@@ -379,6 +379,8 @@ class RecordController:
                     "top_label": str(pred.get("top_label") or ""),
                     "top_prob": float(pred.get("top_prob") or 0.0),
                     "image_b64": base64.b64encode(png).decode("ascii"),
+                    "processed_image_b64": str(pred.get("processed_image_b64") or ""),
+                    "processed_variant": str(pred.get("processed_variant") or ""),
                 },
                 cors=True,
             )
@@ -1803,11 +1805,18 @@ class RecordController:
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
         top_i = int(np.argmax(probs)) if probs.size else 0
+        # Build a displayable preview of the after-processed model input
+        processed_variant = next(iter(prepared.keys()), "")
+        processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
+        processed_img = _model_input_array_to_preview_image(processed_arr)
+        processed_png = _to_png_bytes(processed_img)
         return {
             "labels": labels,
             "probs": [float(x) for x in probs.tolist()],
             "top_label": str(labels[top_i]) if 0 <= top_i < len(labels) else "",
             "top_prob": float(probs[top_i]) if probs.size else 0.0,
+            "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
+            "processed_variant": str(processed_variant or ""),
         }
 
     def _start_train(self, session_id: str, cfg: Any) -> None:
@@ -2441,6 +2450,32 @@ def _to_png_bytes(img: Image.Image) -> bytes:
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     return bio.getvalue()
+
+
+def _model_input_array_to_preview_image(arr: np.ndarray) -> Image.Image:
+    """Convert a model-input array (float32/uint8, any range) to a displayable Image."""
+    vis = np.asarray(arr)
+    if vis.ndim == 3 and vis.shape[-1] == 1:
+        vis = vis[:, :, 0]
+    if vis.dtype == np.uint8:
+        u8 = vis
+    else:
+        vis = vis.astype(np.float32)
+        if vis.size == 0:
+            u8 = np.zeros((1, 1), dtype=np.uint8)
+        else:
+            vmin = float(np.min(vis))
+            vmax = float(np.max(vis))
+            if vmin >= 0.0 and vmax <= 1.0 + 1e-6:
+                u8 = np.clip(np.round(vis * 255.0), 0, 255).astype(np.uint8)
+            elif vmin >= -1.0 - 1e-6 and vmax <= 1.0 + 1e-6:
+                u8 = np.clip(np.round((vis + 1.0) * 127.5), 0, 255).astype(np.uint8)
+            else:
+                span = max(vmax - vmin, 1e-6)
+                u8 = np.clip(np.round((vis - vmin) * (255.0 / span)), 0, 255).astype(np.uint8)
+    if u8.ndim == 2:
+        return Image.fromarray(u8, mode="L")
+    return Image.fromarray(u8[:, :, :3], mode="RGB")
 
 
 def make_hold_button_html(label: str, start_url: str, stop_url: str) -> str:
