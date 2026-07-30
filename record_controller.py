@@ -2139,7 +2139,12 @@ class RecordController:
             reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
             try:
                 reader.open()
-                raw = reader.read_frame(timeout_s=1.5)
+                # Scale timeout with frame size (10 bits/byte at 8N1, ×2.5 margin, floor 1.5 s).
+                frame_bytes = int(cfg.serial_frame_side) * int(cfg.serial_frame_side) * int(cfg.serial_channels)
+                baud = int(cfg.serial_baud) if int(cfg.serial_baud) > 0 else 921600
+                xfer_s = frame_bytes * 10.0 / float(baud)
+                timeout = max(1.5, xfer_s * 2.5)
+                raw = reader.read_frame(timeout_s=timeout)
                 capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
                 self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
                 last_error = ""

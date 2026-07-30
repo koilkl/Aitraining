@@ -96,8 +96,9 @@ class SerialFrameReader:
                         continue
                 frame = bytes(self._buf[after:need])
                 del self._buf[:need]
+                print(f"[Serial] frame ok: {len(frame)} bytes (expecting {self._frame_size}), buf_remaining={len(self._buf)}")
                 return frame
-        raise TimeoutError("Timeout waiting for frame header")
+        raise TimeoutError(f"Timeout waiting for frame header (need {self._frame_size} bytes, buf has {len(self._buf)}, waited {timeout_s:.1f}s)")
 
 
 def list_serial_ports() -> List[SerialPortInfo]:
