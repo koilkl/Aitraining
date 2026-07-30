@@ -1588,6 +1588,37 @@ def _render_tm_old_frontend_html(
       font-size: 13px;
       line-height: 1.45;
     }}
+    .preview-thresh-bar {{
+      display: flex;
+      gap: 12px;
+      margin-top: 8px;
+      padding: 6px 8px;
+      background: var(--surface-soft);
+      border-radius: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .preview-thresh-bar label {{
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: default;
+    }}
+    .preview-thresh-bar input[type="range"] {{
+      width: 72px;
+      accent-color: var(--blue);
+    }}
+    .preview-thresh-bar input[type="number"] {{
+      width: 48px;
+      padding: 2px 4px;
+      border: 1px solid var(--input-border);
+      border-radius: 4px;
+      background: var(--input-bg);
+      color: var(--text);
+      font-size: 12px;
+    }}
     .preview-output {{
       margin-top: 12px;
       display: grid;
@@ -2582,6 +2613,10 @@ def _render_tm_old_frontend_html(
         </div>
         <div id="previewSettingsHost"></div>
         <div class="preview-pane" id="previewPane"></div>
+        <div class="preview-thresh-bar" id="previewThreshBar">
+          <label title="Min G brightness for sign (0-255). Darker pixels → shadow → white.">Dark <input id="previewDarkSlider" type="range" min="0" max="100" value="0" step="1"/><input id="previewDarkNum" type="number" min="0" max="255" value="0"/></label>
+          <label title="Max G brightness for sign (50-255). Brighter pixels → background → white.">Lum <input id="previewLumSlider" type="range" min="50" max="255" value="100" step="1"/><input id="previewLumNum" type="number" min="50" max="255" value="100"/></label>
+        </div>
         <div class="preview-output" id="previewOutput"></div>
         <div class="note" id="previewNote"></div>
       </div>
@@ -5805,6 +5840,49 @@ function renderTrainStatus() {{
   if (!el) return;
   el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
 }}
+function bindPreviewThreshBar() {{
+  const darkSlider = document.getElementById('previewDarkSlider');
+  const darkNum = document.getElementById('previewDarkNum');
+  const lumSlider = document.getElementById('previewLumSlider');
+  const lumNum = document.getElementById('previewLumNum');
+  if (!darkSlider || !lumSlider) return;
+  if (darkSlider.dataset.bound === '1') {{
+    darkSlider.value = String(previewDarkThresh || 0);
+    darkNum.value = String(previewDarkThresh || 0);
+    lumSlider.value = String(previewLumThresh || 100);
+    lumNum.value = String(previewLumThresh || 100);
+    return;
+  }}
+  darkSlider.dataset.bound = '1';
+  const syncDark = (src) => {{
+    const v = Math.max(0, Math.min(255, Number(src.value || 0)));
+    if (previewDarkThresh !== v) {{
+      previewDarkThresh = v;
+      persistPreviewState();
+      if (previewInputOn) {{ if (previewPredictTimer) stopPreviewPredictLoop(); startPreviewPredictLoop(); }}
+    }}
+    darkSlider.value = String(v);
+    darkNum.value = String(v);
+  }};
+  const syncLum = (src) => {{
+    const v = Math.max(50, Math.min(255, Number(src.value || 100)));
+    if (previewLumThresh !== v) {{
+      previewLumThresh = v;
+      persistPreviewState();
+      if (previewInputOn) {{ if (previewPredictTimer) stopPreviewPredictLoop(); startPreviewPredictLoop(); }}
+    }}
+    lumSlider.value = String(v);
+    lumNum.value = String(v);
+  }};
+  darkSlider.oninput = () => syncDark(darkSlider);
+  darkNum.onchange = () => syncDark(darkNum);
+  lumSlider.oninput = () => syncLum(lumSlider);
+  lumNum.onchange = () => syncLum(lumNum);
+  darkSlider.value = String(previewDarkThresh || 0);
+  darkNum.value = String(previewDarkThresh || 0);
+  lumSlider.value = String(previewLumThresh || 100);
+  lumNum.value = String(previewLumThresh || 100);
+}}
 function renderPreviewCard() {{
   const pane = document.getElementById('previewPane');
   const note = document.getElementById('previewNote');
@@ -5827,6 +5905,8 @@ function renderPreviewCard() {{
     roiToggle.checked = false;
     roiToggle.disabled = true;
     settingsBtn.disabled = true;
+    const bar = document.getElementById('previewThreshBar');
+    if (bar) bar.style.display = 'none';
     modeTabs.forEach((btn) => {{
       btn.disabled = true;
       btn.classList.remove('active');
@@ -5836,6 +5916,8 @@ function renderPreviewCard() {{
   toggle.disabled = false;
   roiToggle.disabled = false;
   settingsBtn.disabled = false;
+  const bar = document.getElementById('previewThreshBar');
+  if (bar) bar.style.display = '';
   modeTabs.forEach((btn) => {{
     const active = String(btn.getAttribute('data-preview-mode') || '') === String(previewPreprocessMode || 'auto_by_label');
     btn.disabled = false;
@@ -5843,6 +5925,7 @@ function renderPreviewCard() {{
   }});
   toggle.checked = !!previewInputOn;
   roiToggle.checked = !!previewShowRoi;
+  bindPreviewThreshBar();
   renderPreviewSettings();
   if (!pane.dataset.ready) {{
     const src = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
