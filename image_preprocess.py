@@ -769,13 +769,17 @@ def prepare_inference_inputs(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+    bg_dark_thresh: int = 0,
+    bg_lum_thresh: int = 100,
 ) -> Dict[str, np.ndarray]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
-    return {"default": preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi)}
+    return {"default": preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
+                                                  bg_dark_thresh=int(bg_dark_thresh),
+                                                  bg_lum_thresh=int(bg_lum_thresh))}
 
 
 def focus_and_enhance_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale") -> np.ndarray:

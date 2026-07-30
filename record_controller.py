@@ -371,6 +371,8 @@ class RecordController:
             session_id = (qs.get("session") or [""])[0]
             source = (qs.get("source") or [""])[0]
             preprocess_mode = (qs.get("preprocess") or [""])[0]
+            bg_dark_thresh = int((qs.get("bg_dark") or ["0"])[0] or 0)
+            bg_lum_thresh = int((qs.get("bg_lum") or ["100"])[0] or 100)
             if not session_id or source not in {"webcam", "device"}:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -381,7 +383,8 @@ class RecordController:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
                     return
-                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode)
+                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode,
+                                              bg_dark_thresh=bg_dark_thresh, bg_lum_thresh=bg_lum_thresh)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -590,12 +593,15 @@ class RecordController:
             session_id = str(payload.get("session") or "").strip()
             image_b64 = str(payload.get("image_b64") or "").strip()
             preprocess_mode = str(payload.get("preprocess") or "").strip()
+            bg_dark_thresh = int(payload.get("bg_dark") or 0)
+            bg_lum_thresh = int(payload.get("bg_lum") or 100)
             if not session_id or not image_b64:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
             try:
                 png = base64.b64decode(image_b64, validate=True)
-                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode)
+                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode,
+                                              bg_dark_thresh=bg_dark_thresh, bg_lum_thresh=bg_lum_thresh)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -1749,7 +1755,7 @@ class RecordController:
             self._preview[session_id] = cur
         return cur
 
-    def _preview_predict(self, session_id: str, png: bytes, preprocess_mode: str = "") -> Dict[str, Any]:
+    def _preview_predict(self, session_id: str, png: bytes, preprocess_mode: str = "", bg_dark_thresh: int = 0, bg_lum_thresh: int = 100) -> Dict[str, Any]:
         model = self._preview_load_model(session_id=session_id)
         interpreter = model["interpreter"]
         input_details = model["input_details"]
@@ -1773,6 +1779,8 @@ class RecordController:
             preprocess_mode=preprocess_mode,
             manual_roi=manual_roi,
             class_preprocess=class_preprocess,
+            bg_dark_thresh=int(bg_dark_thresh),
+            bg_lum_thresh=int(bg_lum_thresh),
         )
         qscale = 0.0
         qzp = 0

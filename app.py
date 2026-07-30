@@ -2927,6 +2927,8 @@ let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
 let previewShowRoi = false;
+let previewDarkThresh = 0;
+let previewLumThresh = 100;
 let previewUploadImageSrc = '';
 let previewUploadImageB64 = '';
 let previewUploadFilename = '';
@@ -3745,6 +3747,8 @@ function restorePreviewState() {{
       previewPreprocessMode = String(data.preprocess);
     }}
     previewShowRoi = !!data.showRoi;
+    previewDarkThresh = Number(data.darkThresh || 0);
+    previewLumThresh = Number(data.lumThresh || 100);
   }} catch (e) {{}}
 }}
 function persistPreviewState() {{
@@ -3753,7 +3757,9 @@ function persistPreviewState() {{
       inputOn: !!previewInputOn,
       source: String(previewSource || 'webcam'),
       preprocess: String(previewPreprocessMode || 'auto_by_label'),
-      showRoi: !!previewShowRoi
+      showRoi: !!previewShowRoi,
+      darkThresh: Number(previewDarkThresh || 0),
+      lumThresh: Number(previewLumThresh || 100)
     }}));
   }} catch (e) {{}}
 }}
@@ -5385,7 +5391,7 @@ async function refreshPreviewPrediction(token) {{
   const note = document.getElementById('previewNote');
   const imgId = 'previewImage';
   try {{
-    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&_ts=${{Date.now()}}`);
+    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(String(previewDarkThresh || 0))}}&bg_lum=${{encodeURIComponent(String(previewLumThresh || 100))}}&_ts=${{Date.now()}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
@@ -5435,6 +5441,8 @@ async function runPreviewUploadPrediction() {{
         session: STATE.session,
         image_b64: previewUploadImageB64,
         preprocess: previewPreprocessMode,
+        bg_dark: Number(previewDarkThresh || 0),
+        bg_lum: Number(previewLumThresh || 100),
       }})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
@@ -5616,6 +5624,14 @@ function buildPreviewSettingsMarkup() {{
             Selected File
             <input id="previewUploadName" value="${{escapeHtml(String(previewUploadFilename || 'No file selected'))}}" readonly/>
           </label>
+          <label>
+            Dark Thresh
+            <input id="previewDarkThresh" type="number" min="0" max="255" value="${{Number(previewDarkThresh || 0)}}"/>
+          </label>
+          <label>
+            Lum Thresh
+            <input id="previewLumThresh" type="number" min="0" max="255" value="${{Number(previewLumThresh || 100)}}"/>
+          </label>
         </div>
         <div class="source-settings-actions">
           <button class="source-settings-cancel" type="button" id="previewSettingsCancel">Close</button>
@@ -5648,6 +5664,14 @@ function buildPreviewSettingsMarkup() {{
           <label>
             Sync Header
             <input id="previewDeviceSync" value="${{escapeHtml(String(currentSerialSync || 'AA 55 AA'))}}" placeholder="AA 55 AA"/>
+          </label>
+          <label>
+            Dark Thresh
+            <input id="previewDarkThresh" type="number" min="0" max="255" value="${{Number(previewDarkThresh || 0)}}"/>
+          </label>
+          <label>
+            Lum Thresh
+            <input id="previewLumThresh" type="number" min="0" max="255" value="${{Number(previewLumThresh || 100)}}"/>
           </label>
         </div>
         <div class="source-settings-actions">
@@ -5742,6 +5766,11 @@ function renderPreviewSettings() {{
         if (camEl && String(camEl.value) !== String(currentWebcamIndex)) await setWebcamIndexGlobal(camEl.value);
         if (rateEl) previewIntervalMs = Number(rateEl.value || previewIntervalMs || 80);
       }}
+      const darkEl = document.getElementById('previewDarkThresh');
+      const lumEl = document.getElementById('previewLumThresh');
+      previewDarkThresh = Number(darkEl ? darkEl.value : previewDarkThresh || 0);
+      previewLumThresh = Number(lumEl ? lumEl.value : previewLumThresh || 100);
+      persistPreviewState();
       previewSettingsOpen = false;
       renderPreviewSettings();
       if (previewInputOn) {{
