@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -49,6 +50,26 @@ def _app_data_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
     return (base / "TFLiteTraining").resolve()
+
+
+def _prepare_log_file() -> str:
+    """Return a writable log path; fall back to /tmp if the app-data dir fails."""
+    candidates = []
+    try:
+        candidates.append(str((_app_data_dir() / "logs" / "streamlit.log").resolve()))
+    except Exception:
+        pass
+    candidates.append(str((Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log").resolve()))
+    for log_path in candidates:
+        try:
+            p = Path(log_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch(exist_ok=True)
+            return str(p)
+        except Exception:
+            continue
+    # Absolute last resort — stderr
+    return ""
 
 
 def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None = None) -> None:
@@ -249,10 +270,7 @@ def main() -> None:
     multiprocessing.freeze_support()
     port = _find_free_port()
     url = f"http://127.0.0.1:{port}"
-    log_file = (_app_data_dir() / "logs" / "streamlit.log").resolve()
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    log_file.touch(exist_ok=True)
-    log_path = str(log_file)
+    log_path = _prepare_log_file()
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
     try:

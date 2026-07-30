@@ -78,7 +78,7 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=True,           # needed for macOS .app file-open events
     target_arch=None,
-    codesign_identity='-',         # ad-hoc signing for macOS
+    codesign_identity=None,        # ad-hoc + Hardened Runtime breaks dlopen
     entitlements_file=None,
 )
 coll = COLLECT(
