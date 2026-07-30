@@ -49,6 +49,118 @@ class SessionConfig:
     crop_box: Optional[Tuple[int, int, int, int]]
 
 
+def _pick_folder_dialog(title: str = "Choose Folder") -> Optional[str]:
+    """Cross-platform folder picker. macOS uses osascript, Windows/Linux uses tkinter."""
+    if sys.platform == "darwin":
+        try:
+            script = f'POSIX path of (choose folder with prompt "{title}")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    return picked
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        return filedialog.askdirectory(title=title) or None
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def _pick_save_dialog(default_name: str = "project.tmproj") -> Optional[str]:
+    """Cross-platform save-file picker."""
+    if sys.platform == "darwin":
+        try:
+            script = f'POSIX path of (choose file name with prompt "Save Project" default name "{default_name}")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    p = Path(picked).expanduser()
+                    return str(p if p.suffix.lower() == ".tmproj" else p.with_suffix(".tmproj"))
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.asksaveasfilename(
+            initialfile=default_name,
+            defaultextension=".tmproj",
+            filetypes=[("Teachable Machine Project", "*.tmproj")],
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    if not picked:
+        return None
+    p = Path(str(picked)).expanduser()
+    return str(p if p.suffix.lower() == ".tmproj" else p.with_suffix(".tmproj"))
+
+
+def _pick_open_dialog() -> Optional[str]:
+    """Cross-platform open-file picker for .tmproj files."""
+    if sys.platform == "darwin":
+        try:
+            script = 'POSIX path of (choose file with prompt "Open Project")'
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    p = Path(picked).expanduser()
+                    return str(p) if p.suffix.lower() == ".tmproj" else None
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.askopenfilename(
+            filetypes=[("Teachable Machine Project", "*.tmproj")],
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    if not picked:
+        return None
+    p = Path(str(picked)).expanduser()
+    return str(p) if p.suffix.lower() == ".tmproj" else None
+
+
 class ExportConflictError(RuntimeError):
     def __init__(self, conflicts: List[str]) -> None:
         self.conflicts = list(conflicts)
@@ -414,21 +526,8 @@ class RecordController:
             )
             return
         if path == "/export/pick_dir":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose folder with prompt "Export folder")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                picked = (proc.stdout or "").strip()
+                picked = _pick_folder_dialog("Export folder")
                 if not picked:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
@@ -438,56 +537,23 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
         if path == "/project/pick_save":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose file name with prompt "Save Project" default name "project.tmproj")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                picked = (proc.stdout or "").strip()
+                picked = _pick_save_dialog("project.tmproj")
                 if not picked:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
-                p = Path(picked).expanduser()
-                if p.suffix.lower() != ".tmproj":
-                    p = p.with_suffix(".tmproj")
-                _send_json(req, {"ok": "1", "save_path": str(p)}, cors=True)
+                _send_json(req, {"ok": "1", "save_path": str(picked)}, cors=True)
                 return
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
         if path == "/project/pick_open":
-            if sys.platform != "darwin":
-                _send_json(req, {"ok": "0", "error": "unsupported"}, status=400, cors=True)
-                return
             try:
-                script = 'POSIX path of (choose file with prompt "Open Project")'
-                proc = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
-                    return
-                picked = (proc.stdout or "").strip()
+                picked = _pick_open_dialog()
                 if not picked:
                     _send_json(req, {"ok": "0", "canceled": "1"}, cors=True)
                     return
-                p = Path(picked).expanduser()
-                if p.suffix.lower() != ".tmproj":
-                    _send_json(req, {"ok": "0", "error": "not a .tmproj file"}, status=400, cors=True)
-                    return
-                _send_json(req, {"ok": "1", "open_path": str(p)}, cors=True)
+                _send_json(req, {"ok": "1", "open_path": str(picked)}, cors=True)
                 return
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)

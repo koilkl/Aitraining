@@ -192,26 +192,49 @@ def _pick_directory_dialog(initial_dir: Optional[str] = None) -> Optional[str]:
 
 
 def _pick_tmproj_file_dialog() -> Optional[Path]:
-    if sys.platform != "darwin":
-        return None
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", 'POSIX path of (choose file with prompt "Open Project")'],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            pass
+        else:
+            if proc.returncode == 0:
+                picked = (proc.stdout or "").strip()
+                if picked:
+                    p = Path(picked).expanduser()
+                    return p if p.suffix.lower() == ".tmproj" else None
+
+    # Windows / Linux fallback: tkinter file dialog
     try:
-        proc = subprocess.run(
-            ["osascript", "-e", 'POSIX path of (choose file with prompt "Open Project")'],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        import tkinter as tk
+        from tkinter import filedialog
     except Exception:
         return None
-    if proc.returncode != 0:
-        return None
-    picked = (proc.stdout or "").strip()
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        picked = filedialog.askopenfilename(
+            initialdir=str(Path.home() / "Documents"),
+            filetypes=[("Teachable Machine Project", "*.tmproj")],
+        )
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
     if not picked:
         return None
-    p = Path(picked).expanduser()
-    if p.suffix.lower() != ".tmproj":
-        return None
-    return p
+    p = Path(str(picked)).expanduser()
+    return p if p.suffix.lower() == ".tmproj" else None
 
 
 def _tmproj_read_manifest(path: Path) -> Dict[str, Any]:
@@ -369,10 +392,25 @@ def _session_workspace() -> Path:
     return p
 
 
+def _remove_workspace_tree(session_id: str) -> None:
+    p = WORKSPACE_DIR / str(session_id or "").strip()
+    if p.exists():
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def _remove_workspace_tree_async(session_id: str) -> None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    import threading
+    t = threading.Thread(target=_remove_workspace_tree, args=(sid,), daemon=True)
+    t.start()
+
+
 def _reset_session_workspace() -> None:
     p = WORKSPACE_DIR / st.session_state.session_id
     if p.exists():
-        shutil.rmtree(p)
+        shutil.rmtree(p, ignore_errors=True)
     st.session_state.imported = None
     st.session_state.project_type = None
     st.session_state.step = 0
@@ -407,8 +445,11 @@ def _begin_fresh_tm_session() -> str:
     # #region debug-point B:begin-fresh-session
     _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] begin fresh session", {"old_session": str(st.session_state.get("session_id", ""))})
     # #endregion
+    old_session_id = str(st.session_state.get("session_id", "") or "").strip()
     _reset_session_workspace()
     st.session_state.session_id = uuid.uuid4().hex
+    if old_session_id and old_session_id != st.session_state.session_id:
+        _remove_workspace_tree_async(old_session_id)
     # #region debug-point B:begin-fresh-session-new
     _dbg_open_project_layout("B", "pre-fix", "app.py:_begin_fresh_tm_session", "[DEBUG] fresh session created", {"new_session": str(st.session_state.session_id)})
     # #endregion
@@ -2693,7 +2734,10 @@ def _render_tm_old_frontend_html(
 const STATE = {data};
 const baseUrl = `http://127.0.0.1:${{STATE.port}}`;
 if (window.__tmStageMark) window.__tmStageMark('script-start');
+const DEBUG_ENABLED = false;
+let debugEventDisabled = false;
 function dbgEvent(hypothesisId, location, msg, data) {{
+  if (!DEBUG_ENABLED || debugEventDisabled) return;
   try {{
     fetch(STATE.debug_server_url || 'http://127.0.0.1:7777/event', {{
       method: 'POST',
@@ -2707,7 +2751,10 @@ function dbgEvent(hypothesisId, location, msg, data) {{
         data,
         ts: Date.now()
       }})
-    }}).catch(() => null);
+    }}).catch(() => {{
+      debugEventDisabled = true;
+      return null;
+    }});
   }} catch (e) {{}}
 }}
 function logScrollLayers(tag) {{
@@ -2960,7 +3007,7 @@ let sourceSwitchKind = '';
 let trainInFlight = false;
 let trainPollToken = 0;
 let sourceSettingsOpen = false;
-let previewIntervalMs = 80;
+let previewIntervalMs = 120;
 let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
