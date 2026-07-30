@@ -3307,7 +3307,8 @@ async function refreshClassProcessedPreview() {{
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to render preprocess preview.');
-    classPreprocessProcessedSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+    const procB64 = data.processed_image_b64 || data.image_b64;
+    classPreprocessProcessedSrc = procB64 ? `data:image/png;base64,${{procB64}}` : '';
     // Save auto-crop ROI (normalized 0-1) for overlay display
     classPreprocessAutoCrop = Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null;
   }} catch (err) {{
