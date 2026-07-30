@@ -707,7 +707,11 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Save normalized crop box for ROI overlay display
     crop_norm = (x1 / w_orig, y1 / h_orig, x2 / w_orig, y2 / h_orig)
 
-    gray = gray[y1:y2, x1:x2]
+    # Crop from original RGB, then convert to BT.601 luminance.
+    # ROI search used the masked G-channel for detection, but the final
+    # pixels come from the unmodified source — much sharper.
+    crop_rgb = src[y1:y2, x1:x2, :3].astype(np.float32)
+    gray = (crop_rgb[:,:,0] * 0.299 + crop_rgb[:,:,1] * 0.587 + crop_rgb[:,:,2] * 0.114).astype(np.uint8)
 
     # Resize
     img = Image.fromarray(gray, mode="L")
