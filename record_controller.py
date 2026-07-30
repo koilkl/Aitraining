@@ -1535,7 +1535,7 @@ class RecordController:
     def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
         return _preview_item_payload(path)
 
-    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False, fast_mode: bool = False):
+    def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False, fast_mode: bool = False, out_size: int = 96):
         class_cfg = class_config if isinstance(class_config, dict) else {}
         src_cfg = sample_config if isinstance(sample_config, dict) else {}
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
@@ -1550,7 +1550,7 @@ class RecordController:
         if mode == PREPROCESS_MODE_MANUAL_ROI:
             src = np.asarray(img)
             roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
-        arr, crop_norm = preprocess_blue_diff_array(np.asarray(img), out_size=96, roi=roi,
+        arr, crop_norm = preprocess_blue_diff_array(np.asarray(img), out_size=int(out_size), roi=roi,
                                          bg_dark_thresh=bg_dark_thresh,
                                          bg_lum_thresh=bg_lum_thresh,
                                          return_crop_box=True,
@@ -1569,6 +1569,7 @@ class RecordController:
         class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
         sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
         global_preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
+        out_size: int = 96,
     ) -> None:
         classes = self._classes_load(dataset_root)
         cache_root = self._processed_cache_dir(dataset_root)
@@ -1595,6 +1596,7 @@ class RecordController:
                         class_config=config,
                         fast_mode=True,
                         sample_config=class_sample_map.get(src.name),
+                        out_size=int(out_size),
                     )
                     (dst_dir / f"{src.stem}.png").write_bytes(out_png)
                     processed_count += 1
@@ -1933,6 +1935,7 @@ class RecordController:
                 class_preprocess=cfg.class_preprocess,
                 sample_preprocess=cfg.sample_preprocess,
                 global_preprocess_mode=cfg.preprocess_mode,
+                out_size=int(cfg.img_size),
             )
 
             def on_progress(p: float, msg: str) -> None:
