@@ -321,6 +321,10 @@ def _init_session() -> None:
         st.session_state.tm_serial_frame_side = 96
     if "tm_serial_channels" not in st.session_state:
         st.session_state.tm_serial_channels = 1
+    if "tm_preview_dark_thresh" not in st.session_state:
+        st.session_state.tm_preview_dark_thresh = 0
+    if "tm_preview_lum_thresh" not in st.session_state:
+        st.session_state.tm_preview_lum_thresh = 100
     if "tm_last_device_frame" not in st.session_state:
         st.session_state.tm_last_device_frame = None
     if "tm_capture_open" not in st.session_state:
@@ -932,6 +936,8 @@ def _render_new_project() -> None:
                 _dbg_open_project_layout("A", "pre-fix", "app.py:_render_new_project", "[DEBUG] home open project restored state", {"session": str(st.session_state.session_id), "classes": list(state.get("classes") or []), "count_keys": list((state.get("counts") or {}).keys())})
                 # #endregion
                 st.session_state.tm_classes = list(state.get("classes") or ["Class 1", "Class 2"])
+                st.session_state.tm_preview_dark_thresh = int(state.get("bg_dark_thresh", 0)) if isinstance(state, dict) else 0
+                st.session_state.tm_preview_lum_thresh = int(state.get("bg_lum_thresh", 100)) if isinstance(state, dict) else 100
                 train_cfg_state = state.get("train_cfg") if isinstance(state, dict) else None
                 if isinstance(train_cfg_state, dict):
                     prev_cfg = st.session_state.train_cfg
@@ -1247,6 +1253,8 @@ def _render_tm_old_frontend_html(
         "current_serial_sync": str(current_serial_sync or "AA 55 AA"),
         "current_serial_frame_side": int(current_serial_frame_side),
         "current_serial_channels": int(current_serial_channels),
+        "preview_dark_thresh": int(st.session_state.get("tm_preview_dark_thresh", 0)),
+        "preview_lum_thresh": int(st.session_state.get("tm_preview_lum_thresh", 100)),
         "webcam_options": webcam_options,
         "current_webcam_index": int(current_webcam_index),
         "sample_previews": sample_previews,
@@ -3747,8 +3755,8 @@ function restorePreviewState() {{
       previewPreprocessMode = String(data.preprocess);
     }}
     previewShowRoi = !!data.showRoi;
-    previewDarkThresh = Number(data.darkThresh || 0);
-    previewLumThresh = Number(data.lumThresh || 100);
+    previewDarkThresh = Number(data.darkThresh || STATE.preview_dark_thresh || 0);
+    previewLumThresh = Number(data.lumThresh || STATE.preview_lum_thresh || 100);
   }} catch (e) {{}}
 }}
 function persistPreviewState() {{
@@ -4442,6 +4450,9 @@ function applyProjectState(state) {{
     STATE.train_cfg = Object.assign({{}}, STATE.train_cfg || {{}}, s.train_cfg);
     persistTrainCfgStorage();
   }}
+  if (typeof s.bg_dark_thresh === 'number') previewDarkThresh = s.bg_dark_thresh;
+  if (typeof s.bg_lum_thresh === 'number') previewLumThresh = s.bg_lum_thresh;
+  persistPreviewState();
   recomputeTrainEnabled();
   try {{
     document.documentElement.scrollTop = 0;
@@ -4495,7 +4506,9 @@ async function saveProject() {{
             class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}})
           }}),
           class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}}),
-          sample_preprocess: normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}})
+          sample_preprocess: normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}}),
+          bg_dark_thresh: Number(previewDarkThresh || 0),
+          bg_lum_thresh: Number(previewLumThresh || 100)
         }}
       }})
     }});
