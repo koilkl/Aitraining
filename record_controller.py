@@ -1726,6 +1726,12 @@ class RecordController:
         }
         if train_cfg:
             payload["train_cfg"] = train_cfg
+        # Preserve dark/lum thresholds from project_state so they survive save/restore
+        if isinstance(project_state, dict):
+            if "bg_dark_thresh" in project_state:
+                payload["bg_dark_thresh"] = int(project_state["bg_dark_thresh"])
+            if "bg_lum_thresh" in project_state:
+                payload["bg_lum_thresh"] = int(project_state["bg_lum_thresh"])
         return payload
 
     def _preview_model_lock(self, session_id: str) -> threading.Lock:
