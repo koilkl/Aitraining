@@ -22,15 +22,19 @@ class SerialPortInfo:
 
 class SerialFrameReader:
     def __init__(self, port: str, baud: int, sync_header: bytes | str | None = None,
-                 frame_side: int = DEFAULT_FRAME_SIDE) -> None:
+                 frame_side: int = DEFAULT_FRAME_SIDE, channels: int = 1) -> None:
         self._port = port
         self._baud = int(baud)
         self._header = parse_sync_header(sync_header)
         side = int(frame_side)
         if side < 8 or side > 512:
             raise ValueError("Invalid frame_side.")
+        ch = int(channels)
+        if ch not in (1, 3):
+            raise ValueError("channels must be 1 (grayscale) or 3 (RGB).")
         self._frame_side = side
-        self._frame_size = int(side) * int(side)
+        self._channels = ch
+        self._frame_size = int(side) * int(side) * ch
         self._ser = None
         self._buf = bytearray()
 
@@ -130,16 +134,22 @@ def read_frame_png_from_serial(
     sync_header: bytes | str | None = None,
     timeout_s: float = 3.0,
     frame_side: int = DEFAULT_FRAME_SIDE,
+    channels: int = 1,
 ) -> bytes:
-    reader = SerialFrameReader(port=port, baud=baud, sync_header=sync_header, frame_side=frame_side)
+    reader = SerialFrameReader(port=port, baud=baud, sync_header=sync_header, frame_side=frame_side, channels=channels)
     reader.open()
     try:
         frame = reader.read_frame(timeout_s=timeout_s)
     finally:
         reader.close()
     side = int(frame_side)
-    arr = np.frombuffer(frame, dtype=np.uint8).reshape((side, side))
-    img = Image.fromarray(arr, mode="L")
+    ch = int(channels)
+    if ch == 3:
+        arr = np.frombuffer(frame, dtype=np.uint8).reshape((side, side, 3))
+        img = Image.fromarray(arr, mode="RGB")
+    else:
+        arr = np.frombuffer(frame, dtype=np.uint8).reshape((side, side))
+        img = Image.fromarray(arr, mode="L")
     return _to_png_bytes(img)
 
 

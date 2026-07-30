@@ -319,6 +319,8 @@ def _init_session() -> None:
         st.session_state.tm_serial_sync = "AA 55 AA"
     if "tm_serial_frame_side" not in st.session_state:
         st.session_state.tm_serial_frame_side = 96
+    if "tm_serial_channels" not in st.session_state:
+        st.session_state.tm_serial_channels = 1
     if "tm_last_device_frame" not in st.session_state:
         st.session_state.tm_last_device_frame = None
     if "tm_capture_open" not in st.session_state:
@@ -919,6 +921,7 @@ def _render_new_project() -> None:
                         serial_baud=int(st.session_state.tm_serial_baud),
                         serial_sync=str(st.session_state.tm_serial_sync),
                         serial_frame_side=int(st.session_state.tm_serial_frame_side),
+                        serial_channels=int(st.session_state.tm_serial_channels),
                         webcam_index=int(st.session_state.tm_webcam_index),
                         fps=float(st.session_state.tm_record_fps),
                         crop_box=st.session_state.tm_record_crop_box,
@@ -1220,6 +1223,7 @@ def _render_tm_old_frontend_html(
     current_serial_baud: int,
     current_serial_sync: str,
     current_serial_frame_side: int,
+    current_serial_channels: int,
     webcam_options: List[Dict[str, str]],
     current_webcam_index: int,
     sample_previews: Dict[str, List[Dict[str, str]]],
@@ -1242,6 +1246,7 @@ def _render_tm_old_frontend_html(
         "current_serial_baud": int(current_serial_baud),
         "current_serial_sync": str(current_serial_sync or "AA 55 AA"),
         "current_serial_frame_side": int(current_serial_frame_side),
+        "current_serial_channels": int(current_serial_channels),
         "webcam_options": webcam_options,
         "current_webcam_index": int(current_webcam_index),
         "sample_previews": sample_previews,
@@ -2917,6 +2922,7 @@ let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
 let currentSerialSync = String(STATE.current_serial_sync || 'AA 55 AA');
 let currentSerialFrameSide = Number(STATE.current_serial_frame_side || 96);
+let currentSerialChannels = Number(STATE.current_serial_channels || 1);
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
@@ -5002,6 +5008,10 @@ function buildSerialFrameSideOptions(selected) {{
   const values = [96, 160];
   return values.map((side) => `<option value="${{side}}"${{Number(selected) === side ? ' selected' : ''}}>${{side}}×${{side}}</option>`).join('');
 }}
+function buildSerialColorModeOptions(selected) {{
+  const sel = Number(selected) === 3 ? 3 : 1;
+  return `<option value="1"${{sel === 1 ? ' selected' : ''}}>Grayscale</option><option value="3"${{sel === 3 ? ' selected' : ''}}>RGB</option>`;
+}}
 function deviceHelpText() {{
   const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
   if (!ports.length) return 'No compatible serial UART device is currently detected. Connect the board or install the required USB serial driver first.';
@@ -5019,6 +5029,10 @@ function buildSourceSettingsMarkup(className) {{
           <label>
             Image Size
             <select id="sourceFrameSide-${{cssSafe(className)}}">${{buildSerialFrameSideOptions(currentSerialFrameSide)}}</select>
+          </label>
+          <label>
+            Color Mode
+            <select id="sourceColorMode-${{cssSafe(className)}}">${{buildSerialColorModeOptions(currentSerialChannels)}}</select>
           </label>
           <label>
             Baud Rate
@@ -5145,6 +5159,35 @@ async function changeSerialFrameSide(className, value) {{
     syncSourceActionButtons(className);
   }}
 }}
+async function changeSerialChannels(className, value) {{
+  const nextCh = Number(value || currentSerialChannels || 1);
+  currentSerialChannels = nextCh;
+  STATE.current_serial_channels = currentSerialChannels;
+  sourceSwitchInFlight = true;
+  sourceSwitchClass = className;
+  sourceSwitchKind = 'device';
+  syncSourceActionButtons(className);
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_channels=${{encodeURIComponent(String(currentSerialChannels))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update device color mode.');
+    currentSerialChannels = Number(data.serial_channels || currentSerialChannels || 1);
+    STATE.current_serial_channels = currentSerialChannels;
+    if (openSourceClass === className && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }} finally {{
+    sourceSwitchInFlight = false;
+    sourceSwitchClass = '';
+    sourceSwitchKind = '';
+    syncSourceActionButtons(className);
+  }}
+}}
 function toggleSourceSettings(className) {{
   if (openSourceClass !== className || !openSourceKind || openSourceKind === 'upload') return;
   sourceSettingsOpen = !sourceSettingsOpen;
@@ -5155,9 +5198,11 @@ async function applySourceSettings(className) {{
   try {{
     if (openSourceKind === 'device') {{
       const sideEl = document.getElementById(`sourceFrameSide-${{cssSafe(className)}}`);
+      const modeEl = document.getElementById(`sourceColorMode-${{cssSafe(className)}}`);
       const baudEl = document.getElementById(`sourceBaud-${{cssSafe(className)}}`);
       const syncEl = document.getElementById(`sourceSync-${{cssSafe(className)}}`);
       await changeSerialFrameSide(className, sideEl ? sideEl.value : String(currentSerialFrameSide));
+      await changeSerialChannels(className, modeEl ? modeEl.value : String(currentSerialChannels));
       await changeSerialBaud(className, baudEl ? baudEl.value : String(currentSerialBaud));
       await changeSerialSync(className, syncEl ? syncEl.value : String(currentSerialSync));
     }} else if (openSourceKind === 'webcam') {{
@@ -5519,6 +5564,25 @@ async function setSerialFrameSideGlobal(value) {{
     toast(String(err && err.message ? err.message : err));
   }}
 }}
+async function setSerialChannelsGlobal(value) {{
+  currentSerialChannels = Number(value || currentSerialChannels || 1);
+  STATE.current_serial_channels = currentSerialChannels;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&serial_channels=${{encodeURIComponent(String(currentSerialChannels))}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update device color mode.');
+    currentSerialChannels = Number(data.serial_channels || currentSerialChannels || 1);
+    STATE.current_serial_channels = currentSerialChannels;
+    if (openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 function buildPreviewSettingsMarkup() {{
   if (!previewSettingsOpen || !STATE.export_enabled) return '';
   const exportFields = `
@@ -5572,6 +5636,10 @@ function buildPreviewSettingsMarkup() {{
           <label>
             Image Size
             <select id="previewDeviceFrameSide">${{buildSerialFrameSideOptions(currentSerialFrameSide)}}</select>
+          </label>
+          <label>
+            Color Mode
+            <select id="previewDeviceColorMode">${{buildSerialColorModeOptions(currentSerialChannels)}}</select>
           </label>
           <label>
             Baud Rate
@@ -5660,10 +5728,12 @@ function renderPreviewSettings() {{
       if (previewSource === 'device') {{
         const portEl = document.getElementById('previewDevicePort');
         const sideEl = document.getElementById('previewDeviceFrameSide');
+        const modeEl = document.getElementById('previewDeviceColorMode');
         const baudEl = document.getElementById('previewDeviceBaud');
         const syncEl = document.getElementById('previewDeviceSync');
         await setDevicePortGlobal(portEl ? portEl.value : currentSerialPort);
         await setSerialFrameSideGlobal(sideEl ? sideEl.value : String(currentSerialFrameSide));
+        await setSerialChannelsGlobal(modeEl ? modeEl.value : String(currentSerialChannels));
         await setSerialBaudGlobal(baudEl ? baudEl.value : String(currentSerialBaud));
         await setSerialSyncGlobal(syncEl ? syncEl.value : String(currentSerialSync));
       }} else if (previewSource === 'webcam') {{
@@ -6765,6 +6835,7 @@ def _render_image_project() -> None:
         current_serial_baud=int(st.session_state.tm_serial_baud),
         current_serial_sync=str(st.session_state.tm_serial_sync),
         current_serial_frame_side=int(st.session_state.tm_serial_frame_side),
+        current_serial_channels=int(st.session_state.tm_serial_channels),
         webcam_options=webcam_options,
         current_webcam_index=int(st.session_state.tm_webcam_index),
         sample_previews=sample_previews,
