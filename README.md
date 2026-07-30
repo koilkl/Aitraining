@@ -25,8 +25,9 @@ Goal: students should not need to install Python. Double-click to launch.
   - `Device` samples are grayscale frames from a serial/UART source
   - Training input is normalized to grayscale for all sample sources, so webcam/upload/device are trained consistently
 - Device source:
-      - Open the `Device` card and use the `⚙` settings panel to configure `Image Size`, `Baud Rate`, and `Sync Header`
-      - `Image Size` selects the frame resolution sent by the firmware (e.g. 96×96 or 160×160) — must match the firmware output exactly
+      - Open the `Device` card and use the `⚙` settings panel to configure `Image Size`, `Color Mode`, `Baud Rate`, and `Sync Header`
+      - `Image Size` selects the frame resolution sent by the firmware: 96×96, 160×160, or 384×384 — must match the firmware output exactly
+      - `Color Mode` selects Grayscale (1 channel) or RGB (3 channels) depending on the firmware sketch
       - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
       - Change the sync value if your firmware uses a different frame prefix
 - Classified import:
@@ -36,19 +37,17 @@ Goal: students should not need to install Python. Double-click to launch.
   - Imported class names come from folder / label names
 - Training:
   - The middle `Training` panel trains an int8 TFLite model from the current workspace
-  - The `Advanced` section is now focused on model hyperparameters only, such as batch size, epochs, learning rate, and layer sizes
+  - The `Advanced` section exposes all model hyperparameters: `Image Size` (model input resolution), batch size, epochs, learning rate, conv/dense layer sizes
+  - `Image Size` controls the resolution images are resized to before training — all samples are preprocessed to this size regardless of their original dimensions
   - Image preprocessing is configured per class from the preprocess button shown next to each class name
+  - The class preprocess `Processed Preview` shows the thresholded mask — white = filtered out (background), dark = candidate sign pixels.  Tune the `Dark Thresh` and `Lum Thresh` sliders in the edit page to adjust what the detector keeps
   - Each class preprocess page supports:
-    - `Auto by Label`: automatically route road-sign classes to the sign ROI pipeline and junction classes to the junction pipeline
-    - `Sign`: force the sign-style ROI pipeline for that class
-    - `Junction`: force the junction-style crop for that class
     - `Manual ROI`: draw a custom ROI directly on a sample image for that class
     - `Full Frame`: disable extra ROI cropping for that class
-  - This per-class workflow is recommended when one project mixes classes such as `LEFT`, `RIGHT`, and `CROSS`
 - Preview / Export:
       - The right `Preview` panel runs preview inference after training
-      - Toggle `Input` to start/stop live predictions; toggle `ROI` to switch between raw input and the after-processed model-input view
-      - Use the visible `Auto / Sign / Junction` tabs in the preview header to switch inference preprocessing without opening settings
+      - Toggle `Input` to start/stop live predictions; toggle `ROI` to switch between raw input and the thresholded mask view (shows dark/lum effects)
+      - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
       - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
@@ -61,6 +60,21 @@ Goal: students should not need to install Python. Double-click to launch.
 - Export to MCU:
   - `model.h / model.cpp`: drop into Arduino/ESP-IDF projects (array name can be set in Export)
   - `labels.txt`: class order (inference index mapping)
+
+## ROI Detection Pipeline
+
+The auto-crop uses a G-channel dark-object + edge detection algorithm to find signs:
+
+1. **G-channel extraction**: green channel has best SNR in typical lighting
+2. **Dark/Lum thresholding**: pixels with G between `Dark Thresh` (default 0) and `Lum Thresh` (default 100) are sign candidates; everything else → white
+3. **Search window**: looks for the sign within x:10-90%, y:10-90% of the frame
+4. **Edge detection**: within the search window, dark pixels near edges score higher
+5. **Blob scoring**: best blob by weighted-sum × aspect-ratio × area × center-prior
+6. **Crop**: from the original RGB using the detected bbox → BT.601 luminance → resize → contrast stretch
+
+If no sign is found: center crop fallback (50%, 50% position, 40% side).
+
+The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.
 
 ## Export Behavior
 
@@ -130,7 +144,7 @@ dataset/
   - Supported image extensions are `jpg`, `jpeg`, `png`, `bmp`, `webp`, and `gif`.
   - Imported webcam/upload samples may be stored as color images for display, but training is loaded as grayscale.
   - Device samples are grayscale.
-  - Serial device frames use a sync header before the grayscale payload (96×96 or 160×160, configurable in device settings). The default sync header is `AA 55 AA`, and it can be changed from the device settings gear if your firmware uses a different frame prefix.
+  - Serial device frames use a sync header before the payload (96×96, 160×160, or 384×384, Grayscale or RGB, configurable in device settings). The default sync header is `AA 55 AA`, and it can be changed from the device settings gear if your firmware uses a different frame prefix.
   - If the selected folder does not contain a supported classified dataset layout, the import page reports that no dataset was detected.
 
 ## `.tmproj` File Structure
