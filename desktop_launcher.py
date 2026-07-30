@@ -84,16 +84,29 @@ def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None =
         pass
 
 
+def _raise_fd_limit() -> None:
+    """Set RLIMIT_NOFILE to 4096 using raw ctypes (works in frozen PyInstaller)."""
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except Exception:
+        return
+    RLIMIT_NOFILE = 8  # Darwin <sys/resource.h>
+    class Rlimit(ctypes.Structure):
+        _fields_ = [("rlim_cur", ctypes.c_uint64), ("rlim_max", ctypes.c_uint64)]
+    rlim = Rlimit(0, 0)
+    if libc.getrlimit(RLIMIT_NOFILE, ctypes.byref(rlim)) != 0:
+        return
+    rlim.rlim_cur = max(rlim.rlim_cur, 4096)
+    rlim.rlim_max = max(rlim.rlim_max, 4096)
+    libc.setrlimit(RLIMIT_NOFILE, ctypes.byref(rlim))
+
+
 def _run_streamlit_server(port: int, log_path: str) -> None:
     import traceback
 
-    # Raise fd limit in the subprocess too (macOS spawn doesn't inherit)
-    try:
-        import resource as _r
-        s, h = _r.getrlimit(_r.RLIMIT_NOFILE)
-        _r.setrlimit(_r.RLIMIT_NOFILE, (max(s, 4096), max(h, 4096)))
-    except Exception:
-        pass
+    _raise_fd_limit()
 
     from streamlit.web import bootstrap
 
@@ -232,14 +245,7 @@ def _startup_window_logic(window: "webview.Window") -> None:
 
 
 def main() -> None:
-    # Raise file-descriptor limit for PyInstaller bundles.
-    # Streamlit's static assets (JS/CSS/fonts) can hit macOS's default 256.
-    import resource as _resource
-    try:
-        soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
-        _resource.setrlimit(_resource.RLIMIT_NOFILE, (max(soft, 4096), max(hard, 4096)))
-    except Exception:
-        pass
+    _raise_fd_limit()
     multiprocessing.freeze_support()
     port = _find_free_port()
     url = f"http://127.0.0.1:{port}"
