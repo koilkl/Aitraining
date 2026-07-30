@@ -1,9 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.')]
 binaries = []
 hiddenimports = []
+
+# macOS multiprocessing support — critical for frozen apps using spawn
+hiddenimports += [
+    'multiprocessing',
+    'multiprocessing.process',
+    'multiprocessing.queues',
+    'multiprocessing.synchronize',
+    'multiprocessing.pool',
+    'multiprocessing.spawn',
+    '_multiprocessing',
+    'ctypes',
+    'ctypes.macholib',
+]
+
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_drawable_canvas')
@@ -28,6 +43,10 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all('tkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+if sys.platform == 'darwin':
+    tmp_ret = collect_all('pywebview')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -54,12 +73,12 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,                     # UPX can corrupt macOS dylibs
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    argv_emulation=True,           # needed for macOS .app file-open events
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity='-',         # ad-hoc signing for macOS
     entitlements_file=None,
 )
 coll = COLLECT(
@@ -67,7 +86,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='TFLiteTraining',
 )
