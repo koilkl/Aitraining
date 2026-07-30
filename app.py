@@ -3123,6 +3123,12 @@ function setClassPreprocessConfig(className, cfg) {{
   const next = Object.assign({{}}, STATE.class_preprocess || {{}});
   next[className] = normalizeClassPreprocessConfig(cfg);
   STATE.class_preprocess = next;
+  // Persist to backend so per-class thresholds survive page reload
+  fetch(`${{baseUrl}}/classes/save_config`, {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{session: STATE.session, class_preprocess: next}})
+  }}).catch(() => {{}});
 }}
 function normalizeSamplePreprocessMap(raw) {{
   const src = raw && typeof raw === 'object' ? raw : {{}};

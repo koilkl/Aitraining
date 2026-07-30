@@ -554,6 +554,7 @@ class RecordController:
             "/samples/delete",
             "/preprocess/preview",
             "/preview/predict_upload",
+            "/classes/save_config",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
             return
@@ -598,6 +599,29 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1", **preview}, cors=True)
+            return
+        if path == "/classes/save_config":
+            session_id = str(payload.get("session") or "").strip()
+            class_preprocess = payload.get("class_preprocess")
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                with self._lock:
+                    sess_cfg = self._configs.get(session_id)
+                if sess_cfg is None:
+                    _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                    return
+                classes = self._classes_load(sess_cfg.dataset_root)
+                self._classes_save(
+                    sess_cfg.dataset_root,
+                    classes,
+                    class_preprocess=normalize_class_preprocess_map(class_preprocess) if class_preprocess else None,
+                )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1"}, cors=True)
             return
         if path == "/preview/predict_upload":
             session_id = str(payload.get("session") or "").strip()
