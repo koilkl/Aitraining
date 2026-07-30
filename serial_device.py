@@ -68,8 +68,13 @@ class SerialFrameReader:
             chunk = self._ser.read(4096)
             if chunk:
                 self._buf.extend(chunk)
-                if len(self._buf) > 262144:
-                    self._buf = self._buf[-65536:]
+                # Keep at least 4× frame_size so we never discard a pending frame.
+                # For 384×384×3 RGB that is ~1.7 MB — fine on a desktop.
+                keep = int(self._frame_size) * 4
+                if keep < 65536:
+                    keep = 65536
+                if len(self._buf) > keep * 2:
+                    self._buf = self._buf[-keep:]
             else:
                 time.sleep(0.004)
             while True:
