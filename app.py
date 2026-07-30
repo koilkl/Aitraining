@@ -5672,14 +5672,6 @@ function buildPreviewSettingsMarkup() {{
             Selected File
             <input id="previewUploadName" value="${{escapeHtml(String(previewUploadFilename || 'No file selected'))}}" readonly/>
           </label>
-          <label>
-            Dark Thresh
-            <input id="previewDarkThresh" type="number" min="0" max="255" value="${{Number(previewDarkThresh || 0)}}"/>
-          </label>
-          <label>
-            Lum Thresh
-            <input id="previewLumThresh" type="number" min="0" max="255" value="${{Number(previewLumThresh || 100)}}"/>
-          </label>
         </div>
         <div class="source-settings-actions">
           <button class="source-settings-cancel" type="button" id="previewSettingsCancel">Close</button>
@@ -5712,14 +5704,6 @@ function buildPreviewSettingsMarkup() {{
           <label>
             Sync Header
             <input id="previewDeviceSync" value="${{escapeHtml(String(currentSerialSync || 'AA 55 AA'))}}" placeholder="AA 55 AA"/>
-          </label>
-          <label>
-            Dark Thresh
-            <input id="previewDarkThresh" type="number" min="0" max="255" value="${{Number(previewDarkThresh || 0)}}"/>
-          </label>
-          <label>
-            Lum Thresh
-            <input id="previewLumThresh" type="number" min="0" max="255" value="${{Number(previewLumThresh || 100)}}"/>
           </label>
         </div>
         <div class="source-settings-actions">
