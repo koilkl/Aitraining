@@ -5060,7 +5060,7 @@ function buildSerialBaudOptions(selected) {{
   return values.map((baud) => `<option value="${{baud}}"${{Number(selected) === baud ? ' selected' : ''}}>${{baud}}</option>`).join('');
 }}
 function buildSerialFrameSideOptions(selected) {{
-  const values = [96, 160];
+  const values = [96, 160, 384];
   return values.map((side) => `<option value="${{side}}"${{Number(selected) === side ? ' selected' : ''}}>${{side}}×${{side}}</option>`).join('');
 }}
 function buildSerialColorModeOptions(selected) {{
