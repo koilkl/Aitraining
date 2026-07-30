@@ -2584,6 +2584,7 @@ def _render_tm_old_frontend_html(
         </div>
         <div class="train-adv-panel" id="trainAdvPanel">
           <div class="train-adv-grid">
+            <div class="train-adv-row"><span>Image Size</span><input id="advImgSizeInline" type="number" min="32" max="224" step="8"/></div>
             <div class="train-adv-row"><span>Batch Size</span><input id="advBatchInline" type="number" min="1" step="1"/></div>
             <div class="train-adv-row"><span>Epochs</span><input id="advEpochsInline" type="number" min="1" step="1"/></div>
             <div class="train-adv-row"><span>Validation Split</span><input id="advValInline" type="number" min="0" max="0.5" step="0.05"/></div>
@@ -6231,6 +6232,7 @@ function syncAdvancedInlineInputs() {{
     if (!el) return;
     el.value = nullish(value, nullish(el.value, ''));
   }};
+  set('advImgSizeInline', nullish(cfg.img_size, 96));
   set('advBatchInline', nullish(cfg.batch_size, 32));
   set('advEpochsInline', nullish(cfg.epochs, 20));
   set('advValInline', nullish(cfg.validation_split, 0.25));
@@ -6295,6 +6297,7 @@ function bindAdvancedInlineHandlers() {{
     el.addEventListener('input', (e) => setTrainCfgField(key, e.target.value));
     el.addEventListener('change', (e) => setTrainCfgField(key, e.target.value));
   }};
+  bindNum('advImgSizeInline', 'img_size');
   bindNum('advBatchInline', 'batch_size');
   bindNum('advEpochsInline', 'epochs');
   bindNum('advValInline', 'validation_split');
@@ -6305,6 +6308,7 @@ function bindAdvancedInlineHandlers() {{
 }}
 function resetTrainCfg() {{
   STATE.train_cfg = {{
+    img_size: 96,
     batch_size: 32,
     epochs: 20,
     validation_split: 0.25,
