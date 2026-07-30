@@ -25,9 +25,10 @@ Goal: students should not need to install Python. Double-click to launch.
   - `Device` samples are grayscale frames from a serial/UART source
   - Training input is normalized to grayscale for all sample sources, so webcam/upload/device are trained consistently
 - Device source:
-  - Open the `Device` card and use the `⚙` settings panel to configure `Port`, `Baud Rate`, and `Sync Header`
-  - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
-  - Change the sync value if your firmware uses a different frame prefix
+      - Open the `Device` card and use the `⚙` settings panel to configure `Image Size`, `Baud Rate`, and `Sync Header`
+      - `Image Size` selects the frame resolution sent by the firmware (e.g. 96×96 or 160×160) — must match the firmware output exactly
+      - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
+      - Change the sync value if your firmware uses a different frame prefix
 - Classified import:
   - `Browse...` opens the system folder picker
   - `Load folder` stays disabled until a folder path is present
@@ -45,9 +46,10 @@ Goal: students should not need to install Python. Double-click to launch.
     - `Full Frame`: disable extra ROI cropping for that class
   - This per-class workflow is recommended when one project mixes classes such as `LEFT`, `RIGHT`, and `CROSS`
 - Preview / Export:
-  - The right `Preview` panel runs preview inference after training
-  - Use the visible `Auto / Sign / Junction` tabs in the preview header to switch inference preprocessing without opening settings
-  - `Export Model` writes model files and MCU helper files to the selected export folder
+      - The right `Preview` panel runs preview inference after training
+      - Toggle `Input` to start/stop live predictions; toggle `ROI` to switch between raw input and the after-processed model-input view
+      - Use the visible `Auto / Sign / Junction` tabs in the preview header to switch inference preprocessing without opening settings
+      - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
   - Windows: `%APPDATA%\\TFLiteTraining\\`
@@ -128,7 +130,7 @@ dataset/
   - Supported image extensions are `jpg`, `jpeg`, `png`, `bmp`, `webp`, and `gif`.
   - Imported webcam/upload samples may be stored as color images for display, but training is loaded as grayscale.
   - Device samples are grayscale.
-  - Serial device frames use a sync header before the 96x96 grayscale payload. The default sync header is `AA 55 AA`, and it can be changed from the device settings gear if your firmware uses a different frame prefix.
+  - Serial device frames use a sync header before the grayscale payload (96×96 or 160×160, configurable in device settings). The default sync header is `AA 55 AA`, and it can be changed from the device settings gear if your firmware uses a different frame prefix.
   - If the selected folder does not contain a supported classified dataset layout, the import page reports that no dataset was detected.
 
 ## `.tmproj` File Structure
