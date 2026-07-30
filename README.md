@@ -61,6 +61,137 @@ Goal: students should not need to install Python. Double-click to launch.
   - `model.h / model.cpp`: drop into Arduino/ESP-IDF projects (array name can be set in Export)
   - `labels.txt`: class order (inference index mapping)
 
+## Quick Start Demo (10 minutes)
+
+A step-by-step walkthrough that showcases every major feature.  Ideal for presentations and first-time users.
+
+---
+
+### Step 1 — Create a Project (30 sec)
+
+1. Launch the app → you see the **Home** screen.
+2. Click **Open Image Project** → **Start from empty**.
+3. You are now in the workspace with three columns: **Classes**, **Training**, **Preview**.
+
+---
+
+### Step 2 — Add Classes (30 sec)
+
+1. In the left column, click **＋ Add a class** to create a second class.
+2. Click a class name to rename it (e.g. `SIGN`, `BACKGROUND`).
+3. Each class card has three capture buttons: **Webcam**, **Device**, **Upload**.
+
+> **Demo tip**: Create 2 classes — one for the sign, one for background/nothing.
+
+---
+
+### Step 3 — Configure Device Source (1 min)
+
+1. On a class card, click **Device** to open the device panel.
+2. Click the **⚙ gear icon** on the device panel to open settings:
+
+   | Setting | Value | What it does |
+   |---|---|---|
+   | **Image Size** | 96 / 160 / 384 | Must match your firmware output |
+   | **Color Mode** | Grayscale / RGB | Grayscale for inference, RGB for data collection |
+   | **Baud Rate** | 921600 | Match your serial port speed |
+   | **Sync Header** | AA 55 AA | Frame start marker |
+
+3. Click **Apply** — the device preview should show live frames.
+
+> **Showcase**: Change Image Size and see the preview adapt.  This proves the app handles any resolution.
+
+---
+
+### Step 4 — Capture Samples (2 min)
+
+1. Click and **hold** the device/webcam capture button → samples are saved to that class.
+2. Repeat for each class.  Aim for 10-20 samples per class.
+3. The sample count updates on each class card.
+
+> **Showcase**: The device works with **any frame size** (96/160/384) and **Grayscale or RGB** — configured entirely from the gear icon, no code changes.
+
+---
+
+### Step 5 — Tune Detection Thresholds (2 min) ⭐ KEY FEATURE
+
+1. Click the **preprocess button** (🔍 icon) next to a class name.
+2. The class edit page opens showing your samples on the left and a **Processed Preview** on the right.
+3. The preview shows the **thresholded mask** — white = filtered out, dark = what the detector keeps.
+4. Adjust the **Dark Thr** and **Lum Thr** sliders:
+
+   | Slider | Default | Effect |
+   |---|---|---|
+   | **Dark Thr** | 0 | Pixels darker than this → ignored as shadow |
+   | **Lum Thr** | 100 | Pixels brighter than this → ignored as background |
+
+5. Watch the processed preview update in real-time as you drag the sliders.
+6. The ROI bounding box (green outline) shows where the detector found the sign.
+
+> **Showcase**: This is the core tuning workflow.  The processed preview gives instant visual feedback — no guesswork.
+
+---
+
+### Step 6 — Train the Model (1 min)
+
+1. In the middle **Training** column, click **Train Model**.
+2. To change model parameters, expand **Advanced**:
+
+   | Parameter | Default | What it does |
+   |---|---|---|
+   | **Image Size** | 96 | All images resized to this before training |
+   | **Batch Size** | 32 | Samples per training step |
+   | **Epochs** | 20 | Training iterations |
+   | **Learning Rate** | 0.0016 | Optimization step size |
+
+3. Training takes 10-60 seconds.  A progress bar shows status.
+
+> **Showcase**: The **Image Size** parameter is independent of capture resolution.  You can capture at 160×160 but train at 96×96 (or vice versa).
+
+---
+
+### Step 7 — Preview & Tune Live (2 min) ⭐ KEY FEATURE
+
+1. After training, the right **Preview** panel becomes active.
+2. Toggle **Input ON** → live camera feed with predictions.
+3. Toggle **ROI ON** → switches to the **thresholded mask view**.
+4. Use the **slider bar** under the preview image:
+
+   ```
+   Dark [===○========] 3    Lum [========○===] 76
+   ```
+
+5. Adjust sliders while watching the ROI view — the detection updates in real-time.
+
+> **Showcase**: The slider bar + ROI toggle is the fastest way to find good thresholds.  No need to re-train — just slide and see.
+
+---
+
+### Step 8 — Save & Export (30 sec)
+
+1. Click the **top-left menu** → **Save project** → saves a `.tmproj` file.
+2. All settings are preserved: class names, samples, thresholds, training config.
+3. Click **Export Model** → choose a folder → gets `.tflite`, `model.cpp`, `model.h`, `labels.txt`.
+
+> **Showcase**: `.tmproj` is a complete snapshot.  Share it with teammates or reopen it later — everything is restored.
+
+---
+
+### Key Features Checklist
+
+| # | Feature | Where |
+|---|---|---|
+| 1 | Configurable device resolution (96/160/384) | Device gear ⚙ |
+| 2 | Grayscale / RGB color mode | Device gear ⚙ |
+| 3 | Per-class dark/lum threshold tuning | Class edit page (🔍) |
+| 4 | Real-time processed preview with mask overlay | Class edit page |
+| 5 | Live ROI toggle + slider bar | Preview panel |
+| 6 | Image Size as training hyperparameter | Training → Advanced |
+| 7 | Full project save/restore (.tmproj) | Top-left menu |
+| 8 | MCU-ready export (.tflite + C sources) | Export button |
+
+---
+
 ## ROI Detection Pipeline
 
 The auto-crop uses a G-channel dark-object + edge detection algorithm to find signs:
