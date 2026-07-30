@@ -736,6 +736,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     result = out.astype(np.float32) / 255.0
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
     if return_crop_box:
+        if masked_preview is not None:
+            return image, crop_norm, masked_preview
         return image, crop_norm
     if masked_preview is not None:
         return image, masked_preview

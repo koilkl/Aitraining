@@ -1566,17 +1566,28 @@ class RecordController:
         if mode == PREPROCESS_MODE_MANUAL_ROI:
             src = np.asarray(img)
             roi = manual_roi_to_pixels(src.shape[0], src.shape[1], config.get("manual_roi"))
-        arr, crop_norm = preprocess_blue_diff_array(np.asarray(img), out_size=int(out_size), roi=roi,
+        result = preprocess_blue_diff_array(np.asarray(img), out_size=int(out_size), roi=roi,
                                          bg_dark_thresh=bg_dark_thresh,
                                          bg_lum_thresh=bg_lum_thresh,
                                          return_crop_box=True,
                                          fast_mode=fast_mode)
+        if isinstance(result, tuple) and len(result) == 3:
+            arr, crop_norm, masked_preview = result
+        else:
+            arr, crop_norm = result
+            masked_preview = None
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
         png_bytes = _to_png_bytes(Image.fromarray(out, mode="L"))
+        # Build a displayable version of the masked preview for the UI
+        if masked_preview is not None:
+            mp_arr = np.asarray(np.clip(masked_preview[:,:,0] * 255.0, 0, 255), dtype=np.uint8) if masked_preview.ndim == 3 else np.asarray(np.clip(masked_preview * 255.0, 0, 255), dtype=np.uint8)
+            mp_png = _to_png_bytes(Image.fromarray(mp_arr, mode="L"))
+        else:
+            mp_png = png_bytes
         if return_crop:
-            return {"png": png_bytes, "crop": list(crop_norm)}
+            return {"png": png_bytes, "crop": list(crop_norm), "processed_png": mp_png}
         return png_bytes
 
     def _rebuild_processed_cache(
@@ -1664,6 +1675,7 @@ class RecordController:
         return {
             "image_b64": base64.b64encode(result["png"]).decode("ascii"),
             "crop": result.get("crop"),
+            "processed_image_b64": base64.b64encode(result.get("processed_png", result["png"])).decode("ascii"),
         }
 
     def _project_state_payload(self, dataset_root: Path, project_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
