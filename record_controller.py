@@ -1842,7 +1842,13 @@ class RecordController:
         top_i = int(np.argmax(probs)) if probs.size else 0
         # Build a displayable preview of the after-processed model input
         processed_variant = next(iter(prepared.keys()), "")
-        processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
+        # Use masked_preview (thresholded G-channel) for the ROI toggle so the
+        # user can see dark/lum threshold effects.  Falls back to model-input array.
+        if "masked_preview" in prepared:
+            processed_arr = np.asarray(prepared["masked_preview"])
+            processed_variant = "masked"
+        else:
+            processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
         processed_img = _model_input_array_to_preview_image(processed_arr)
         processed_png = _to_png_bytes(processed_img)
         return {

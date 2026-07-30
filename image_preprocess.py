@@ -707,6 +707,19 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Save normalized crop box for ROI overlay display
     crop_norm = (x1 / w_orig, y1 / h_orig, x2 / w_orig, y2 / h_orig)
 
+    # Build a masked-preview image so the user can see dark/lum threshold effects.
+    # This is the G-channel after thresholding (non-sign pixels → white), cropped
+    # and resized to out_size.  Distinct from the model-input image below.
+    masked_preview = None
+    try:
+        mp = gray[y1:y2, x1:x2]  # crop the masked G-channel
+        mp_img = Image.fromarray(mp, mode="L")
+        mp_img = mp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+        mp_arr = _contrast_stretch_u8(np.asarray(mp_img, dtype=np.uint8))
+        masked_preview = np.expand_dims(mp_arr.astype(np.float32) / 255.0, axis=-1)
+    except Exception:
+        pass
+
     # Crop from original RGB, then convert to BT.601 luminance.
     # ROI search used the masked G-channel for detection, but the final
     # pixels come from the unmodified source — much sharper.
@@ -724,6 +737,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
     if return_crop_box:
         return image, crop_norm
+    if masked_preview is not None:
+        return image, masked_preview
     return image
 
 
@@ -781,9 +796,12 @@ def prepare_inference_inputs(
     if mode == PREPROCESS_MODE_MANUAL_ROI:
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
-    return {"default": preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
-                                                  bg_dark_thresh=int(bg_dark_thresh),
-                                                  bg_lum_thresh=int(bg_lum_thresh))}
+    result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
+                                        bg_dark_thresh=int(bg_dark_thresh),
+                                        bg_lum_thresh=int(bg_lum_thresh))
+    if isinstance(result, tuple) and len(result) == 2:
+        return {"default": result[0], "masked_preview": result[1]}
+    return {"default": result}
 
 
 def focus_and_enhance_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale") -> np.ndarray:
