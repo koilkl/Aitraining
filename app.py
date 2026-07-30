@@ -4148,7 +4148,7 @@ async function openSourcePanel(kind, className) {{
   if (openSourceClass === className) updateOpenSamplesPanel(className);
   if (kind === 'webcam' || kind === 'device') {{
     try {{
-      const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(kind)}}`);
+      const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(kind)}}&frame_side=${{encodeURIComponent(String(currentSerialFrameSide || 96))}}&channels=${{encodeURIComponent(String(currentSerialChannels || 1))}}`);
       if (!res.ok) {{
         const data = await res.json().catch(() => ({{ok:'0'}}));
         toast(String(data && data.error ? data.error : 'Unable to open live preview.'));
@@ -4164,7 +4164,7 @@ async function ensureOpenSourceLive() {{
   if (!openSourceKind || !openSourceClass) return;
   if (openSourceKind !== 'webcam' && openSourceKind !== 'device') return;
   try {{
-    const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
+    const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&frame_side=${{encodeURIComponent(String(currentSerialFrameSide || 96))}}&channels=${{encodeURIComponent(String(currentSerialChannels || 1))}}`);
     if (!res.ok) {{
       const data = await res.json().catch(() => ({{ok:'0'}}));
       toast(String(data && data.error ? data.error : 'Unable to open live preview.'));

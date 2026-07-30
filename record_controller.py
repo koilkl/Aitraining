@@ -306,6 +306,16 @@ class RecordController:
             if not session_id or not source:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
+            # Apply any per-request overrides before opening the stream
+            frame_side_raw = (qs.get("frame_side") or [None])[0]
+            channels_raw = (qs.get("channels") or [None])[0]
+            if frame_side_raw not in (None, "") or channels_raw not in (None, ""):
+                kwargs = {}
+                if frame_side_raw not in (None, ""):
+                    kwargs["serial_frame_side"] = int(float(frame_side_raw))
+                if channels_raw not in (None, ""):
+                    kwargs["serial_channels"] = int(float(channels_raw))
+                self.update_config(session_id, **kwargs)
             self._ensure_live(session_id=session_id, source=source)
             _send_json(req, {"ok": "1"}, cors=True)
             return
