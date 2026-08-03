@@ -11,3 +11,4 @@ model.h
 model.cpp
 g_model.tflite
 /.venv
+/dist-packages
