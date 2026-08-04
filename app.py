@@ -9,6 +9,7 @@ import os
 import sys
 import re
 import subprocess
+import tempfile
 import urllib.request
 import zipfile
 from html import escape as html_escape
@@ -119,16 +120,38 @@ def _dbg_open_project_layout(hypothesis_id: str, run_id: str, location: str, msg
 
 
 def _app_data_dir() -> Path:
+    candidates: list[Path] = []
     env_override = os.getenv("TFLITE_TRAINING_DATA_DIR")
     if env_override:
-        return Path(env_override).expanduser().resolve()
+        candidates.append(Path(env_override).expanduser().resolve())
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
+        candidates.append((base / APP_NAME).resolve())
     elif os.name == "nt":
         base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        candidates.append((base / APP_NAME).resolve())
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
-    return (base / APP_NAME).resolve()
+        candidates.append((base / APP_NAME).resolve())
+    candidates.append((Path(tempfile.gettempdir()) / APP_NAME).resolve())
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            (candidate / "workspace").mkdir(parents=True, exist_ok=True)
+            (candidate / "datasets").mkdir(parents=True, exist_ok=True)
+            probe_dir = candidate / "workspace" / "_probe_dir"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            probe = probe_dir / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            probe_dir.rmdir()
+            return candidate
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to prepare app data dir. Last error: {last_err}")
 
 
 APP_DATA_DIR = _app_data_dir()
@@ -364,9 +387,18 @@ def _init_session() -> None:
 
 
 def _session_workspace() -> Path:
+    global WORKSPACE_DIR
     p = WORKSPACE_DIR / st.session_state.session_id
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except PermissionError:
+        fallback = (Path(tempfile.gettempdir()) / APP_NAME / "workspace").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        WORKSPACE_DIR = fallback
+        p = WORKSPACE_DIR / st.session_state.session_id
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
 
 def _reset_session_workspace() -> None:
@@ -706,23 +738,52 @@ def _tm_classes_meta_path() -> Path:
     return _tm_dataset_dir().parent / "tm_classes.json"
 
 
-def _tm_load_classes_meta() -> Optional[List[str]]:
+def _tm_load_classes_meta_full() -> Optional[Dict[str, Any]]:
     p = _tm_classes_meta_path()
     if not p.exists():
         return None
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        classes = raw.get("classes") if isinstance(raw, dict) else None
-        if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
-            return [str(x) for x in classes]
     except Exception:
         return None
+    if not isinstance(raw, dict):
+        return None
+    classes = raw.get("classes")
+    if not (isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes):
+        return None
+    from image_preprocess import normalize_class_preprocess_map, normalize_sample_preprocess_map
+
+    class_preprocess = normalize_class_preprocess_map(raw.get("class_preprocess"))
+    sample_preprocess = normalize_sample_preprocess_map(raw.get("sample_preprocess"))
+    return {
+        "classes": [str(x) for x in classes],
+        "class_preprocess": class_preprocess,
+        "sample_preprocess": sample_preprocess,
+    }
+
+
+def _tm_load_classes_meta() -> Optional[List[str]]:
+    meta = _tm_load_classes_meta_full()
+    if not meta:
+        return None
+    classes = meta.get("classes")
+    if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
+        return [str(x) for x in classes]
     return None
 
 
 def _tm_save_classes_meta(classes: List[str]) -> None:
     p = _tm_classes_meta_path()
-    p.write_text(json.dumps({"classes": list(classes)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                payload.update(raw)
+        except Exception:
+            payload = {}
+    payload["classes"] = list(classes)
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _status_style(status: str) -> str:
@@ -1238,6 +1299,7 @@ def _render_tm_old_frontend_html(
 ) -> None:
     import json as _json
 
+    meta = _tm_load_classes_meta_full() or {}
     payload = {
         "port": int(port),
         "session": str(session_id),
@@ -1260,6 +1322,8 @@ def _render_tm_old_frontend_html(
         "sample_previews": sample_previews,
         "initial_open_source_class": str(initial_open_source_class or ""),
         "initial_open_source_kind": str(initial_open_source_kind or ""),
+        "class_preprocess": dict(meta.get("class_preprocess") or {}),
+        "sample_preprocess": dict(meta.get("sample_preprocess") or {}),
         "train_cfg": {
             "img_size": int(train_cfg.img_size),
             "batch_size": int(train_cfg.batch_size),

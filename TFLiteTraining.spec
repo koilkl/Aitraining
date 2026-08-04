@@ -78,11 +78,29 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=True,           # needed for macOS .app file-open events
     target_arch=None,
-    codesign_identity=None,        # ad-hoc + Hardened Runtime breaks dlopen
+    codesign_identity=None,
+    entitlements_file=None,
+)
+exe_console = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='TFLiteTrainingConsole',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=True,
+    target_arch=None,
+    codesign_identity=None,
     entitlements_file=None,
 )
 coll = COLLECT(
     exe,
+    exe_console,
     a.binaries,
     a.datas,
     strip=False,

@@ -105,23 +105,51 @@ def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None =
         pass
 
 
+def _configure_multiprocessing_executable() -> None:
+    if sys.platform != "darwin":
+        return
+    if not getattr(sys, "frozen", False):
+        return
+    helper = Path(sys.executable).with_name("TFLiteTrainingConsole")
+    if helper.exists():
+        multiprocessing.set_executable(str(helper))
+
+
 def _raise_fd_limit() -> None:
-    """Set RLIMIT_NOFILE to 4096 using raw ctypes (works in frozen PyInstaller)."""
-    import ctypes
-    import ctypes.util
+    target = 4096
     try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired_soft = max(soft, target)
+        desired_hard = max(hard, desired_soft)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired_soft, desired_hard))
+        except Exception:
+            new_soft = min(desired_soft, hard)
+            if new_soft != soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        import ctypes.util
+
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        RLIMIT_NOFILE = 8
+
+        class Rlimit(ctypes.Structure):
+            _fields_ = [("rlim_cur", ctypes.c_uint64), ("rlim_max", ctypes.c_uint64)]
+
+        rlim = Rlimit(0, 0)
+        if libc.getrlimit(RLIMIT_NOFILE, ctypes.byref(rlim)) != 0:
+            return
+        rlim.rlim_cur = min(max(int(rlim.rlim_cur), target), int(rlim.rlim_max))
+        libc.setrlimit(RLIMIT_NOFILE, ctypes.byref(rlim))
     except Exception:
         return
-    RLIMIT_NOFILE = 8  # Darwin <sys/resource.h>
-    class Rlimit(ctypes.Structure):
-        _fields_ = [("rlim_cur", ctypes.c_uint64), ("rlim_max", ctypes.c_uint64)]
-    rlim = Rlimit(0, 0)
-    if libc.getrlimit(RLIMIT_NOFILE, ctypes.byref(rlim)) != 0:
-        return
-    rlim.rlim_cur = max(rlim.rlim_cur, 4096)
-    rlim.rlim_max = max(rlim.rlim_max, 4096)
-    libc.setrlimit(RLIMIT_NOFILE, ctypes.byref(rlim))
 
 
 def _run_streamlit_server(port: int, log_path: str) -> None:
@@ -131,13 +159,23 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
 
     from streamlit.web import bootstrap
 
+    try:
+        base_dir = _app_data_dir()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(base_dir))
+    except Exception:
+        pass
+
     app_py = _resource_path("app.py")
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+    os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"
 
     flag_options = {
         "global_developmentMode": False,
         "server_headless": True,
+        "server_fileWatcherType": "poll",
+        "server_runOnSave": False,
         "server_port": port,
         "server_address": "127.0.0.1",
         "browser_gatherUsageStats": False,
@@ -145,12 +183,32 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
         "browser_serverAddress": "127.0.0.1",
     }
 
-    log_file = Path(log_path)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if not log_path:
+        log_path = _prepare_log_file()
+    if log_path:
+        log_file = Path(log_path)
+    else:
+        log_file = (Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log").resolve()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.touch(exist_ok=True)
     with log_file.open("a", encoding="utf-8") as f:
+        try:
+            import resource
+
+            f.write(f"[TFLiteTraining] RLIMIT_NOFILE={resource.getrlimit(resource.RLIMIT_NOFILE)}\n")
+            f.flush()
+        except Exception:
+            pass
         with contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
             try:
                 bootstrap.load_config_options(flag_options=flag_options)
+                try:
+                    from streamlit import config as st_config
+
+                    f.write(f"[TFLiteTraining] server.fileWatcherType={st_config.get_option('server.fileWatcherType')}\n")
+                    f.flush()
+                except Exception:
+                    pass
                 bootstrap.run(str(app_py), False, [], flag_options)
             except Exception:
                 f.write(traceback.format_exc())
@@ -266,6 +324,11 @@ def _startup_window_logic(window: "webview.Window") -> None:
 
 
 def main() -> None:
+    _configure_multiprocessing_executable()
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except Exception:
+        pass
     _raise_fd_limit()
     multiprocessing.freeze_support()
     port = _find_free_port()
