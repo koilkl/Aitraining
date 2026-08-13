@@ -397,7 +397,9 @@ def main() -> None:
 
         shell_api = _ShellApi()
         _startup_log("creating window")
-        window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
+        # No js_api: the JS-bridge generation (generate_js_object) held the GIL
+        # and deadlocked against the WebView2 resource-request callback.
+        window = webview.create_window("TF Lite Training", url, width=1200, height=800)
         shell_api.bind(window)
         # No resize/layout handlers: evaluate_js during a window drag deadlocks
         # the WebView2 UI thread. The iframe height is handled by the SPA's own
