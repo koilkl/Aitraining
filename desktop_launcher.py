@@ -406,7 +406,7 @@ def main() -> None:
         window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
         _startup_log("entering webview.start (GUI loop)")
-        webview.start(_startup_window_logic, window)
+        webview.start(_startup_window_logic, window, private_mode=False)
         _startup_log("webview.start returned (window closed)")
     finally:
         if proc.is_alive():
