@@ -8,8 +8,22 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf
-from tensorflow.lite.python.util import convert_bytes_to_c_source
+
+# TensorFlow is imported lazily (inside _ensure_tf) so the desktop app starts
+# fast. Importing TF takes ~20s and is only needed when actually training or
+# exporting a model.
+tf = None
+convert_bytes_to_c_source = None
+
+
+def _ensure_tf() -> None:
+    global tf, convert_bytes_to_c_source
+    if tf is None:
+        import tensorflow as _tf
+        from tensorflow.lite.python.util import convert_bytes_to_c_source as _cvt
+
+        tf = _tf
+        convert_bytes_to_c_source = _cvt
 
 from image_preprocess import (
     PREPROCESS_MODE_AUTO_BY_LABEL,
@@ -277,6 +291,7 @@ def convert_to_int8_tflite(model: tf.keras.Model, train_ds: tf.data.Dataset, cfg
 
 
 def export_tflite_c_sources(tflite_model: bytes, array_name: str) -> Tuple[str, str]:
+    _ensure_tf()
     array_name = array_name.strip() or "g_model"
     header_guard = f"{array_name.upper()}_H"
     source_code, header_code = convert_bytes_to_c_source(
@@ -296,6 +311,7 @@ def train_and_export(
     array_name: str = "g_model",
     progress: Optional[Callable[[float, str], None]] = None,
 ) -> TrainResult:
+    _ensure_tf()
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
