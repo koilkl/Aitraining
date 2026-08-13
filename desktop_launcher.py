@@ -340,20 +340,9 @@ _SPLASH_HTML = """<!doctype html>
 </html>"""
 
 
-def _startup_window_logic(window: "webview.Window", url: str) -> None:
-    # The window initially renders a splash HTML. Wait for the local Streamlit
-    # server in a background thread, then navigate the same window to the app.
-    def _load_app_when_ready() -> None:
-        try:
-            _wait_http_ready(url, timeout_s=30.0)
-        except Exception:
-            pass  # server failed; still navigate (the browser renders the error)
-        try:
-            window.load_url(url)
-        except Exception:
-            pass
-
-    threading.Thread(target=_load_app_when_ready, daemon=True).start()
+def _startup_window_logic(window: "webview.Window") -> None:
+    _schedule_window_layout_refresh(window, reason="startup")
+    _maybe_native_resize_nudge(window, reason="startup")
 
 
 def main() -> None:
@@ -371,28 +360,37 @@ def main() -> None:
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
     try:
+        deadline = time.time() + 25.0
+        last_err: Exception | None = None
+        while time.time() < deadline:
+            if not proc.is_alive():
+                break
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if 200 <= resp.status < 500:
+                        last_err = None
+                        break
+            except Exception as e:
+                last_err = e
+            time.sleep(0.25)
+
+        if last_err is not None:
+            raise RuntimeError(f"Streamlit not ready: {url} ({last_err}). Log: {log_path}")
+        if not proc.is_alive():
+            raise RuntimeError(f"Streamlit process exited. Log: {log_path}")
+
         import webview
 
         shell_api = _ShellApi()
-        # The window starts by rendering a splash HTML; _startup_window_logic
-        # navigates it to the app URL once the local Streamlit server is ready.
-        # (Single window avoids pywebview treating a separate splash as the
-        # primary window and exiting when it is destroyed.)
-        window = webview.create_window(
-            "TF Lite Training",
-            html=_SPLASH_HTML,
-            width=1200,
-            height=800,
-            js_api=shell_api,
-        )
+        window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
         shell_api.bind(window)
         window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
-        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"), _maybe_native_resize_nudge(window, reason="shown"))
+        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"))
         window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _schedule_window_layout_refresh(window, reason="restored"))
         window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
         window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
-        webview.start(_startup_window_logic, (window, url))
+        webview.start(_startup_window_logic, window)
     finally:
         if proc.is_alive():
             proc.terminate()
