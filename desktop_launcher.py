@@ -121,6 +121,10 @@ def _raise_fd_limit() -> None:
 
 
 def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None = None) -> None:
+    # Disabled in the packaged app: posting to a debug server (127.0.0.1:7777)
+    # does a blocking urlopen on every window event, which freezes the GUI while
+    # the window is dragged (resized fires dozens of times/sec).
+    return
     env_path = Path(".dbg/open-project-layout.env")
     url = "http://127.0.0.1:7777/event"
     session_id = "open-project-layout"
@@ -353,10 +357,8 @@ _SPLASH_HTML = """<!doctype html>
 
 
 def _startup_window_logic(window: "webview.Window") -> None:
-    # Layout refresh is intentionally deferred until the window `shown` / `loaded`
-    # events fire on the GUI thread — doing evaluate_js / resize here (on a
-    # background thread, while the page is still loading) can stall WebView2.
-    _startup_log("startup logic (no-op; deferring layout refresh)")
+    _schedule_window_layout_refresh(window, reason="startup")
+    _maybe_native_resize_nudge(window, reason="startup")
 
 
 def main() -> None:
@@ -401,11 +403,15 @@ def main() -> None:
         _startup_log("creating window")
         window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
         shell_api.bind(window)
-        window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _startup_log("window loaded event"))
-        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _startup_log("window shown event"))
-        window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _startup_log("window restored event"))
-        window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _startup_log("window maximized event"))
-        window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _startup_log(f"window resized {width}x{height}"))
+        # NOTE: these handlers must stay cheap — `resized` fires dozens of times
+        # per second while the window is dragged, and any blocking work (network
+        # debug posts, file logging) here freezes the GUI. `_schedule_window_layout_refresh`
+        # is debounced to 0.3s, so it is safe.
+        window.events.loaded += lambda: _schedule_window_layout_refresh(window, reason="loaded")
+        window.events.shown += lambda: _schedule_window_layout_refresh(window, reason="shown")
+        window.events.restored += lambda: _schedule_window_layout_refresh(window, reason="restored")
+        window.events.maximized += lambda: _schedule_window_layout_refresh(window, reason="maximized")
+        window.events.resized += lambda width, height: _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}")
         window.events.closed += lambda: _shutdown_and_exit(proc)
         _startup_log("entering webview.start (GUI loop)")
         webview.start(_startup_window_logic, window, private_mode=False)
