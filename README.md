@@ -203,7 +203,8 @@ project.tmproj
 - Camera permission (macOS auto request): `camera_permission.py`
 - Native file dialogs (macOS osascript / Windows PowerShell): `file_dialog.py`
 - Windows build script: `build_windows.ps1`
-- Windows packaging script (distributable .zip): `package_windows.ps1`
+- Windows packaging script (installer .exe / .zip): `package_windows.ps1`
+- Inno Setup installer definition: `installer.iss`
 
 ## macOS (.app + .dmg)
 
@@ -258,8 +259,13 @@ Package for distribution (Windows equivalent of the macOS `.dmg`):
 .\package_windows.ps1
 ```
 
+Produces a proper installer `.exe` (requires Inno Setup — install once with
+`winget install JRSoftware.InnoSetup`); falls back to a `.zip` if Inno Setup is
+not installed.
+
 Artifacts:
-- `dist\\TFLiteTraining-windows-x64-v2.4.14.zip`
+- `dist\\TFLiteTraining-Setup-v2.4.14.exe`  (installer, preferred)
+- `dist\\TFLiteTraining-windows-x64-v2.4.14.zip`  (zip fallback)
 
 ## FAQ
 
