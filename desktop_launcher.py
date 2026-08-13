@@ -340,25 +340,20 @@ _SPLASH_HTML = """<!doctype html>
 </html>"""
 
 
-def _startup_window_logic(window: "webview.Window", splash: "webview.Window", url: str) -> None:
-    # Splash is already visible. Wait for the Streamlit server in a background
-    # thread, then swap in the main window. Layout refresh happens later via the
-    # window `shown` event on the GUI thread.
-    def _swap_when_ready() -> None:
+def _startup_window_logic(window: "webview.Window", url: str) -> None:
+    # The window initially renders a splash HTML. Wait for the local Streamlit
+    # server in a background thread, then navigate the same window to the app.
+    def _load_app_when_ready() -> None:
         try:
             _wait_http_ready(url, timeout_s=30.0)
         except Exception:
-            pass  # server failed; still show the main window (it renders the error)
+            pass  # server failed; still navigate (the browser renders the error)
         try:
-            window.show()
-        except Exception:
-            pass
-        try:
-            splash.destroy()
+            window.load_url(url)
         except Exception:
             pass
 
-    threading.Thread(target=_swap_when_ready, daemon=True).start()
+    threading.Thread(target=_load_app_when_ready, daemon=True).start()
 
 
 def main() -> None:
@@ -379,25 +374,16 @@ def main() -> None:
         import webview
 
         shell_api = _ShellApi()
-        # Show a splash immediately so the user gets feedback while the local
-        # Streamlit server boots (a couple of seconds even with lazy TF import).
-        splash = webview.create_window(
-            "TFLiteTraining",
-            html=_SPLASH_HTML,
-            width=380,
-            height=240,
-            frameless=True,
-            on_top=True,
-            easy_drag=False,
-            resizable=False,
-        )
+        # The window starts by rendering a splash HTML; _startup_window_logic
+        # navigates it to the app URL once the local Streamlit server is ready.
+        # (Single window avoids pywebview treating a separate splash as the
+        # primary window and exiting when it is destroyed.)
         window = webview.create_window(
             "TF Lite Training",
-            url,
+            html=_SPLASH_HTML,
             width=1200,
             height=800,
             js_api=shell_api,
-            hidden=True,
         )
         shell_api.bind(window)
         window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
@@ -406,7 +392,7 @@ def main() -> None:
         window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
         window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
-        webview.start(_startup_window_logic, (window, splash, url))
+        webview.start(_startup_window_logic, (window, url))
     finally:
         if proc.is_alive():
             proc.terminate()
