@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -51,6 +52,62 @@ def _app_data_dir() -> Path:
     return (base / "TFLiteTraining").resolve()
 
 
+def _prepare_log_file() -> str:
+    """Return a writable log path; fall back to the temp dir if the app-data dir fails."""
+    candidates = []
+    try:
+        candidates.append(str((_app_data_dir() / "logs" / "streamlit.log").resolve()))
+    except Exception:
+        pass
+    candidates.append(str((Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log").resolve()))
+    for log_path in candidates:
+        try:
+            p = Path(log_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch(exist_ok=True)
+            return str(p)
+        except Exception:
+            continue
+    return ""
+
+
+def _raise_fd_limit() -> None:
+    target = 4096
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        desired_soft = max(soft, target)
+        desired_hard = max(hard, desired_soft)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (desired_soft, desired_hard))
+        except Exception:
+            new_soft = min(desired_soft, hard)
+            if new_soft != soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        RLIMIT_NOFILE = 8
+
+        class Rlimit(ctypes.Structure):
+            _fields_ = [("rlim_cur", ctypes.c_uint64), ("rlim_max", ctypes.c_uint64)]
+
+        rlim = Rlimit(0, 0)
+        if libc.getrlimit(RLIMIT_NOFILE, ctypes.byref(rlim)) != 0:
+            return
+        rlim.rlim_cur = min(max(int(rlim.rlim_cur), target), int(rlim.rlim_max))
+        libc.setrlimit(RLIMIT_NOFILE, ctypes.byref(rlim))
+    except Exception:
+        return
+
+
 def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None = None) -> None:
     env_path = Path(".dbg/open-project-layout.env")
     url = "http://127.0.0.1:7777/event"
@@ -87,15 +144,27 @@ def _debug_post(hypothesis_id: str, location: str, msg: str, data: dict | None =
 def _run_streamlit_server(port: int, log_path: str) -> None:
     import traceback
 
+    _raise_fd_limit()
+
     from streamlit.web import bootstrap
+
+    try:
+        base_dir = _app_data_dir()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(base_dir))
+    except Exception:
+        pass
 
     app_py = _resource_path("app.py")
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+    os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"
 
     flag_options = {
         "global_developmentMode": False,
         "server_headless": True,
+        "server_fileWatcherType": "poll",
+        "server_runOnSave": False,
         "server_port": port,
         "server_address": "127.0.0.1",
         "browser_gatherUsageStats": False,
@@ -103,8 +172,14 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
         "browser_serverAddress": "127.0.0.1",
     }
 
-    log_file = Path(log_path)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if not log_path:
+        log_path = _prepare_log_file()
+    if log_path:
+        log_file = Path(log_path)
+    else:
+        log_file = (Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log").resolve()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.touch(exist_ok=True)
     with log_file.open("a", encoding="utf-8") as f:
         with contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
             try:
@@ -138,7 +213,19 @@ _LAYOUT_REFRESH_JS = r"""
 """
 
 
+_LAST_LAYOUT_REFRESH_AT = 0.0
+
+
 def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") -> None:
+    global _LAST_LAYOUT_REFRESH_AT
+    # Debounce: the SPA fires request_reflow many times in quick succession on
+    # mount (loaded/shown/mount:t0/t120/t360), and each call would schedule a
+    # fresh set of evaluate_js timers that force Streamlit + iframe reflow. Only
+    # let one schedule through per window so the native WebView2 is not thrashed.
+    now = time.time()
+    if (now - _LAST_LAYOUT_REFRESH_AT) < 0.3:
+        return
+    _LAST_LAYOUT_REFRESH_AT = now
     # #region debug-point C:schedule-window-layout-refresh
     _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell layout refresh scheduled", {"reason": str(reason or "")})
     # #endregion
@@ -156,7 +243,7 @@ def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") 
         timer.daemon = True
         timer.start()
 
-    for delay_s in (0.0, 0.12, 0.35, 0.8):
+    for delay_s in (0.0, 0.18, 0.5):
         _run_once(delay_s)
 
 
@@ -225,12 +312,16 @@ def _startup_window_logic(window: "webview.Window") -> None:
 
 def main() -> None:
     multiprocessing.freeze_support()
+    # Windows: explicitly use 'spawn' for PyInstaller compatibility
+    if os.name == "nt":
+        try:
+            multiprocessing.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass  # already set
+    _raise_fd_limit()
     port = _find_free_port()
     url = f"http://127.0.0.1:{port}"
-    log_file = (_app_data_dir() / "logs" / "streamlit.log").resolve()
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    log_file.touch(exist_ok=True)
-    log_path = str(log_file)
+    log_path = _prepare_log_file()
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
     try:

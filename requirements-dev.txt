@@ -1,2 +1,2 @@
 pyinstaller
-dmgbuild
+dmgbuild; sys_platform == "darwin"

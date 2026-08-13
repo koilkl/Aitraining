@@ -4,8 +4,6 @@ import base64
 import json
 import shutil
 import socket
-import subprocess
-import sys
 import threading
 import time
 import zipfile
@@ -50,72 +48,21 @@ class SessionConfig:
 
 
 def _pick_folder_dialog(title: str = "Choose Folder") -> Optional[str]:
-    """Cross-platform folder picker. macOS uses osascript, Windows/Linux uses tkinter."""
-    if sys.platform == "darwin":
-        try:
-            script = f'POSIX path of (choose folder with prompt "{title}")'
-            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                picked = (proc.stdout or "").strip()
-                if picked:
-                    return picked
-        except Exception:
-            pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        return filedialog.askdirectory(title=title) or None
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
+    """Cross-platform folder picker (native on macOS/Windows, tkinter fallback)."""
+    from file_dialog import pick_folder
+
+    return pick_folder(title=title)
 
 
 def _pick_save_dialog(default_name: str = "project.tmproj") -> Optional[str]:
-    """Cross-platform save-file picker."""
-    if sys.platform == "darwin":
-        try:
-            script = f'POSIX path of (choose file name with prompt "Save Project" default name "{default_name}")'
-            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                picked = (proc.stdout or "").strip()
-                if picked:
-                    p = Path(picked).expanduser()
-                    return str(p if p.suffix.lower() == ".tmproj" else p.with_suffix(".tmproj"))
-        except Exception:
-            pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        picked = filedialog.asksaveasfilename(
-            initialfile=default_name,
-            defaultextension=".tmproj",
-            filetypes=[("Teachable Machine Project", "*.tmproj")],
-        )
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
+    """Cross-platform save-file picker (native on macOS/Windows, tkinter fallback)."""
+    from file_dialog import pick_save_file
+
+    picked = pick_save_file(
+        title="Save Project",
+        default_name=default_name,
+        filetypes=[("Teachable Machine Project", "*.tmproj")],
+    )
     if not picked:
         return None
     p = Path(str(picked)).expanduser()
@@ -123,38 +70,13 @@ def _pick_save_dialog(default_name: str = "project.tmproj") -> Optional[str]:
 
 
 def _pick_open_dialog() -> Optional[str]:
-    """Cross-platform open-file picker for .tmproj files."""
-    if sys.platform == "darwin":
-        try:
-            script = 'POSIX path of (choose file with prompt "Open Project")'
-            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
-            if proc.returncode == 0:
-                picked = (proc.stdout or "").strip()
-                if picked:
-                    p = Path(picked).expanduser()
-                    return str(p) if p.suffix.lower() == ".tmproj" else None
-        except Exception:
-            pass
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        picked = filedialog.askopenfilename(
-            filetypes=[("Teachable Machine Project", "*.tmproj")],
-        )
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
+    """Cross-platform open-file picker for .tmproj files (native on macOS/Windows)."""
+    from file_dialog import pick_open_file
+
+    picked = pick_open_file(
+        title="Open Project",
+        filetypes=[("Teachable Machine Project", "*.tmproj")],
+    )
     if not picked:
         return None
     p = Path(str(picked)).expanduser()
@@ -177,6 +99,70 @@ def _is_truthy(value: Any) -> bool:
         return bool(value)
     text = str(value or "").strip().lower()
     return text in {"1", "true", "yes", "on"}
+
+
+_TFLITE_OP_RESOLVER_MAP = {
+    "ADD": "Add",
+    "AVERAGE_POOL_2D": "AveragePool2D",
+    "CONV_2D": "Conv2D",
+    "DEPTHWISE_CONV_2D": "DepthwiseConv2D",
+    "FULLY_CONNECTED": "FullyConnected",
+    "MAX_POOL_2D": "MaxPool2D",
+    "MUL": "Mul",
+    "PACK": "Pack",
+    "PAD": "Pad",
+    "QUANTIZE": "Quantize",
+    "DEQUANTIZE": "Dequantize",
+    "RESHAPE": "Reshape",
+    "SHAPE": "Shape",
+    "SOFTMAX": "Softmax",
+    "STRIDED_SLICE": "StridedSlice",
+}
+
+
+def _generate_model_resolver_h(tflite_bytes: bytes) -> str:
+    """Generate model_resolver.h matching the ops in the exported .tflite."""
+    ops = []
+    try:
+        import tensorflow as tf
+        interp = tf.lite.Interpreter(model_content=tflite_bytes)
+        interp.allocate_tensors()
+        for detail in interp._get_ops_details():
+            op = str(detail.get("op_name") or "")
+            if op and op not in ops:
+                ops.append(op)
+    except Exception:
+        pass
+    if not ops:
+        ops = ["CONV_2D", "MAX_POOL_2D", "SHAPE", "STRIDED_SLICE", "PACK", "RESHAPE", "FULLY_CONNECTED", "SOFTMAX"]
+    resolved = [op for op in ops if op in _TFLITE_OP_RESOLVER_MAP]
+    if not resolved:
+        resolved = ["CONV_2D", "FULLY_CONNECTED", "SOFTMAX"]
+    n = len(resolved)
+    lines = [
+        "/*",
+        "Auto-generated by TFLiteTraining export.",
+        "Derived from the exported .tflite builtin operator table.",
+        "*/",
+        "",
+        "#ifndef TFLITE_MODEL_RESOLVER_H_",
+        "#define TFLITE_MODEL_RESOLVER_H_",
+        "",
+        '#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"',
+        "",
+        f"using ModelOpResolver = tflite::MicroMutableOpResolver<{n}>;",
+        "",
+        "inline TfLiteStatus RegisterModelOps(ModelOpResolver& resolver) {",
+    ]
+    for op in resolved:
+        add_fn = _TFLITE_OP_RESOLVER_MAP[op]
+        lines.append(f"  if (resolver.Add{add_fn}() != kTfLiteOk) return kTfLiteError;")
+    lines.append("  return kTfLiteOk;")
+    lines.append("}")
+    lines.append("")
+    lines.append("#endif  // TFLITE_MODEL_RESOLVER_H_")
+    lines.append("")
+    return "\n".join(lines)
 
 
 class RecordController:
@@ -386,9 +372,22 @@ class RecordController:
         if path == "/serial/ports":
             ports = []
             try:
+                blocked = {
+                    "/dev/cu.bluetooth-incoming-port",
+                    "/dev/cu.debug-console",
+                    "/dev/tty.bluetooth-incoming-port",
+                    "/dev/tty.debug-console",
+                }
                 for p in list_serial_ports():
-                    label = f"{p.device} - {p.description}" if getattr(p, "description", "") else p.device
-                    ports.append({"device": str(p.device), "label": str(label)})
+                    dev = str(p.device or "")
+                    desc = str(getattr(p, "description", "") or "")
+                    d_low = dev.strip().lower()
+                    if d_low in blocked:
+                        continue
+                    if "bluetooth" in desc.lower() and "serial" not in desc.lower():
+                        continue
+                    label = f"{dev} - {desc}" if desc else dev
+                    ports.append({"device": dev, "label": str(label)})
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -520,6 +519,8 @@ class RecordController:
                     "top_prob": float(pred.get("top_prob") or 0.0),
                     "image_b64": base64.b64encode(png).decode("ascii"),
                     "processed_image_b64": str(pred.get("processed_image_b64") or ""),
+                    "crop_image_b64": str(pred.get("crop_image_b64") or ""),
+                    "full_image_b64": str(pred.get("full_image_b64") or ""),
                     "processed_variant": str(pred.get("processed_variant") or ""),
                 },
                 cors=True,
@@ -1209,6 +1210,7 @@ class RecordController:
             export_dir / "model_settings.cpp",
             export_dir / "model.h",
             export_dir / "model.cpp",
+            export_dir / "model_resolver.h",
             export_dir / "labels.txt",
         ]
         dedup_target_paths: List[Path] = []
@@ -1230,6 +1232,9 @@ class RecordController:
         (export_dir / "model.h").write_text(hdr, encoding="utf-8")
         (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
         (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
+        # Generate model_resolver.h from the actual ops in the exported model
+        resolver_h = _generate_model_resolver_h(source_bytes)
+        (export_dir / "model_resolver.h").write_text(resolver_h, encoding="utf-8")
         def _c_str(s: str) -> str:
             return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -1649,7 +1654,6 @@ class RecordController:
         # User-adjustable thresholds from class-level config (shared across samples)
         bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 0)) if class_cfg else 20
         bg_lum_thresh  = int(class_cfg.get("bg_lum_thresh", 100)) if class_cfg else 180
-        print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} (G-channel)")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None
@@ -1661,11 +1665,17 @@ class RecordController:
                                          bg_lum_thresh=bg_lum_thresh,
                                          return_crop_box=True,
                                          fast_mode=fast_mode)
-        if isinstance(result, tuple) and len(result) == 3:
+        if isinstance(result, tuple) and len(result) >= 5:
+            arr, crop_norm, masked_preview, crop_preview, _full_preview = result
+        elif isinstance(result, tuple) and len(result) >= 4:
+            arr, crop_norm, masked_preview, crop_preview = result
+        elif isinstance(result, tuple) and len(result) >= 3:
             arr, crop_norm, masked_preview = result
+            crop_preview = None
         else:
             arr, crop_norm = result
             masked_preview = None
+            crop_preview = None
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
@@ -1676,8 +1686,14 @@ class RecordController:
             mp_png = _to_png_bytes(Image.fromarray(mp_arr, mode="L"))
         else:
             mp_png = png_bytes
+        # Crop-only preview (no threshold)
+        if crop_preview is not None:
+            cp_arr = np.asarray(np.clip(crop_preview[:,:,0] * 255.0, 0, 255), dtype=np.uint8) if crop_preview.ndim == 3 else np.asarray(np.clip(crop_preview * 255.0, 0, 255), dtype=np.uint8)
+            cp_png = _to_png_bytes(Image.fromarray(cp_arr, mode="L"))
+        else:
+            cp_png = png_bytes
         if return_crop:
-            return {"png": png_bytes, "crop": list(crop_norm), "processed_png": mp_png}
+            return {"png": png_bytes, "crop": list(crop_norm), "processed_png": mp_png, "crop_png": cp_png}
         return png_bytes
 
     def _rebuild_processed_cache(
@@ -1938,12 +1954,19 @@ class RecordController:
                 scores = (out.astype(np.float32) - float(ozp)) * float(oscale)
             else:
                 scores = out.astype(np.float32)
-            scores = scores - float(np.max(scores))
-            expv = np.exp(scores)
-            return expv / float(np.sum(expv) + 1e-12)
+            # Auto-detect softmax:
+            # - If scores sum to ~1 → model already has softmax → use as-is
+            # - Otherwise → int8 conversion stripped the softmax op → apply it here
+            if abs(float(np.sum(scores)) - 1.0) > 0.1:
+                scores = scores - float(np.max(scores))
+                expv = np.exp(scores)
+                scores = expv / float(np.sum(expv) + 1e-12)
+            return np.clip(scores, 0.0, 1.0)
 
-        variant_probs = {name: _invoke_one(arr) for name, arr in prepared.items()}
-        probs = next(iter(variant_probs.values()))
+        # Only the "default" array is a real model input; the *_preview entries
+        # are display-only images and MUST NOT be run through the interpreter
+        # (that would run inference 4× per frame and thrash the preview loop).
+        probs = _invoke_one(np.asarray(prepared["default"]))
 
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
@@ -1957,6 +1980,18 @@ class RecordController:
             processed_variant = "masked"
         else:
             processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
+        # Crop-only preview (no threshold)
+        if "crop_preview" in prepared:
+            crop_arr = np.asarray(prepared["crop_preview"])
+            crop_png = _to_png_bytes(_model_input_array_to_preview_image(crop_arr))
+        else:
+            crop_png = None
+        # Full-frame thresholded preview (no crop) — for the Orig view
+        if "full_preview" in prepared:
+            full_arr = np.asarray(prepared["full_preview"])
+            full_png = _to_png_bytes(_model_input_array_to_preview_image(full_arr))
+        else:
+            full_png = None
         processed_img = _model_input_array_to_preview_image(processed_arr)
         processed_png = _to_png_bytes(processed_img)
         return {
@@ -1965,6 +2000,8 @@ class RecordController:
             "top_label": str(labels[top_i]) if 0 <= top_i < len(labels) else "",
             "top_prob": float(probs[top_i]) if probs.size else 0.0,
             "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
+            "crop_image_b64": base64.b64encode(crop_png).decode("ascii") if crop_png else "",
+            "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
             "processed_variant": str(processed_variant or ""),
         }
 

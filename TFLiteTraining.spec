@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.')]
+datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('file_dialog.py', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('streamlit')
@@ -16,6 +17,25 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all('serial')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+tmp_ret = collect_all('tkinter')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Windows: ensure pyserial backend is collected
+hiddenimports += ['serial.tools.list_ports_windows', 'serial.tools.list_ports_common']
+
+# Windows: multiprocessing support for frozen apps
+hiddenimports += ['multiprocessing', 'multiprocessing.process', 'multiprocessing.spawn',
+                   'multiprocessing.queues', 'multiprocessing.synchronize',
+                   'multiprocessing.pool', 'multiprocessing.heap',
+                   'multiprocessing.reduction', 'multiprocessing.resource_tracker']
+
+# Ensure pathlib is available (resolved Path objects)
+hiddenimports += ['pathlib']
+
+# Dynamically imported modules used on Windows/macOS
+hiddenimports += ['webview', 'pywebview', 'tkinter', 'websocket', 'websocket-client',
+                   'PIL', 'PIL.Image', 'io', 'uuid', 'json', 'base64']
 
 
 a = Analysis(
@@ -59,13 +79,16 @@ coll = COLLECT(
     upx_exclude=[],
     name='TFLiteTraining',
 )
-app = BUNDLE(
-    coll,
-    name='TFLiteTraining.app',
-    icon=None,
-    bundle_identifier='ai.tflite.training',
-    info_plist={
-        'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
-        'NSHighResolutionCapable': True,
-    },
-)
+
+# macOS: bundle into .app; Windows: COLLECT alone produces a dist folder with the .exe
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name='TFLiteTraining.app',
+        icon=None,
+        bundle_identifier='ai.tflite.training',
+        info_plist={
+            'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
+            'NSHighResolutionCapable': True,
+        },
+    )

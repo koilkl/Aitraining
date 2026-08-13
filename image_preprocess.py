@@ -683,10 +683,6 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Too dark (below dark_thresh) → shadow/noise → white.
     # Too bright (above lum_thresh) → paper/background → white.
     is_sign = (gray > bg_dark_thresh) & (gray < bg_lum_thresh)
-    sign_pct = is_sign.mean() * 100
-    too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
-    too_bright_pct = (gray >= bg_lum_thresh).mean() * 100
-    print(f"[MASK] sign={sign_pct:.1f}% dark={too_dark_pct:.1f}% bright={too_bright_pct:.1f}%  (G>{bg_dark_thresh} & G<{bg_lum_thresh})")
     gray[~is_sign] = 255
 
     # Crop: shadow search (live preview) or center crop (batch/cache)
@@ -720,6 +716,27 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     except Exception:
         pass
 
+    # Full-frame thresholded preview (mask applied, NO crop) — for the Orig view.
+    full_preview = None
+    try:
+        fp_arr = gray.copy()  # gray is already masked: non-sign → 255
+        fp_img = Image.fromarray(fp_arr, mode="L")
+        fp_img = fp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+        full_preview = np.expand_dims(np.asarray(fp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
+    except Exception:
+        pass
+
+    # Crop-only preview: cropped RGB → luminance, resized, NO threshold/stretch.
+    crop_preview = None
+    try:
+        cp_rgb = src[y1:y2, x1:x2, :3].astype(np.float32)
+        cp_gray = (cp_rgb[:,:,0] * 0.299 + cp_rgb[:,:,1] * 0.587 + cp_rgb[:,:,2] * 0.114).astype(np.uint8)
+        cp_img = Image.fromarray(cp_gray, mode="L")
+        cp_img = cp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+        crop_preview = np.expand_dims(np.asarray(cp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
+    except Exception:
+        pass
+
     # Crop from original RGB, then convert to BT.601 luminance.
     # ROI search used the masked G-channel for detection, but the final
     # pixels come from the unmodified source — much sharper.
@@ -736,11 +753,11 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     result = out.astype(np.float32) / 255.0
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
     if return_crop_box:
-        if masked_preview is not None:
-            return image, crop_norm, masked_preview
+        if masked_preview is not None and crop_preview is not None and full_preview is not None:
+            return image, crop_norm, masked_preview, crop_preview, full_preview
         return image, crop_norm
-    if masked_preview is not None:
-        return image, masked_preview
+    if masked_preview is not None and crop_preview is not None and full_preview is not None:
+        return image, masked_preview, crop_preview, full_preview
     return image
 
 
@@ -801,6 +818,10 @@ def prepare_inference_inputs(
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
                                         bg_dark_thresh=int(bg_dark_thresh),
                                         bg_lum_thresh=int(bg_lum_thresh))
+    if isinstance(result, tuple) and len(result) >= 4:
+        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2], "full_preview": result[3]}
+    if isinstance(result, tuple) and len(result) >= 3:
+        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2]}
     if isinstance(result, tuple) and len(result) == 2:
         return {"default": result[0], "masked_preview": result[1]}
     return {"default": result}

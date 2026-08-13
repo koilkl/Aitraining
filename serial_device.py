@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -96,7 +97,6 @@ class SerialFrameReader:
                         continue
                 frame = bytes(self._buf[after:need])
                 del self._buf[:need]
-                print(f"[Serial] frame ok: {len(frame)} bytes (expecting {self._frame_size}), buf_remaining={len(self._buf)}")
                 return frame
         raise TimeoutError(f"Timeout waiting for frame header (need {self._frame_size} bytes, buf has {len(self._buf)}, waited {timeout_s:.1f}s)")
 
@@ -119,8 +119,9 @@ def _fallback_list_serial_ports() -> List[SerialPortInfo]:
         patterns = ["/dev/cu.*", "/dev/tty.*"]
     elif sys.platform.startswith("linux"):
         patterns = ["/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyAMA*", "/dev/ttyS*"]
-    else:
-        patterns = []
+    elif os.name == "nt":
+        # Windows: probe COM0 – COM99 via CreateFile-like access
+        return _fallback_windows_com_ports()
     devices: List[str] = []
     for pat in patterns:
         devices.extend(glob.glob(pat))
@@ -131,6 +132,22 @@ def _fallback_list_serial_ports() -> List[SerialPortInfo]:
             continue
         seen.add(dev)
         out.append(SerialPortInfo(device=str(dev), description=""))
+    return out
+
+
+def _fallback_windows_com_ports() -> List[SerialPortInfo]:
+    """Enumerate COM ports on Windows without pyserial by probing each port."""
+    out: List[SerialPortInfo] = []
+    for i in range(0, 100):
+        port = f"COM{i}"
+        try:
+            # Try to open the port with a short timeout to check if it exists
+            import serial
+            ser = serial.Serial(port=port, baudrate=9600, timeout=0.02)
+            ser.close()
+            out.append(SerialPortInfo(device=port, description=f"Serial Port {port}"))
+        except Exception:
+            pass
     return out
 
 

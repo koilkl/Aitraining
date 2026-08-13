@@ -46,7 +46,8 @@ Goal: students should not need to install Python. Double-click to launch.
     - `Full Frame`: disable extra ROI cropping for that class
 - Preview / Export:
       - The right `Preview` panel runs preview inference after training
-      - Toggle `Input` to start/stop live predictions; toggle `ROI` to switch between raw input and the thresholded mask view (shows dark/lum effects)
+      - Toggle `Input` to start/stop live predictions; toggle `ROI` to apply the auto-crop; toggle `Orig` to apply the thresholded filter (enable both for the cropped + filtered view)
+      - The prediction bars show per-class confidence; the button under them toggles between percentage (`Show Score`) and raw 0–1 score (`Show %`)
       - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
       - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
@@ -95,6 +96,7 @@ The **processed preview** (ROI toggle / class edit page) shows step 2: white = f
   - Compatibility files:
     - `model.h`
     - `model.cpp`
+    - `model_resolver.h`
     - `labels.txt`
 - Export naming:
   - `Export name` controls the `.tflite` base name and the generated `*_model_data.*` file names
@@ -199,6 +201,8 @@ project.tmproj
 - Training/quant/export: `trainer.py`
 - UI styles: `ui_styles.py`
 - Camera permission (macOS auto request): `camera_permission.py`
+- Native file dialogs (macOS osascript / Windows PowerShell): `file_dialog.py`
+- Windows build script: `build_windows.ps1`
 
 ## macOS (.app + .dmg)
 
@@ -223,7 +227,14 @@ Artifacts:
 
 ## Windows (.exe)
 
-Run on Windows:
+One-shot build (recommended):
+
+```powershell
+cd AItraining
+.\build_windows.ps1 -Clean
+```
+
+Or build manually:
 
 ```powershell
 cd AItraining
@@ -233,7 +244,6 @@ python --version
 
 py -m pip install -r requirements.txt
 py -m pip install -r requirements-dev.txt
-py -m pip install pyinstaller
 
 python -m PyInstaller --clean --noconfirm TFLiteTraining.spec
 ```

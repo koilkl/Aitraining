@@ -8,7 +8,7 @@ import uuid
 import os
 import sys
 import re
-import subprocess
+import tempfile
 import urllib.request
 import zipfile
 from html import escape as html_escape
@@ -119,16 +119,38 @@ def _dbg_open_project_layout(hypothesis_id: str, run_id: str, location: str, msg
 
 
 def _app_data_dir() -> Path:
+    candidates: list[Path] = []
     env_override = os.getenv("TFLITE_TRAINING_DATA_DIR")
     if env_override:
-        return Path(env_override).expanduser().resolve()
+        candidates.append(Path(env_override).expanduser().resolve())
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
+        candidates.append((base / APP_NAME).resolve())
     elif os.name == "nt":
         base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        candidates.append((base / APP_NAME).resolve())
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
-    return (base / APP_NAME).resolve()
+        candidates.append((base / APP_NAME).resolve())
+    candidates.append((Path(tempfile.gettempdir()) / APP_NAME).resolve())
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            (candidate / "workspace").mkdir(parents=True, exist_ok=True)
+            (candidate / "datasets").mkdir(parents=True, exist_ok=True)
+            probe_dir = candidate / "workspace" / "_probe_dir"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            probe = probe_dir / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            probe_dir.rmdir()
+            return candidate
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to prepare app data dir. Last error: {last_err}")
 
 
 APP_DATA_DIR = _app_data_dir()
@@ -145,92 +167,19 @@ def _default_export_dir() -> Path:
 
 
 def _pick_directory_dialog(initial_dir: Optional[str] = None) -> Optional[str]:
-    if sys.platform == "darwin":
-        try:
-            start_dir = Path(initial_dir).expanduser().resolve() if initial_dir else _documents_dir()
-        except Exception:
-            start_dir = _documents_dir()
-        try:
-            start_posix = str(start_dir).replace("\\", "\\\\").replace('"', '\\"')
-            script = (
-                'POSIX path of (choose folder with prompt "Choose Folder" '
-                f'default location (POSIX file "{start_posix}"))'
-            )
-            proc = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if proc.returncode == 0:
-                picked = (proc.stdout or "").strip()
-                if picked:
-                    return picked
-        except Exception:
-            pass
+    from file_dialog import pick_folder
 
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        path = filedialog.askdirectory(initialdir=initial_dir or str(_documents_dir()))
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
-    return path or None
+    return pick_folder(title="Choose Folder", initial_dir=initial_dir or str(_documents_dir()))
 
 
 def _pick_tmproj_file_dialog() -> Optional[Path]:
-    if sys.platform == "darwin":
-        try:
-            proc = subprocess.run(
-                ["osascript", "-e", 'POSIX path of (choose file with prompt "Open Project")'],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except Exception:
-            pass
-        else:
-            if proc.returncode == 0:
-                picked = (proc.stdout or "").strip()
-                if picked:
-                    p = Path(picked).expanduser()
-                    return p if p.suffix.lower() == ".tmproj" else None
+    from file_dialog import pick_open_file
 
-    # Windows / Linux fallback: tkinter file dialog
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception:
-        return None
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        picked = filedialog.askopenfilename(
-            initialdir=str(Path.home() / "Documents"),
-            filetypes=[("Teachable Machine Project", "*.tmproj")],
-        )
-    finally:
-        try:
-            root.destroy()
-        except Exception:
-            pass
+    picked = pick_open_file(
+        title="Open Project",
+        filetypes=[("Teachable Machine Project", "*.tmproj")],
+        initial_dir=str(Path.home() / "Documents"),
+    )
     if not picked:
         return None
     p = Path(str(picked)).expanduser()
@@ -387,9 +336,18 @@ def _init_session() -> None:
 
 
 def _session_workspace() -> Path:
+    global WORKSPACE_DIR
     p = WORKSPACE_DIR / st.session_state.session_id
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except PermissionError:
+        fallback = (Path(tempfile.gettempdir()) / APP_NAME / "workspace").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        WORKSPACE_DIR = fallback
+        p = WORKSPACE_DIR / st.session_state.session_id
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
 
 def _remove_workspace_tree(session_id: str) -> None:
@@ -747,23 +705,52 @@ def _tm_classes_meta_path() -> Path:
     return _tm_dataset_dir().parent / "tm_classes.json"
 
 
-def _tm_load_classes_meta() -> Optional[List[str]]:
+def _tm_load_classes_meta_full() -> Optional[Dict[str, Any]]:
     p = _tm_classes_meta_path()
     if not p.exists():
         return None
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        classes = raw.get("classes") if isinstance(raw, dict) else None
-        if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
-            return [str(x) for x in classes]
     except Exception:
         return None
+    if not isinstance(raw, dict):
+        return None
+    classes = raw.get("classes")
+    if not (isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes):
+        return None
+    from image_preprocess import normalize_class_preprocess_map, normalize_sample_preprocess_map
+
+    class_preprocess = normalize_class_preprocess_map(raw.get("class_preprocess"))
+    sample_preprocess = normalize_sample_preprocess_map(raw.get("sample_preprocess"))
+    return {
+        "classes": [str(x) for x in classes],
+        "class_preprocess": class_preprocess,
+        "sample_preprocess": sample_preprocess,
+    }
+
+
+def _tm_load_classes_meta() -> Optional[List[str]]:
+    meta = _tm_load_classes_meta_full()
+    if not meta:
+        return None
+    classes = meta.get("classes")
+    if isinstance(classes, list) and all(isinstance(x, str) for x in classes) and classes:
+        return [str(x) for x in classes]
     return None
 
 
 def _tm_save_classes_meta(classes: List[str]) -> None:
     p = _tm_classes_meta_path()
-    p.write_text(json.dumps({"classes": list(classes)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload: Dict[str, Any] = {}
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                payload.update(raw)
+        except Exception:
+            payload = {}
+    payload["classes"] = list(classes)
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _status_style(status: str) -> str:
@@ -1279,6 +1266,7 @@ def _render_tm_old_frontend_html(
 ) -> None:
     import json as _json
 
+    meta = _tm_load_classes_meta_full() or {}
     payload = {
         "port": int(port),
         "session": str(session_id),
@@ -1301,6 +1289,8 @@ def _render_tm_old_frontend_html(
         "sample_previews": sample_previews,
         "initial_open_source_class": str(initial_open_source_class or ""),
         "initial_open_source_kind": str(initial_open_source_kind or ""),
+        "class_preprocess": dict(meta.get("class_preprocess") or {}),
+        "sample_preprocess": dict(meta.get("sample_preprocess") or {}),
         "train_cfg": {
             "img_size": int(train_cfg.img_size),
             "batch_size": int(train_cfg.batch_size),
@@ -1687,6 +1677,21 @@ def _render_tm_old_frontend_html(
       background: rgba(26,115,232,0.55);
       border-radius: 999px;
       transition: width 120ms linear;
+    }}
+    .out-toggle {{
+      display: block;
+      margin: 8px auto 0;
+      padding: 4px 12px;
+      border: 1px solid var(--input-border);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+    }}
+    .out-toggle:hover {{
+      border-color: var(--accent);
+      color: var(--accent);
     }}
     .out-pct {{
       position: absolute;
@@ -2565,6 +2570,26 @@ def _render_tm_old_frontend_html(
       color: var(--text);
       background: var(--input-bg);
     }}
+    /* Dark mode: hardcoded light-mode colors are unreadable on dark surfaces. */
+    @media (prefers-color-scheme: dark) {{
+      .navmenu .danger {{ color: #f28b82; }}
+      .out-pct {{ color: var(--muted); }}
+      .train-status {{ color: var(--muted); background: rgba(255,255,255,0.06); }}
+      .train-adv-row {{ color: var(--muted); }}
+      .trainbtn {{ color: rgba(255,255,255,0.4); background: rgba(255,255,255,0.06); }}
+      .footer {{ color: rgba(255,255,255,0.5); }}
+      .summary-title {{ color: var(--text); }}
+      .class-preprocess-thumb.defined .class-preprocess-thumb-state {{ color: #34a853; }}
+      .class-preprocess-status-chip.dirty {{ color: #f0b429; }}
+      .preview-pane img {{ background: #111821; }}
+      .out-bar {{ background: rgba(255,255,255,0.12); }}
+      .navmenu {{ border-color: rgba(255,255,255,0.1); }}
+      .navmenu button:hover {{ background: rgba(255,255,255,0.06); }}
+      .navmenu .divider {{ background: rgba(255,255,255,0.1); }}
+      .iconbtn:hover {{ background: rgba(255,255,255,0.06); }}
+      .divider {{ background: rgba(255,255,255,0.1); }}
+      .addclass {{ border-color: rgba(255,255,255,0.2); }}
+    }}
   </style>
 </head>
 <body>
@@ -2646,6 +2671,7 @@ def _render_tm_old_frontend_html(
         <div class="preview-controls">
           <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
           <label class="preview-toggle"><input id="previewRoiToggle" type="checkbox"/><span>ROI</span></label>
+          <label class="preview-toggle"><input id="previewRawToggle" type="checkbox"/><span>Orig</span></label>
           <div class="preview-mode-tabs" id="previewModeTabs">
             <button class="preview-mode-tab" type="button" data-preview-mode="auto_by_label">Auto</button>
           </div>
@@ -3007,7 +3033,7 @@ let sourceSwitchKind = '';
 let trainInFlight = false;
 let trainPollToken = 0;
 let sourceSettingsOpen = false;
-let previewIntervalMs = 120;
+let previewIntervalMs = 80;
 let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
@@ -3017,7 +3043,9 @@ let currentSerialChannels = Number(STATE.current_serial_channels || 1);
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
-let previewShowRoi = false;
+let previewShowRoi = true;
+let previewShowRaw = false;  // toggle to show original (unprocessed) image
+let previewShowScore = false;  // toggle: percentage (%) vs raw score (0.000-1.000)
 let previewDarkThresh = 0;
 let previewLumThresh = 100;
 let previewUploadImageSrc = '';
@@ -3457,7 +3485,11 @@ function closeClassPreprocessEditor(force = false) {{
     const next = normalizeClassPreprocessConfig(Object.assign({{}}, classPreprocessDraft || {{}}, {{mode: nextMode}}));
     if (!next.manual_roi) next.manual_roi = [0, 0, 1, 1];
     classPreprocessDraft = next;
-    classPreprocessDirty = true;
+    if (nextMode === 'auto_by_label') {{
+      const filename = selectedClassSampleFilename(classPreprocessClass);
+      if (filename) setSamplePreprocessConfig(classPreprocessClass, filename, next);
+    }}
+    classPreprocessDirty = (nextMode !== 'auto_by_label');
     renderClassPreprocessModal();
     refreshClassProcessedPreview();
   }}
@@ -3626,12 +3658,12 @@ function renderClassPreprocessModal() {{
             <div class="class-preprocess-result">${{classPreprocessProcessedSrc ? `<img src="${{escapeHtml(classPreprocessProcessedSrc)}}" alt="Processed preview"/>` : `<div class="preview-empty">${{classPreprocessBusy ? 'Rendering...' : 'Choose a sample to preview preprocessing.'}}</div>`}}</div>
           </div>
         </div>
-          <div class="class-preprocess-info">In Manual ROI mode, drag directly on the original image and save the current sample. Shortcuts: F1 Auto, F2 Sign, F3 Junction, F4 Manual ROI, F5 Full Frame, S Save, D Delete Sample, Esc Close, Arrow Keys Move ROI.</div>
+          <div class="class-preprocess-info">In Manual ROI mode, drag directly on the original image and save the current sample. Shortcuts: F1 Auto, F2 Manual ROI, S Save, D Delete Sample, Esc Close, ←→↑↓ Navigate, Shift+Arrows Move ROI.</div>
       </div>
       <div class="class-preprocess-right class-preprocess-side" id="classPreprocessRightPane">
         <div class="class-preprocess-current class-preprocess-status-row">
           <div class="class-preprocess-info">Current Sample: ${{sampleFilename ? escapeHtml(sampleFilename) : 'No sample selected'}} · ${{samplePreprocessStatus(classPreprocessClass, sampleFilename)}}</div>
-          <div class="class-preprocess-status-chip${{dirty ? ' dirty' : ''}}">${{dirty ? 'Unsaved' : 'Saved'}}</div>
+          <div class="class-preprocess-status-chip${{dirty ? ' dirty' : ''}}">${{cfg.mode === 'auto_by_label' ? 'Auto' : (dirty ? 'Unsaved' : 'Saved')}}</div>
           <button class="btn btn-secondary" type="button" id="classPreprocessDeleteSample"${{sampleFilename ? '' : ' disabled'}}>Delete Sample</button>
         </div>
         <div class="class-preprocess-mode-row">
@@ -3845,6 +3877,8 @@ function restorePreviewState() {{
       previewPreprocessMode = String(data.preprocess);
     }}
     previewShowRoi = !!data.showRoi;
+    previewShowRaw = !!data.showRaw;
+    previewShowScore = !!data.showScore;
     previewDarkThresh = Number(data.darkThresh || STATE.preview_dark_thresh || 0);
     previewLumThresh = Number(data.lumThresh || STATE.preview_lum_thresh || 100);
   }} catch (e) {{}}
@@ -3856,6 +3890,8 @@ function persistPreviewState() {{
       source: String(previewSource || 'webcam'),
       preprocess: String(previewPreprocessMode || 'auto_by_label'),
       showRoi: !!previewShowRoi,
+      showRaw: !!previewShowRaw,
+      showScore: !!previewShowScore,
       darkThresh: Number(previewDarkThresh || 0),
       lumThresh: Number(previewLumThresh || 100)
     }}));
@@ -5015,7 +5051,10 @@ async function startHoldCapture() {{
             }});
             STATE.counts[holdRecordClass] = Number(nextData.count || STATE.counts[holdRecordClass] || 0);
             recomputeTrainEnabled();
-            if (openSourceClass === holdRecordClass) updateOpenSamplesPanel(holdRecordClass);
+            if (openSourceClass === holdRecordClass) prependSampleTileToDom(holdRecordClass, {{
+              src: `data:image/png;base64,${{nextData.image_b64}}`,
+              filename: String(nextData.filename || '')
+            }});
           }} else {{
             holdSeq = seq;
           }}
@@ -5060,7 +5099,8 @@ function buildDeviceOptions(selected) {{
   const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
   const opts = ['<option value="">Select device port</option>'];
   for (const p of ports) {{
-    const device = String(p.device || '');
+    const device = String(p.device || '').trim();
+    if (!device) continue;  // skip entries with empty device name
     const label = String(p.label || device);
     const sel = device === selected ? ' selected' : '';
     opts.push(`<option value="${{device.replace(/"/g, '&quot;')}}"${{sel}}>${{label}}</option>`);
@@ -5471,20 +5511,42 @@ function renderOutputBars(labels, probs) {{
     host.innerHTML = '';
     return;
   }}
-  host.innerHTML = ls.map((label, idx) => {{
+  // Build persistent structure ONCE — the toggle button must never be
+  // destroyed by the prediction loop, or clicks get lost mid-press.
+  let rows = host.querySelector('.out-rows');
+  let btn = host.querySelector('.out-toggle');
+  if (!rows || !btn) {{
+    host.innerHTML = '<div class="out-rows"></div>';
+    rows = host.querySelector('.out-rows');
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'out-toggle';
+    btn.addEventListener('click', () => {{
+      previewShowScore = !previewShowScore;
+      try {{ persistPreviewState(); }} catch (e) {{}}
+      renderOutputBars(host._lastLabels || [], host._lastProbs || []);
+    }});
+    host.appendChild(btn);
+  }}
+  host._lastLabels = ls;
+  host._lastProbs = ps;
+  rows.innerHTML = ls.map((label, idx) => {{
     const p = Math.max(0, Math.min(1, Number(ps[idx] || 0)));
     const pct = Math.round(p * 1000) / 10;
+    const disp = previewShowScore ? p.toFixed(3) : `${{pct}}%`;
     return `
       <div class="out-row">
         <div>${{String(label)}}</div>
         <div class="out-bar">
           <div class="out-fill" style="width:${{pct}}%"></div>
-          <div class="out-pct">${{pct}}%</div>
+          <div class="out-pct">${{disp}}</div>
         </div>
       </div>
     `;
   }}).join('');
+  btn.textContent = previewShowScore ? 'Show %' : 'Show Score';
 }}
+
 async function refreshPreviewPrediction(token) {{
   if (!previewInputOn || !STATE.export_enabled) return;
   if (previewPredictInFlight) return;
@@ -5499,7 +5561,16 @@ async function refreshPreviewPrediction(token) {{
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
     const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
+    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
+    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
+    // Each button is an independent state; they stack:
+    //   Orig ON  = apply processed filter (no crop change)
+    //   ROI  ON  = apply crop (no filter)
+    //   both ON  = cropped AND filtered (processed_image_b64)
+    let src = rawSrc;
+    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
+    else if (previewShowRaw) src = fullSrc || rawSrc;
+    else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
       if (!pane.dataset.ready) {{
         pane.innerHTML = `<img id="${{imgId}}" alt="Preview"/>`;
@@ -5516,7 +5587,7 @@ async function refreshPreviewPrediction(token) {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
       note.textContent = top ? `Top: ${{top}} (${{p}}%)${{roiMsg}}` : roiMsg.trim();
     }}
   }} catch (err) {{
@@ -5552,7 +5623,16 @@ async function runPreviewUploadPrediction() {{
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
     const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
+    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
+    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
+    // Each button is an independent state; they stack:
+    //   Orig ON  = apply processed filter (no crop change)
+    //   ROI  ON  = apply crop (no filter)
+    //   both ON  = cropped AND filtered (processed_image_b64)
+    let src = rawSrc;
+    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
+    else if (previewShowRaw) src = fullSrc || rawSrc;
+    else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
       pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
       pane.dataset.ready = '1';
@@ -5561,7 +5641,7 @@ async function runPreviewUploadPrediction() {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
       note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)${{roiMsg}}` : `Upload: ${{String(previewUploadFilename || 'image')}}${{roiMsg}}`;
     }}
   }} catch (err) {{
@@ -5801,7 +5881,7 @@ function renderPreviewSettings() {{
   if (previewSource === 'device') {{
     const currentPorts = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
     if (!currentPorts.length) {{
-      refreshSerialPorts(true).catch(() => {{}});
+      refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
     }}
   }}
   const cancel = document.getElementById('previewSettingsCancel');
@@ -5810,8 +5890,11 @@ function renderPreviewSettings() {{
   const sourceSel = document.getElementById('previewInputSource');
   const uploadPick = document.getElementById('previewUploadPick');
   if (portSel) {{
-    portSel.onpointerdown = () => refreshSerialPorts(false, 'previewDevicePort');
-    portSel.onmousedown = () => refreshSerialPorts(false, 'previewDevicePort');
+    // Refresh ports once when the settings panel opens — NOT on every
+    // dropdown click (refilling mid-interaction resets the selection).
+    portSel.onchange = () => {{
+      // selection is applied on Save — just keep the UI value
+    }};
   }}
   if (sourceSel) sourceSel.onchange = () => {{
     previewSource = String(sourceSel.value || 'webcam');
@@ -5927,6 +6010,14 @@ function renderPreviewCard() {{
   const note = document.getElementById('previewNote');
   const output = document.getElementById('previewOutput');
   const toggle = document.getElementById('previewInputToggle');
+  const rawToggle = document.getElementById('previewRawToggle');
+  if (rawToggle) {{
+    rawToggle.checked = !!previewShowRaw;
+    rawToggle.onchange = () => {{
+      previewShowRaw = !!rawToggle.checked;
+      persistPreviewState();
+    }};
+  }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settingsBtn = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
@@ -5986,6 +6077,14 @@ function renderPreviewCard() {{
 }}
 function bindPreviewControls() {{
   const toggle = document.getElementById('previewInputToggle');
+  const rawToggle = document.getElementById('previewRawToggle');
+  if (rawToggle) {{
+    rawToggle.checked = !!previewShowRaw;
+    rawToggle.onchange = () => {{
+      previewShowRaw = !!rawToggle.checked;
+      persistPreviewState();
+    }};
+  }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settings = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
@@ -6024,6 +6123,21 @@ function bindPreviewControls() {{
     }};
   }});
 }}
+function prependSampleTileToDom(className, item) {{
+  const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
+  if (!host) return;
+  const tile = buildSampleTileMarkup(item, 0);
+  const grid = host.querySelector('.samples-grid');
+  if (grid) {{
+    grid.insertAdjacentHTML('afterbegin', tile);
+  }} else {{
+    host.innerHTML = `<div class="samples-grid">${{tile}}</div>`;
+  }}
+  bindSampleDeleteButtons(host, className);
+  setClassSampleCountLabel(className);
+  queueFrameHeightSync();
+}}
+
 function updateOpenSamplesPanel(className) {{
   const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
   if (!host) return;
