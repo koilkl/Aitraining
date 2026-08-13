@@ -13,7 +13,11 @@ tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all('tensorflow')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# Exclude the C++ headers under tensorflow/include — they are dev-only, bloat
+# the bundle by ~1 GB, and their deep paths exceed Windows MAX_PATH in the
+# installer (Inno Setup fails with "系统找不到指定的路径").
+tf_datas = [d for d in tmp_ret[0] if '/tensorflow/include/' not in str(d[0]).replace('\\', '/')]
+datas += tf_datas; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 tmp_ret = collect_all('serial')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
