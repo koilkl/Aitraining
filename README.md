@@ -203,6 +203,7 @@ project.tmproj
 - Camera permission (macOS auto request): `camera_permission.py`
 - Native file dialogs (macOS osascript / Windows PowerShell): `file_dialog.py`
 - Windows build script: `build_windows.ps1`
+- Windows packaging script (distributable .zip): `package_windows.ps1`
 
 ## macOS (.app + .dmg)
 
@@ -250,6 +251,15 @@ python -m PyInstaller --clean --noconfirm TFLiteTraining.spec
 
 Artifacts:
 - `dist\\TFLiteTraining\\TFLiteTraining.exe`
+
+Package for distribution (Windows equivalent of the macOS `.dmg`):
+
+```powershell
+.\package_windows.ps1
+```
+
+Artifacts:
+- `dist\\TFLiteTraining-windows-x64-v2.4.14.zip`
 
 ## FAQ
 

@@ -2862,6 +2862,7 @@ let frameHeightRaf = 0;
 let layoutResyncTimers = [];
 let mountReflowTimers = [];
 let homeNavigateTimer = 0;
+let lastFrameHeight = 0;
 function syncFrameHeight() {{
   if (window.__tmNavigatingAway) return;
   initStreamlitFrame();
@@ -2874,10 +2875,7 @@ function syncFrameHeight() {{
     const wrap = document.querySelector('.wrap');
     nextHeight = Math.max(
       body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
       doc ? doc.scrollHeight : 0,
-      doc ? doc.offsetHeight : 0,
-      doc ? doc.clientHeight : 0,
     );
     nextWidth = Math.max(
       body ? body.scrollWidth : 0,
@@ -2908,18 +2906,25 @@ function syncFrameHeight() {{
     }};
   }} catch (e) {{}}
   if (!nextHeight || !Number.isFinite(nextHeight)) return;
+  const targetHeight = Math.ceil(nextHeight + 12);
+  // Break the resize feedback loop: only post when the height actually moved.
+  // Without this, posting the same height re-triggers a resize → re-measure →
+  // re-post forever, which is what makes the scrollbar visibly "shrink" on
+  // mount and drags out render time.
+  if (Math.abs(targetHeight - lastFrameHeight) <= 2) return;
+  lastFrameHeight = targetHeight;
   try {{
     const frame = window.frameElement;
     if (frame && frame.style) {{
-      frame.style.height = `${{Math.ceil(nextHeight + 12)}}px`;
-      frame.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
+      frame.style.height = `${{targetHeight}}px`;
+      frame.style.minHeight = `${{targetHeight}}px`;
       frame.style.width = '100%';
       frame.style.maxWidth = '100%';
       if (frame.parentElement && frame.parentElement.style) {{
         frame.parentElement.style.width = '100%';
         frame.parentElement.style.maxWidth = '100%';
-        frame.parentElement.style.height = `${{Math.ceil(nextHeight + 12)}}px`;
-        frame.parentElement.style.minHeight = `${{Math.ceil(nextHeight + 12)}}px`;
+        frame.parentElement.style.height = `${{targetHeight}}px`;
+        frame.parentElement.style.minHeight = `${{targetHeight}}px`;
         frame.parentElement.style.overflow = 'hidden';
       }}
     }}
@@ -2931,7 +2936,7 @@ function syncFrameHeight() {{
   // #region debug-point A:sync-frame-height
   dbgEvent('A', 'app.py:syncFrameHeight', '[DEBUG] syncFrameHeight posting iframe height', metrics);
   // #endregion
-  sendStreamlitMessage('streamlit:setFrameHeight', {{height: Math.ceil(nextHeight + 12)}});
+  sendStreamlitMessage('streamlit:setFrameHeight', {{height: targetHeight}});
 }}
 function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;
@@ -3033,7 +3038,7 @@ let sourceSwitchKind = '';
 let trainInFlight = false;
 let trainPollToken = 0;
 let sourceSettingsOpen = false;
-let previewIntervalMs = 80;
+let previewIntervalMs = 120;
 let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);

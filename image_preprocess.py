@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -657,12 +658,17 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     return (int(x1), int(y1), int(x2), int(y2))
 
 
+_ROI_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], float]] = {}
+_ROI_CACHE_TTL = 1.0  # seconds before the auto-crop box is recomputed
+
+
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_dark_thresh: int = 0,
                                bg_lum_thresh: int = 100,
                                return_crop_box: bool = False,
-                               fast_mode: bool = False):
+                               fast_mode: bool = False,
+                               cache_key: Optional[str] = None):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -693,6 +699,17 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y1 = max(0, min(gray.shape[0] - 1, y1))
         x2 = max(x1 + 1, min(gray.shape[1], x2))
         y2 = max(y1 + 1, min(gray.shape[0], y2))
+    elif cache_key is not None:
+        cached = _ROI_CACHE.get(cache_key)
+        if cached is not None and (time.time() - cached[1]) < _ROI_CACHE_TTL:
+            x1, y1, x2, y2 = cached[0]
+            x1 = max(0, min(gray.shape[1] - 1, x1))
+            y1 = max(0, min(gray.shape[0] - 1, y1))
+            x2 = max(x1 + 1, min(gray.shape[1], x2))
+            y2 = max(y1 + 1, min(gray.shape[0], y2))
+        else:
+            x1, y1, x2, y2 = _focus_bbox(gray)
+            _ROI_CACHE[cache_key] = ((int(x1), int(y1), int(x2), int(y2)), time.time())
     elif fast_mode:
         # Fast: simple center crop (for batch cache rebuild)
         x1, y1, x2, y2 = _center_bbox(h_orig, w_orig, frac=0.60)
@@ -809,15 +826,18 @@ def prepare_inference_inputs(
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
     bg_dark_thresh: int = 0,
     bg_lum_thresh: int = 100,
+    cache_key: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
+        cache_key = None  # manual ROI must not use the auto-crop cache
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
                                         bg_dark_thresh=int(bg_dark_thresh),
-                                        bg_lum_thresh=int(bg_lum_thresh))
+                                        bg_lum_thresh=int(bg_lum_thresh),
+                                        cache_key=cache_key)
     if isinstance(result, tuple) and len(result) >= 4:
         return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2], "full_preview": result[3]}
     if isinstance(result, tuple) and len(result) >= 3:

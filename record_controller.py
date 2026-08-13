@@ -1915,6 +1915,7 @@ class RecordController:
             class_preprocess=class_preprocess,
             bg_dark_thresh=int(bg_dark_thresh),
             bg_lum_thresh=int(bg_lum_thresh),
+            cache_key=f"preview:{session_id}",
         )
         qscale = 0.0
         qzp = 0
