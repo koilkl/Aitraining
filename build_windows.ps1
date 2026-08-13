@@ -12,14 +12,23 @@ Set-Location $ScriptDir
 
 Write-Host "=== TFLiteTraining Windows Build ===" -ForegroundColor Cyan
 
-# 1. Python version check
+# 1. Python version check — the app is built/tested against Python 3.11
+#    (pywebview + pythonnet are known-good there). Prefer `py -3.11`.
 Write-Host "[1/5] Checking Python..." -ForegroundColor Yellow
-$pythonVersion = python --version 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Python not found. Install Python 3.11+ from https://python.org" -ForegroundColor Red
-    exit 1
+$PY = $null
+py -3.11 --version *> $null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  $(py -3.11 --version) (using py -3.11)" -ForegroundColor Green
+    $PY = "py -3.11"
+} else {
+    $pythonVersion = python --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Python not found. Install Python 3.11 from https://python.org" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "  $pythonVersion (falling back to system python)" -ForegroundColor Yellow
+    $PY = "python"
 }
-Write-Host "  $pythonVersion" -ForegroundColor Green
 
 # 2. Virtual environment
 Write-Host "[2/5] Setting up virtual environment..." -ForegroundColor Yellow
@@ -29,7 +38,7 @@ if ($Clean -and (Test-Path $venvPath)) {
     Remove-Item -Recurse -Force $venvPath
 }
 if (-not (Test-Path $venvPath)) {
-    python -m venv $venvPath
+    Invoke-Expression "$PY -m venv $venvPath"
     Write-Host "  Created .venv" -ForegroundColor Green
 } else {
     Write-Host "  Using existing .venv" -ForegroundColor Green
