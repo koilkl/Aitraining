@@ -3,6 +3,7 @@ examples/
 datasets/
 dist/
 build/
+.venv/
 __pycache__/
 .DS_Store
 /.vscode
