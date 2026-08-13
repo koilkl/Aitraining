@@ -311,14 +311,9 @@ class _ShellApi:
         self.window = window
 
     def request_reflow(self, reason: str = "") -> bool:
-        if self.window is None:
-            return False
-        # #region debug-point C:request-reflow
-        _debug_post("C", "desktop_launcher.py:_ShellApi.request_reflow", "[DEBUG] shell request_reflow invoked", {"reason": str(reason or "")})
-        # #endregion
-        _schedule_window_layout_refresh(self.window, reason=reason)
-        _maybe_native_resize_nudge(self.window, reason=reason)
-        return True
+        # Layout-refresh machinery removed (caused a drag deadlock). The SPA
+        # still calls this from requestShellLayoutRefresh; just acknowledge it.
+        return False
 
 
 _SPLASH_HTML = """<!doctype html>
@@ -357,8 +352,9 @@ _SPLASH_HTML = """<!doctype html>
 
 
 def _startup_window_logic(window: "webview.Window") -> None:
-    _schedule_window_layout_refresh(window, reason="startup")
-    _maybe_native_resize_nudge(window, reason="startup")
+    # Layout refresh machinery removed: it caused a deadlock while dragging the
+    # window (evaluate_js / native resize from a background thread).
+    pass
 
 
 def main() -> None:
@@ -403,15 +399,10 @@ def main() -> None:
         _startup_log("creating window")
         window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
         shell_api.bind(window)
-        # NOTE: these handlers must stay cheap — `resized` fires dozens of times
-        # per second while the window is dragged, and any blocking work (network
-        # debug posts, file logging) here freezes the GUI. `_schedule_window_layout_refresh`
-        # is debounced to 0.3s, so it is safe.
-        window.events.loaded += lambda: _schedule_window_layout_refresh(window, reason="loaded")
-        window.events.shown += lambda: _schedule_window_layout_refresh(window, reason="shown")
-        window.events.restored += lambda: _schedule_window_layout_refresh(window, reason="restored")
-        window.events.maximized += lambda: _schedule_window_layout_refresh(window, reason="maximized")
-        window.events.resized += lambda width, height: _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}")
+        # No resize/layout handlers: evaluate_js during a window drag deadlocks
+        # the WebView2 UI thread. The iframe height is handled by the SPA's own
+        # syncFrameHeight (fixed to use scrollHeight only), so nothing here is
+        # needed.
         window.events.closed += lambda: _shutdown_and_exit(proc)
         _startup_log("entering webview.start (GUI loop)")
         webview.start(_startup_window_logic, window, private_mode=False)
