@@ -54,6 +54,16 @@ if (-not $SkipInstall) {
 Write-Host "[4/5] Building with PyInstaller..." -ForegroundColor Yellow
 $distDir = Join-Path $ScriptDir "dist"
 $buildDir = Join-Path $ScriptDir "build"
+
+# Close any running instance first, otherwise its .exe is locked and the
+# rebuild fails with "PermissionError: [WinError 5] 拒绝访问".
+$running = Get-Process -Name TFLiteTraining -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "  Closing running TFLiteTraining.exe..." -ForegroundColor Yellow
+    $running | Stop-Process -Force
+    Start-Sleep -Milliseconds 800
+}
+
 if ($Clean) {
     if (Test-Path $distDir) { Remove-Item -Recurse -Force $distDir }
     if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
