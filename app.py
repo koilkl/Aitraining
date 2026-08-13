@@ -1711,6 +1711,21 @@ def _render_tm_old_frontend_html(
       border-radius: 999px;
       transition: width 120ms linear;
     }}
+    .out-toggle {{
+      display: block;
+      margin: 8px auto 0;
+      padding: 4px 12px;
+      border: 1px solid var(--input-border);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      cursor: pointer;
+    }}
+    .out-toggle:hover {{
+      border-color: var(--accent);
+      color: var(--accent);
+    }}
     .out-pct {{
       position: absolute;
       right: 6px;
@@ -2669,6 +2684,7 @@ def _render_tm_old_frontend_html(
         <div class="preview-controls">
           <label class="preview-toggle"><input id="previewInputToggle" type="checkbox"/><span>Input</span></label>
           <label class="preview-toggle"><input id="previewRoiToggle" type="checkbox"/><span>ROI</span></label>
+          <label class="preview-toggle"><input id="previewRawToggle" type="checkbox"/><span>Orig</span></label>
           <div class="preview-mode-tabs" id="previewModeTabs">
             <button class="preview-mode-tab" type="button" data-preview-mode="auto_by_label">Auto</button>
           </div>
@@ -3034,7 +3050,9 @@ let currentSerialChannels = Number(STATE.current_serial_channels || 1);
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
-let previewShowRoi = false;
+let previewShowRoi = true;
+let previewShowRaw = false;  // toggle to show original (unprocessed) image
+let previewShowScore = false;  // toggle: percentage (%) vs raw score (0.000-1.000)
 let previewDarkThresh = 0;
 let previewLumThresh = 100;
 let previewUploadImageSrc = '';
@@ -3474,7 +3492,11 @@ function closeClassPreprocessEditor(force = false) {{
     const next = normalizeClassPreprocessConfig(Object.assign({{}}, classPreprocessDraft || {{}}, {{mode: nextMode}}));
     if (!next.manual_roi) next.manual_roi = [0, 0, 1, 1];
     classPreprocessDraft = next;
-    classPreprocessDirty = true;
+    if (nextMode === 'auto_by_label') {{
+      const filename = selectedClassSampleFilename(classPreprocessClass);
+      if (filename) setSamplePreprocessConfig(classPreprocessClass, filename, next);
+    }}
+    classPreprocessDirty = (nextMode !== 'auto_by_label');
     renderClassPreprocessModal();
     refreshClassProcessedPreview();
   }}
@@ -3643,12 +3665,12 @@ function renderClassPreprocessModal() {{
             <div class="class-preprocess-result">${{classPreprocessProcessedSrc ? `<img src="${{escapeHtml(classPreprocessProcessedSrc)}}" alt="Processed preview"/>` : `<div class="preview-empty">${{classPreprocessBusy ? 'Rendering...' : 'Choose a sample to preview preprocessing.'}}</div>`}}</div>
           </div>
         </div>
-          <div class="class-preprocess-info">In Manual ROI mode, drag directly on the original image and save the current sample. Shortcuts: F1 Auto, F2 Sign, F3 Junction, F4 Manual ROI, F5 Full Frame, S Save, D Delete Sample, Esc Close, Arrow Keys Move ROI.</div>
+          <div class="class-preprocess-info">In Manual ROI mode, drag directly on the original image and save the current sample. Shortcuts: F1 Auto, F2 Manual ROI, S Save, D Delete Sample, Esc Close, ←→↑↓ Navigate, Shift+Arrows Move ROI.</div>
       </div>
       <div class="class-preprocess-right class-preprocess-side" id="classPreprocessRightPane">
         <div class="class-preprocess-current class-preprocess-status-row">
           <div class="class-preprocess-info">Current Sample: ${{sampleFilename ? escapeHtml(sampleFilename) : 'No sample selected'}} · ${{samplePreprocessStatus(classPreprocessClass, sampleFilename)}}</div>
-          <div class="class-preprocess-status-chip${{dirty ? ' dirty' : ''}}">${{dirty ? 'Unsaved' : 'Saved'}}</div>
+          <div class="class-preprocess-status-chip${{dirty ? ' dirty' : ''}}">${{cfg.mode === 'auto_by_label' ? 'Auto' : (dirty ? 'Unsaved' : 'Saved')}}</div>
           <button class="btn btn-secondary" type="button" id="classPreprocessDeleteSample"${{sampleFilename ? '' : ' disabled'}}>Delete Sample</button>
         </div>
         <div class="class-preprocess-mode-row">
@@ -3862,6 +3884,8 @@ function restorePreviewState() {{
       previewPreprocessMode = String(data.preprocess);
     }}
     previewShowRoi = !!data.showRoi;
+    previewShowRaw = !!data.showRaw;
+    previewShowScore = !!data.showScore;
     previewDarkThresh = Number(data.darkThresh || STATE.preview_dark_thresh || 0);
     previewLumThresh = Number(data.lumThresh || STATE.preview_lum_thresh || 100);
   }} catch (e) {{}}
@@ -3873,6 +3897,8 @@ function persistPreviewState() {{
       source: String(previewSource || 'webcam'),
       preprocess: String(previewPreprocessMode || 'auto_by_label'),
       showRoi: !!previewShowRoi,
+      showRaw: !!previewShowRaw,
+      showScore: !!previewShowScore,
       darkThresh: Number(previewDarkThresh || 0),
       lumThresh: Number(previewLumThresh || 100)
     }}));
@@ -5077,7 +5103,8 @@ function buildDeviceOptions(selected) {{
   const ports = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
   const opts = ['<option value="">Select device port</option>'];
   for (const p of ports) {{
-    const device = String(p.device || '');
+    const device = String(p.device || '').trim();
+    if (!device) continue;  // skip entries with empty device name
     const label = String(p.label || device);
     const sel = device === selected ? ' selected' : '';
     opts.push(`<option value="${{device.replace(/"/g, '&quot;')}}"${{sel}}>${{label}}</option>`);
@@ -5488,20 +5515,42 @@ function renderOutputBars(labels, probs) {{
     host.innerHTML = '';
     return;
   }}
-  host.innerHTML = ls.map((label, idx) => {{
+  // Build persistent structure ONCE — the toggle button must never be
+  // destroyed by the prediction loop, or clicks get lost mid-press.
+  let rows = host.querySelector('.out-rows');
+  let btn = host.querySelector('.out-toggle');
+  if (!rows || !btn) {{
+    host.innerHTML = '<div class="out-rows"></div>';
+    rows = host.querySelector('.out-rows');
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'out-toggle';
+    btn.addEventListener('click', () => {{
+      previewShowScore = !previewShowScore;
+      try {{ persistPreviewState(); }} catch (e) {{}}
+      renderOutputBars(host._lastLabels || [], host._lastProbs || []);
+    }});
+    host.appendChild(btn);
+  }}
+  host._lastLabels = ls;
+  host._lastProbs = ps;
+  rows.innerHTML = ls.map((label, idx) => {{
     const p = Math.max(0, Math.min(1, Number(ps[idx] || 0)));
     const pct = Math.round(p * 1000) / 10;
+    const disp = previewShowScore ? p.toFixed(3) : `${{pct}}%`;
     return `
       <div class="out-row">
         <div>${{String(label)}}</div>
         <div class="out-bar">
           <div class="out-fill" style="width:${{pct}}%"></div>
-          <div class="out-pct">${{pct}}%</div>
+          <div class="out-pct">${{disp}}</div>
         </div>
       </div>
     `;
   }}).join('');
+  btn.textContent = previewShowScore ? 'Show %' : 'Show Score';
 }}
+
 async function refreshPreviewPrediction(token) {{
   if (!previewInputOn || !STATE.export_enabled) return;
   if (previewPredictInFlight) return;
@@ -5516,7 +5565,16 @@ async function refreshPreviewPrediction(token) {{
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
     const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
+    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
+    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
+    // Each button is an independent state; they stack:
+    //   Orig ON  = apply processed filter (no crop change)
+    //   ROI  ON  = apply crop (no filter)
+    //   both ON  = cropped AND filtered (processed_image_b64)
+    let src = rawSrc;
+    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
+    else if (previewShowRaw) src = fullSrc || rawSrc;
+    else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
       if (!pane.dataset.ready) {{
         pane.innerHTML = `<img id="${{imgId}}" alt="Preview"/>`;
@@ -5533,7 +5591,7 @@ async function refreshPreviewPrediction(token) {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
       note.textContent = top ? `Top: ${{top}} (${{p}}%)${{roiMsg}}` : roiMsg.trim();
     }}
   }} catch (err) {{
@@ -5569,7 +5627,16 @@ async function runPreviewUploadPrediction() {{
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
     const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const src = previewShowRoi ? (roiSrc || rawSrc) : rawSrc;
+    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
+    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
+    // Each button is an independent state; they stack:
+    //   Orig ON  = apply processed filter (no crop change)
+    //   ROI  ON  = apply crop (no filter)
+    //   both ON  = cropped AND filtered (processed_image_b64)
+    let src = rawSrc;
+    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
+    else if (previewShowRaw) src = fullSrc || rawSrc;
+    else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
       pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
       pane.dataset.ready = '1';
@@ -5578,7 +5645,7 @@ async function runPreviewUploadPrediction() {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = previewShowRoi && data.processed_variant ? ` · ROI: ${{String(data.processed_variant)}}` : '';
+      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
       note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)${{roiMsg}}` : `Upload: ${{String(previewUploadFilename || 'image')}}${{roiMsg}}`;
     }}
   }} catch (err) {{
@@ -5818,7 +5885,7 @@ function renderPreviewSettings() {{
   if (previewSource === 'device') {{
     const currentPorts = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
     if (!currentPorts.length) {{
-      refreshSerialPorts(true).catch(() => {{}});
+      refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
     }}
   }}
   const cancel = document.getElementById('previewSettingsCancel');
@@ -5827,8 +5894,11 @@ function renderPreviewSettings() {{
   const sourceSel = document.getElementById('previewInputSource');
   const uploadPick = document.getElementById('previewUploadPick');
   if (portSel) {{
-    portSel.onpointerdown = () => refreshSerialPorts(false, 'previewDevicePort');
-    portSel.onmousedown = () => refreshSerialPorts(false, 'previewDevicePort');
+    // Refresh ports once when the settings panel opens — NOT on every
+    // dropdown click (refilling mid-interaction resets the selection).
+    portSel.onchange = () => {{
+      // selection is applied on Save — just keep the UI value
+    }};
   }}
   if (sourceSel) sourceSel.onchange = () => {{
     previewSource = String(sourceSel.value || 'webcam');
@@ -5944,6 +6014,14 @@ function renderPreviewCard() {{
   const note = document.getElementById('previewNote');
   const output = document.getElementById('previewOutput');
   const toggle = document.getElementById('previewInputToggle');
+  const rawToggle = document.getElementById('previewRawToggle');
+  if (rawToggle) {{
+    rawToggle.checked = !!previewShowRaw;
+    rawToggle.onchange = () => {{
+      previewShowRaw = !!rawToggle.checked;
+      persistPreviewState();
+    }};
+  }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settingsBtn = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
@@ -6003,6 +6081,14 @@ function renderPreviewCard() {{
 }}
 function bindPreviewControls() {{
   const toggle = document.getElementById('previewInputToggle');
+  const rawToggle = document.getElementById('previewRawToggle');
+  if (rawToggle) {{
+    rawToggle.checked = !!previewShowRaw;
+    rawToggle.onchange = () => {{
+      previewShowRaw = !!rawToggle.checked;
+      persistPreviewState();
+    }};
+  }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settings = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
