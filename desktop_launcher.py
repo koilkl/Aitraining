@@ -305,9 +305,60 @@ class _ShellApi:
         return True
 
 
-def _startup_window_logic(window: "webview.Window") -> None:
-    _schedule_window_layout_refresh(window, reason="startup")
-    _maybe_native_resize_nudge(window, reason="startup")
+_SPLASH_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #1a212b;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  body {
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px; color: #e8eaed;
+  }
+  .title { font-size: 18px; font-weight: 800; letter-spacing: -0.01em; }
+  .spinner {
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,0.18);
+    border-top-color: #8ab4f8;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .sub { font-size: 12px; color: #a8b0ba; }
+</style>
+</head>
+<body>
+  <div class="title">TFLiteTraining</div>
+  <div class="spinner"></div>
+  <div class="sub">Loading…</div>
+</body>
+</html>"""
+
+
+def _startup_window_logic(window: "webview.Window", splash: "webview.Window", url: str) -> None:
+    # Splash is already visible. Wait for the Streamlit server in a background
+    # thread, then swap in the main window. Layout refresh happens later via the
+    # window `shown` event on the GUI thread.
+    def _swap_when_ready() -> None:
+        try:
+            _wait_http_ready(url, timeout_s=30.0)
+        except Exception:
+            pass  # server failed; still show the main window (it renders the error)
+        try:
+            window.show()
+        except Exception:
+            pass
+        try:
+            splash.destroy()
+        except Exception:
+            pass
+
+    threading.Thread(target=_swap_when_ready, daemon=True).start()
 
 
 def main() -> None:
@@ -325,37 +376,37 @@ def main() -> None:
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
     try:
-        deadline = time.time() + 25.0
-        last_err: Exception | None = None
-        while time.time() < deadline:
-            if not proc.is_alive():
-                break
-            try:
-                with urllib.request.urlopen(url, timeout=2) as resp:
-                    if 200 <= resp.status < 500:
-                        last_err = None
-                        break
-            except Exception as e:
-                last_err = e
-            time.sleep(0.25)
-
-        if last_err is not None:
-            raise RuntimeError(f"Streamlit not ready: {url} ({last_err}). Log: {log_path}")
-        if not proc.is_alive():
-            raise RuntimeError(f"Streamlit process exited. Log: {log_path}")
-
         import webview
 
         shell_api = _ShellApi()
-        window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
+        # Show a splash immediately so the user gets feedback while the local
+        # Streamlit server boots (a couple of seconds even with lazy TF import).
+        splash = webview.create_window(
+            "TFLiteTraining",
+            html=_SPLASH_HTML,
+            width=380,
+            height=240,
+            frameless=True,
+            on_top=True,
+            easy_drag=False,
+            resizable=False,
+        )
+        window = webview.create_window(
+            "TF Lite Training",
+            url,
+            width=1200,
+            height=800,
+            js_api=shell_api,
+            hidden=True,
+        )
         shell_api.bind(window)
         window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
-        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"))
+        window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"), _maybe_native_resize_nudge(window, reason="shown"))
         window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _schedule_window_layout_refresh(window, reason="restored"))
         window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
         window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
-        webview.start(_startup_window_logic, window)
+        webview.start(_startup_window_logic, (window, splash, url))
     finally:
         if proc.is_alive():
             proc.terminate()
