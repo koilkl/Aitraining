@@ -25,6 +25,18 @@ def _find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _startup_log(msg: str) -> None:
+    """Append a line to a startup log so we can see where the main process hangs."""
+    try:
+        p = Path(tempfile.gettempdir()) / "TFLiteTraining" / "startup.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"{time.time():.3f} {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 def _wait_http_ready(url: str, timeout_s: float = 25.0) -> None:
     deadline = time.time() + timeout_s
     last_err: Exception | None = None
@@ -359,6 +371,7 @@ def main() -> None:
     log_path = _prepare_log_file()
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
+    _startup_log(f"streamlit child started (pid={proc.pid}, port={port})")
     try:
         deadline = time.time() + 25.0
         last_err: Exception | None = None
@@ -378,19 +391,23 @@ def main() -> None:
             raise RuntimeError(f"Streamlit not ready: {url} ({last_err}). Log: {log_path}")
         if not proc.is_alive():
             raise RuntimeError(f"Streamlit process exited. Log: {log_path}")
+        _startup_log("streamlit ready (urlopen 200)")
 
         import webview
 
         shell_api = _ShellApi()
+        _startup_log("creating window")
         window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
         shell_api.bind(window)
-        window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _schedule_window_layout_refresh(window, reason="loaded"))
+        window.events.loaded += lambda: (_debug_post("C", "desktop_launcher.py:window.events.loaded", "[DEBUG] shell loaded event", {}), _startup_log("window loaded event"), _schedule_window_layout_refresh(window, reason="loaded"))
         window.events.shown += lambda: (_debug_post("C", "desktop_launcher.py:window.events.shown", "[DEBUG] shell shown event", {}), _schedule_window_layout_refresh(window, reason="shown"))
         window.events.restored += lambda: (_debug_post("C", "desktop_launcher.py:window.events.restored", "[DEBUG] shell restored event", {}), _schedule_window_layout_refresh(window, reason="restored"))
         window.events.maximized += lambda: (_debug_post("C", "desktop_launcher.py:window.events.maximized", "[DEBUG] shell maximized event", {}), _schedule_window_layout_refresh(window, reason="maximized"))
         window.events.resized += lambda width, height: (_debug_post("C", "desktop_launcher.py:window.events.resized", "[DEBUG] shell resized event", {"width": int(width), "height": int(height)}), _schedule_window_layout_refresh(window, reason=f"resized:{width}x{height}"))
         window.events.closed += lambda: _shutdown_and_exit(proc)
+        _startup_log("entering webview.start (GUI loop)")
         webview.start(_startup_window_logic, window)
+        _startup_log("webview.start returned (window closed)")
     finally:
         if proc.is_alive():
             proc.terminate()
