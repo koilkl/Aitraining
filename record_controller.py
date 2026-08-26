@@ -1247,6 +1247,29 @@ class RecordController:
             if current is thread and (thread is None or not thread.is_alive()):
                 self._record_threads.pop(session_id, None)
 
+    def drop_session(self, session_id: str) -> None:
+        """Release ALL per-session state for a finished/returned-home session:
+        config, active record state, record condition/thread, live states and
+        threads (keyed ``{session_id}:{source}``) and train/preview entries.
+        Call after _stop_record + _stop_live so no worker can re-register.
+        Safe to call for unknown sessions; idempotent."""
+        prefix = f"{session_id}:"
+        with self._lock:
+            self._configs.pop(session_id, None)
+            self._active.pop(session_id, None)
+            self._record_conds.pop(session_id, None)
+            self._record_threads.pop(session_id, None)
+            self._train.pop(session_id, None)
+            self._train_conds.pop(session_id, None)
+            self._preview.pop(session_id, None)
+            self._preview_locks.pop(session_id, None)
+            for key in list(self._live):
+                if key.startswith(prefix):
+                    self._live.pop(key, None)
+            for key in list(self._live_threads):
+                if key.startswith(prefix):
+                    self._live_threads.pop(key, None)
+
     def _wait_next_record(self, session_id: str, since: int, timeout_s: float = 10.0) -> Dict[str, Any]:
         cond = self._record_conds.get(session_id)
         if cond is None:

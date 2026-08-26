@@ -1041,6 +1041,67 @@ def inject_teachable_style() -> None:
     }
   }
 
+  /* Dark mode: keep the Teachable-style surfaces consistent with the in-app
+     SPA (app.py) so text does not stay light-mode black on dark backgrounds. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --tm-bg: #0f141a;
+      --tm-flow-bg: #111821;
+      --tm-surface: #18202a;
+      --tm-surface-strong: #202833;
+      --tm-text: #e8eaed;
+      --tm-muted: #a8b0ba;
+      --tm-border: rgba(255, 255, 255, 0.12);
+      --tm-primary: #8ab4f8;
+      --tm-primary-strong: #aecbfa;
+      --tm-accent: rgba(138, 180, 248, 0.12);
+      --tm-success: #34a853;
+      --tm-shadow: 0 2px 8px rgba(0, 0, 0, 0.40);
+      --tm-shadow-soft: 0 2px 8px rgba(0, 0, 0, 0.32);
+    }
+
+    .tm-hero,
+    .tm-card {
+      border-color: rgba(255, 255, 255, 0.12);
+    }
+
+    .tm-flow-step,
+    .tm-hero-panel,
+    .tm-stat,
+    .tm-class-header,
+    .tm-inline-note {
+      background: #18202a;
+      border-color: rgba(255, 255, 255, 0.10);
+    }
+
+    .tm-kv {
+      background: rgba(138, 180, 248, 0.12);
+      border-color: rgba(138, 180, 248, 0.20);
+    }
+
+    .stTabs [data-baseweb="tab"] {
+      background: #18202a;
+    }
+    .stTabs [aria-selected="true"] {
+      background: rgba(138, 180, 248, 0.20);
+      color: #aecbfa;
+    }
+
+    /* Streamlit/baseweb form controls inherit light-theme text color; force it
+       to follow the dark surface so typed text is readable. */
+    [data-testid="stTextInput"] input,
+    [data-testid="stNumberInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stSelectbox"] [data-baseweb="select"],
+    [data-baseweb="select"] div,
+    [data-baseweb="select"] span,
+    [data-baseweb="select"] p {
+      color: #e8eaed !important;
+      -webkit-text-fill-color: #e8eaed !important;
+    }
+  }
+
 </style>
         """,
         unsafe_allow_html=True,

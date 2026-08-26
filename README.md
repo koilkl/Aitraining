@@ -5,18 +5,17 @@ Goal: students should not need to install Python. Double-click to launch.
 ## How to Use (Students / Teachers)
 
 - Typical workflow:
-  - Home → `New Project` → `Image`
-  - Choose a start mode:
+  - Home → `Open Image Project` → choose a start mode:
     - `Start from empty`: create classes and collect samples from scratch
     - `Start from classified class`: import a dataset that is already grouped by label
-    - `Open .tmproj`: restore a previously saved project archive
+  - Home → `Open Project` → `Open .tmproj`: restore a previously saved project archive
 - Workspace navigation:
-  - Open the top-left `Teachable Machine` menu for `Open project`, `Save project`, `Return`, and `Reset project`
-  - `Return` goes back to the page you came from:
+  - Open the top-left **AIoScout** menu (`☰`) for `Open project`, `Save project`, `Export dataset`, `Return`, and `Reset project`
+  - `Return` stops live capture/record and goes back to the page you came from:
     - empty project workspace → home
     - classified import workspace → classified import page
     - opened `.tmproj` workspace → home
-  - `Reset project` clears the current workspace session
+  - `Reset project` deletes the current workspace session (samples, classes, and trained model) after a confirmation prompt
 - Classes and samples:
   - `＋ Add a class`: add a new class card
   - Click the class name to rename it
@@ -30,6 +29,7 @@ Goal: students should not need to install Python. Double-click to launch.
       - `Color Mode` selects Grayscale (1 channel) or RGB (3 channels) depending on the firmware sketch
       - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
       - Change the sync value if your firmware uses a different frame prefix
+      - The selected device port and camera index persist across page reruns, training, and exports (they are stored in the live-config controller and merged back on every render); they reset only via `Return` / `Reset project`
 - Classified import:
   - `Browse...` opens the system folder picker
   - `Load folder` stays disabled until a folder path is present
@@ -48,6 +48,7 @@ Goal: students should not need to install Python. Double-click to launch.
       - The right `Preview` panel runs preview inference after training
       - Toggle `Input` to start/stop live predictions; toggle `ROI` to switch between raw input and the thresholded mask view (shows dark/lum effects)
       - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
+      - Live predictions use the same center-60 % crop the model was trained on (matches the device firmware); the ROI view is visual feedback only
       - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
@@ -192,9 +193,27 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
 
 ---
 
-## ROI Detection Pipeline
+## ROI Detection (preview) vs Model Input
 
-The auto-crop uses a G-channel dark-object + edge detection algorithm to find signs:
+Two different crops exist — know which one the model actually receives:
+
+**Model input (training = live predict = device firmware)** — the canonical
+transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
+
+1. Center **60 % square crop** of the frame (`_center_bbox(frac=0.60)`)
+2. BT.601 luminance of the cropped original RGB (no WB, no masking)
+3. Bilinear resize to the training image size (default 96×96)
+4. Contrast stretch (only if pixel span ≥ 24)
+5. int8 = gray − 128
+
+The dark/lum mask never touches these pixels; it only drives the previews and
+the sign_pct OOD statistic. This transform is identical to the device firmware
+(`BG_ENABLE_BLOB_SEARCH=0` + `BG_FALLBACK_CENTER_FRAC=0.60`) — verified
+86/86 training frames → 0 label flips (2026-08-26).
+
+**Shadow-search preview** (`_focus_bbox`, used by the ROI overlay, the class
+edit page's auto mode, and the masked previews) — a G-channel dark-object +
+edge detector:
 
 1. **G-channel extraction**: green channel has best SNR in typical lighting
 2. **Dark/Lum thresholding**: pixels with G between `Dark Thresh` (default 0) and `Lum Thresh` (default 100) are sign candidates; everything else → white
@@ -205,7 +224,7 @@ The auto-crop uses a G-channel dark-object + edge detection algorithm to find si
 
 If no sign is found: center crop fallback (50%, 50% position, 40% side).
 
-The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.
+The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.  Note this search tends to crop ~13 px right of the sign centroid and is for *visual* ROI feedback only — live predictions use the center-60 % model-input path above.
 
 ## Export Behavior
 
@@ -223,6 +242,7 @@ The **processed preview** (ROI toggle / class edit page) shows step 2: white = f
     - `<export name>_model_data.cpp`
     - `model_settings.h`
     - `model_settings.cpp`
+    - `model_resolver.h` (generated from the actual ops in the .tflite)
   - Compatibility files:
     - `model.h`
     - `model.cpp`
@@ -325,11 +345,15 @@ project.tmproj
 ## Project Layout (Developers)
 
 - Desktop entry: `desktop_launcher.py` (starts local Streamlit server + WebView window)
-- Streamlit UI: `app.py`
+- Streamlit UI + embedded SPA template: `app.py` (the capture/preview UI is an HTML/JS SPA served from `_render_tm_old_frontend_html`)
+- Headless HTTP server: `record_controller.py` (live preview/predict, recording, capture, train sessions — the SPA talks to it over localhost; per-session config lives here)
+- Serial frame reader: `serial_device.py` (`SerialFrameReader`, `list_serial_ports`)
+- Preprocessing (crop / mask / previews): `image_preprocess.py`
 - Dataset import/export: `dataset_io.py`
 - Training/quant/export: `trainer.py`
 - UI styles: `ui_styles.py`
 - Camera permission (macOS auto request): `camera_permission.py`
+- DMG build settings: `dmg_settings.py`
 
 ## macOS (.app + .dmg)
 

@@ -842,7 +842,13 @@ def prepare_inference_inputs(
     use_lum  = int(bg_lum_thresh)  if bg_lum_thresh  is not None else 100
     use_dark = max(0, min(255, use_dark))
     use_lum = max(1, min(255, use_lum))
-    fast_mode = bool(mode == PREPROCESS_MODE_MANUAL_ROI)
+    # Live prediction must use the SAME transform the model was trained on:
+    # training always goes through the preprocessed cache (fast_mode=True →
+    # _center_bbox central 60 % crop), and the device firmware crops the
+    # same way.  The _focus_bbox dark-object search is only a preview aid —
+    # on the training set it crops ~13 px right of the sign and flips
+    # 24/40 LEFT samples to RIGHT.  A manual ROI still takes precedence.
+    fast_mode = True
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
                                         bg_dark_thresh=use_dark,
                                         bg_lum_thresh=use_lum,
