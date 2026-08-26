@@ -5,18 +5,17 @@ Goal: students should not need to install Python. Double-click to launch.
 ## How to Use (Students / Teachers)
 
 - Typical workflow:
-  - Home → `New Project` → `Image`
-  - Choose a start mode:
+  - Home → `Open Image Project` → choose a start mode:
     - `Start from empty`: create classes and collect samples from scratch
     - `Start from classified class`: import a dataset that is already grouped by label
-    - `Open .tmproj`: restore a previously saved project archive
+  - Home → `Open Project` → `Open .tmproj`: restore a previously saved project archive
 - Workspace navigation:
-  - Open the top-left `Teachable Machine` menu for `Open project`, `Save project`, `Return`, and `Reset project`
-  - `Return` goes back to the page you came from:
+  - Open the top-left **AIoScout** menu (`☰`) for `Open project`, `Save project`, `Export dataset`, `Return`, and `Reset project`
+  - `Return` stops live capture/record and goes back to the page you came from:
     - empty project workspace → home
     - classified import workspace → classified import page
     - opened `.tmproj` workspace → home
-  - `Reset project` clears the current workspace session
+  - `Reset project` deletes the current workspace session (samples, classes, and trained model) after a confirmation prompt
 - Classes and samples:
   - `＋ Add a class`: add a new class card
   - Click the class name to rename it
@@ -30,6 +29,7 @@ Goal: students should not need to install Python. Double-click to launch.
       - `Color Mode` selects Grayscale (1 channel) or RGB (3 channels) depending on the firmware sketch
       - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
       - Change the sync value if your firmware uses a different frame prefix
+      - The selected device port and camera index persist across page reruns, training, and exports (they are stored in the live-config controller and merged back on every render); they reset only via `Return` / `Reset project`
 - Classified import:
   - `Browse...` opens the system folder picker
   - `Load folder` stays disabled until a folder path is present
@@ -49,6 +49,7 @@ Goal: students should not need to install Python. Double-click to launch.
       - Toggle `Input` to start/stop live predictions; toggle `ROI` to apply the auto-crop; toggle `Orig` to apply the thresholded filter (enable both for the cropped + filtered view)
       - The prediction bars show per-class confidence; the button under them toggles between percentage (`Show Score`) and raw 0–1 score (`Show %`)
       - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
+      - Live predictions use the same center-60 % crop the model was trained on (matches the device firmware); the ROI view is visual feedback only
       - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
@@ -62,9 +63,158 @@ Goal: students should not need to install Python. Double-click to launch.
   - `model.h / model.cpp`: drop into Arduino/ESP-IDF projects (array name can be set in Export)
   - `labels.txt`: class order (inference index mapping)
 
-## ROI Detection Pipeline
+## Quick Start Demo (10 minutes)
 
-The auto-crop uses a G-channel dark-object + edge detection algorithm to find signs:
+A step-by-step walkthrough that showcases every major feature.  Ideal for presentations and first-time users.
+
+---
+
+### Step 1 — Create a Project (30 sec)
+
+1. Launch the app → you see the **Home** screen.
+2. Click **Open Image Project** → **Start from empty**.
+3. You are now in the workspace with three columns: **Classes**, **Training**, **Preview**.
+
+---
+
+### Step 2 — Add Classes (30 sec)
+
+1. In the left column, click **＋ Add a class** to create a second class.
+2. Click a class name to rename it (e.g. `SIGN`, `BACKGROUND`).
+3. Each class card has three capture buttons: **Webcam**, **Device**, **Upload**.
+
+> **Demo tip**: Create 2 classes — one for the sign, one for background/nothing.
+
+---
+
+### Step 3 — Configure Device Source (1 min)
+
+1. On a class card, click **Device** to open the device panel.
+2. Click the **⚙ gear icon** on the device panel to open settings:
+
+   | Setting | Value | What it does |
+   |---|---|---|
+   | **Image Size** | 96 / 160 / 384 | Must match your firmware output |
+   | **Color Mode** | Grayscale / RGB | Grayscale for inference, RGB for data collection |
+   | **Baud Rate** | 921600 | Match your serial port speed |
+   | **Sync Header** | AA 55 AA | Frame start marker |
+
+3. Click **Apply** — the device preview should show live frames.
+
+> **Showcase**: Change Image Size and see the preview adapt.  This proves the app handles any resolution.
+
+---
+
+### Step 4 — Capture Samples (2 min)
+
+1. Click and **hold** the device/webcam capture button → samples are saved to that class.
+2. Repeat for each class.  Aim for 10-20 samples per class.
+3. The sample count updates on each class card.
+
+> **Showcase**: The device works with **any frame size** (96/160/384) and **Grayscale or RGB** — configured entirely from the gear icon, no code changes.
+
+---
+
+### Step 5 — Tune Detection Thresholds (2 min) ⭐ KEY FEATURE
+
+1. Click the **preprocess button** (🔍 icon) next to a class name.
+2. The class edit page opens showing your samples on the left and a **Processed Preview** on the right.
+3. The preview shows the **thresholded mask** — white = filtered out, dark = what the detector keeps.
+4. Adjust the **Dark Thr** and **Lum Thr** sliders:
+
+   | Slider | Default | Effect |
+   |---|---|---|
+   | **Dark Thr** | 0 | Pixels darker than this → ignored as shadow |
+   | **Lum Thr** | 100 | Pixels brighter than this → ignored as background |
+
+5. Watch the processed preview update in real-time as you drag the sliders.
+6. The ROI bounding box (green outline) shows where the detector found the sign.
+
+> **Showcase**: This is the core tuning workflow.  The processed preview gives instant visual feedback — no guesswork.
+
+---
+
+### Step 6 — Train the Model (1 min)
+
+1. In the middle **Training** column, click **Train Model**.
+2. To change model parameters, expand **Advanced**:
+
+   | Parameter | Default | What it does |
+   |---|---|---|
+   | **Image Size** | 96 | All images resized to this before training |
+   | **Batch Size** | 32 | Samples per training step |
+   | **Epochs** | 20 | Training iterations |
+   | **Learning Rate** | 0.0016 | Optimization step size |
+
+3. Training takes 10-60 seconds.  A progress bar shows status.
+
+> **Showcase**: The **Image Size** parameter is independent of capture resolution.  You can capture at 160×160 but train at 96×96 (or vice versa).
+
+---
+
+### Step 7 — Preview & Tune Live (2 min) ⭐ KEY FEATURE
+
+1. After training, the right **Preview** panel becomes active.
+2. Toggle **Input ON** → live camera feed with predictions.
+3. Toggle **ROI ON** → switches to the **thresholded mask view**.
+4. Use the **slider bar** under the preview image:
+
+   ```
+   Dark [===○========] 3    Lum [========○===] 76
+   ```
+
+5. Adjust sliders while watching the ROI view — the detection updates in real-time.
+
+> **Showcase**: The slider bar + ROI toggle is the fastest way to find good thresholds.  No need to re-train — just slide and see.
+
+---
+
+### Step 8 — Save & Export (30 sec)
+
+1. Click the **top-left menu** → **Save project** → saves a `.tmproj` file.
+2. All settings are preserved: class names, samples, thresholds, training config.
+3. Click **Export Model** → choose a folder → gets `.tflite`, `model.cpp`, `model.h`, `labels.txt`.
+
+> **Showcase**: `.tmproj` is a complete snapshot.  Share it with teammates or reopen it later — everything is restored.
+
+---
+
+### Key Features Checklist
+
+| # | Feature | Where |
+|---|---|---|
+| 1 | Configurable device resolution (96/160/384) | Device gear ⚙ |
+| 2 | Grayscale / RGB color mode | Device gear ⚙ |
+| 3 | Per-class dark/lum threshold tuning | Class edit page (🔍) |
+| 4 | Real-time processed preview with mask overlay | Class edit page |
+| 5 | Live ROI toggle + slider bar | Preview panel |
+| 6 | Image Size as training hyperparameter | Training → Advanced |
+| 7 | Full project save/restore (.tmproj) | Top-left menu |
+| 8 | MCU-ready export (.tflite + C sources) | Export button |
+
+---
+
+## ROI Detection (preview) vs Model Input
+
+Two different crops exist — know which one the model actually receives:
+
+**Model input (training = live predict = device firmware)** — the canonical
+transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
+
+1. Center **60 % square crop** of the frame (`_center_bbox(frac=0.60)`)
+2. BT.601 luminance of the cropped original RGB (no WB, no masking)
+3. Bilinear resize to the training image size (default 96×96)
+4. Contrast stretch (only if pixel span ≥ 24)
+5. int8 = gray − 128
+
+The dark/lum mask never touches these pixels; it only drives the previews and
+the sign_pct OOD statistic. This transform is identical to the device firmware
+(`BG_ENABLE_BLOB_SEARCH=0` + `BG_FALLBACK_CENTER_FRAC=0.60`) — verified
+86/86 training frames → 0 label flips (2026-08-26).
+
+**Shadow-search preview** (`_focus_bbox`, used by the ROI overlay, the class
+edit page's auto mode, and the masked previews) — a G-channel dark-object +
+edge detector:
 
 1. **G-channel extraction**: green channel has best SNR in typical lighting
 2. **Dark/Lum thresholding**: pixels with G between `Dark Thresh` (default 0) and `Lum Thresh` (default 100) are sign candidates; everything else → white
@@ -75,7 +225,7 @@ The auto-crop uses a G-channel dark-object + edge detection algorithm to find si
 
 If no sign is found: center crop fallback (50%, 50% position, 40% side).
 
-The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.
+The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.  Note this search tends to crop ~13 px right of the sign centroid and is for *visual* ROI feedback only — live predictions use the center-60 % model-input path above.
 
 ## Export Behavior
 
@@ -93,6 +243,7 @@ The **processed preview** (ROI toggle / class edit page) shows step 2: white = f
     - `<export name>_model_data.cpp`
     - `model_settings.h`
     - `model_settings.cpp`
+    - `model_resolver.h` (generated from the actual ops in the .tflite)
   - Compatibility files:
     - `model.h`
     - `model.cpp`
@@ -196,7 +347,10 @@ project.tmproj
 ## Project Layout (Developers)
 
 - Desktop entry: `desktop_launcher.py` (starts local Streamlit server + WebView window)
-- Streamlit UI: `app.py`
+- Streamlit UI + embedded SPA template: `app.py` (the capture/preview UI is an HTML/JS SPA served from `_render_tm_old_frontend_html`)
+- Headless HTTP server: `record_controller.py` (live preview/predict, recording, capture, train sessions — the SPA talks to it over localhost; per-session config lives here)
+- Serial frame reader: `serial_device.py` (`SerialFrameReader`, `list_serial_ports`)
+- Preprocessing (crop / mask / previews): `image_preprocess.py`
 - Dataset import/export: `dataset_io.py`
 - Training/quant/export: `trainer.py`
 - UI styles: `ui_styles.py`
@@ -205,6 +359,7 @@ project.tmproj
 - Windows build script: `build_windows.ps1`
 - Windows packaging script (installer .exe / .zip): `package_windows.ps1`
 - Inno Setup installer definition: `installer.iss`
+- DMG build settings: `dmg_settings.py`
 
 ## macOS (.app + .dmg)
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -658,17 +657,13 @@ def _find_bg_roi(rgb: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     return (int(x1), int(y1), int(x2), int(y2))
 
 
-_ROI_CACHE: Dict[str, Tuple[Tuple[int, int, int, int], float]] = {}
-_ROI_CACHE_TTL = 1.0  # seconds before the auto-crop box is recomputed
-
-
 def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale",
                                roi: Optional[Tuple[int, int, int, int]] = None,
                                bg_dark_thresh: int = 0,
                                bg_lum_thresh: int = 100,
                                return_crop_box: bool = False,
                                fast_mode: bool = False,
-                               cache_key: Optional[str] = None):
+                               return_stats: bool = False):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -689,6 +684,10 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Too dark (below dark_thresh) → shadow/noise → white.
     # Too bright (above lum_thresh) → paper/background → white.
     is_sign = (gray > bg_dark_thresh) & (gray < bg_lum_thresh)
+    sign_pct = is_sign.mean() * 100
+    too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
+    too_bright_pct = (gray >= bg_lum_thresh).mean() * 100
+    print(f"[MASK] sign={sign_pct:.1f}% dark={too_dark_pct:.1f}% bright={too_bright_pct:.1f}%  (G>{bg_dark_thresh} & G<{bg_lum_thresh})")
     gray[~is_sign] = 255
 
     # Crop: shadow search (live preview) or center crop (batch/cache)
@@ -699,17 +698,6 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         y1 = max(0, min(gray.shape[0] - 1, y1))
         x2 = max(x1 + 1, min(gray.shape[1], x2))
         y2 = max(y1 + 1, min(gray.shape[0], y2))
-    elif cache_key is not None:
-        cached = _ROI_CACHE.get(cache_key)
-        if cached is not None and (time.time() - cached[1]) < _ROI_CACHE_TTL:
-            x1, y1, x2, y2 = cached[0]
-            x1 = max(0, min(gray.shape[1] - 1, x1))
-            y1 = max(0, min(gray.shape[0] - 1, y1))
-            x2 = max(x1 + 1, min(gray.shape[1], x2))
-            y2 = max(y1 + 1, min(gray.shape[0], y2))
-        else:
-            x1, y1, x2, y2 = _focus_bbox(gray)
-            _ROI_CACHE[cache_key] = ((int(x1), int(y1), int(x2), int(y2)), time.time())
     elif fast_mode:
         # Fast: simple center crop (for batch cache rebuild)
         x1, y1, x2, y2 = _center_bbox(h_orig, w_orig, frac=0.60)
@@ -769,13 +757,25 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     out = _contrast_stretch_u8(out_arr)
     result = out.astype(np.float32) / 255.0
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
+    stats = {
+        "sign_pct": float(sign_pct),
+        "too_dark_pct": float(too_dark_pct),
+        "too_bright_pct": float(too_bright_pct),
+        "bg_dark_thresh": int(bg_dark_thresh),
+        "bg_lum_thresh": int(bg_lum_thresh),
+    } if return_stats else None
+    # Backward compatible return structure: stats appended ONLY when return_stats=True.
+    # When both return_crop_box + return_stats → stats is always LAST element.
     if return_crop_box:
         if masked_preview is not None and crop_preview is not None and full_preview is not None:
-            return image, crop_norm, masked_preview, crop_preview, full_preview
-        return image, crop_norm
+            t = (image, crop_norm, masked_preview, crop_preview, full_preview)
+            return (*t, stats) if return_stats else t
+        t = (image, crop_norm)
+        return (*t, stats) if return_stats else t
     if masked_preview is not None and crop_preview is not None and full_preview is not None:
-        return image, masked_preview, crop_preview, full_preview
-    return image
+        t = (image, masked_preview, crop_preview, full_preview)
+        return (*t, stats) if return_stats else t
+    return (image, stats) if return_stats else image
 
 
 def preprocess_manual_roi_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale", manual_roi: Any = None) -> np.ndarray:
@@ -813,8 +813,14 @@ def preprocess_for_label(
         resolved_roi = resolved.get("manual_roi")
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], resolved_roi)
-    # Always B-G; mode only controls how the ROI is chosen
-    return preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi)
+    class_cfg = normalize_class_preprocess(class_preprocess.get(str(label_name or ""))) if class_preprocess else {}
+    fast_mode = bool(mode == PREPROCESS_MODE_MANUAL_ROI)
+    return preprocess_blue_diff_array(
+        arr, out_size=out_size, color_mode=color_mode, roi=roi,
+        bg_dark_thresh=int(class_cfg.get("bg_dark_thresh", 0)),
+        bg_lum_thresh=int(class_cfg.get("bg_lum_thresh", 100)),
+        fast_mode=fast_mode,
+    )
 
 
 def prepare_inference_inputs(
@@ -824,27 +830,57 @@ def prepare_inference_inputs(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
-    bg_dark_thresh: int = 0,
-    bg_lum_thresh: int = 100,
-    cache_key: Optional[str] = None,
-) -> Dict[str, np.ndarray]:
+    bg_dark_thresh: Optional[int] = None,
+    bg_lum_thresh: Optional[int] = None,
+) -> Dict[str, Any]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
-        cache_key = None  # manual ROI must not use the auto-crop cache
+    use_dark = int(bg_dark_thresh) if bg_dark_thresh is not None else 0
+    use_lum  = int(bg_lum_thresh)  if bg_lum_thresh  is not None else 100
+    use_dark = max(0, min(255, use_dark))
+    use_lum = max(1, min(255, use_lum))
+    # Live prediction must use the SAME transform the model was trained on:
+    # training always goes through the preprocessed cache (fast_mode=True →
+    # _center_bbox central 60 % crop), and the device firmware crops the
+    # same way.  The _focus_bbox dark-object search is only a preview aid —
+    # on the training set it crops ~13 px right of the sign and flips
+    # 24/40 LEFT samples to RIGHT.  A manual ROI still takes precedence.
+    fast_mode = True
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
-                                        bg_dark_thresh=int(bg_dark_thresh),
-                                        bg_lum_thresh=int(bg_lum_thresh),
-                                        cache_key=cache_key)
-    if isinstance(result, tuple) and len(result) >= 4:
-        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2], "full_preview": result[3]}
-    if isinstance(result, tuple) and len(result) >= 3:
-        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2]}
-    if isinstance(result, tuple) and len(result) == 2:
-        return {"default": result[0], "masked_preview": result[1]}
-    return {"default": result}
+                                        bg_dark_thresh=use_dark,
+                                        bg_lum_thresh=use_lum,
+                                        return_crop_box=True,
+                                        fast_mode=fast_mode,
+                                        return_stats=True)
+    out: Dict[str, Any] = {"default": None, "mask_stats": None}
+    stats: Any = None
+    if isinstance(result, tuple):
+        image = result[0]
+        out["default"] = image
+        if len(result) >= 6 and isinstance(result[-1], dict):
+            stats = result[-1]
+            out["mask_stats"] = stats
+            result = result[:-1]
+        if len(result) >= 5 and result[2] is not None:
+            out["masked_preview"] = result[2]
+        if len(result) >= 5 and result[3] is not None:
+            out["crop_preview"] = result[3]
+        if len(result) >= 5 and result[4] is not None:
+            out["full_preview"] = result[4]
+        if len(result) >= 2 and len(result) < 4:
+            out["masked_preview"] = image
+    else:
+        out["default"] = result
+    if "masked_preview" not in out:
+        out["masked_preview"] = out.get("default")
+    if "crop_preview" not in out:
+        out["crop_preview"] = out.get("default")
+    if "full_preview" not in out:
+        out["full_preview"] = out.get("default")
+    return out
 
 
 def focus_and_enhance_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale") -> np.ndarray:

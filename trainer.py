@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -53,6 +54,9 @@ class TrainConfig:
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None
     sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
     use_preprocessed_dataset: bool = False
+    class_names_order: Optional[List[str]] = None
+    min_steps_per_epoch: int = 4
+    auto_adjust_batch_and_epochs: bool = True
 
 
 @dataclass(frozen=True)
@@ -85,9 +89,18 @@ def load_datasets(
 ) -> Tuple[tf.data.Dataset, Optional[tf.data.Dataset], tf.data.Dataset, List[str], Tuple[int, int, int], Dict[int, float]]:
     dataset_dir = dataset_dir.resolve()
     image_map = _list_image_files(dataset_dir)
-    class_names = list(image_map.keys())
+    default_order = list(image_map.keys())
+    if cfg.class_names_order:
+        provided = [str(x) for x in cfg.class_names_order if str(x) in image_map]
+        missed = [str(x) for x in cfg.class_names_order if str(x) not in image_map]
+        extra = [x for x in default_order if x not in provided]
+        class_names = list(provided) + list(extra)
+        if missed:
+            print(f"[trainer] class_names_order entries not found in dataset, skipped: {missed}")
+    else:
+        class_names = list(default_order)
     total_files = sum(len(files) for files in image_map.values())
-    if len(image_map) < 2:
+    if len(class_names) < 2:
         raise ValueError("Need at least 2 classes with images before training.")
     if total_files < 2:
         raise ValueError("Need at least 2 images before training.")
@@ -136,7 +149,6 @@ def load_datasets(
             seed=cfg.seed,
         )
         val_ds = None
-    class_names = list(train_ds.class_names)
     input_shape = (cfg.img_size, cfg.img_size, _channels(cfg.color_mode))
     class_name_list = [str(name) for name in class_names]
     preprocess_mode = str(cfg.preprocess_mode or PREPROCESS_MODE_AUTO_BY_LABEL)
@@ -272,11 +284,15 @@ def build_model(input_shape: Tuple[int, int, int], num_classes: int, cfg: TrainC
 
 
 def _representative_data_gen(train_ds: tf.data.Dataset, cfg: TrainConfig):
-    remaining = cfg.representative_samples
-    for batch_x, _ in train_ds.unbatch().batch(1).take(cfg.representative_samples):
-        yield [batch_x]
-        remaining -= 1
-        if remaining <= 0:
+    n = max(1, int(cfg.representative_samples))
+    seen = 0
+    for batch_x, _ in train_ds.unbatch().batch(1).take(n):
+        x = tf.convert_to_tensor(batch_x, dtype=tf.float32)
+        if x.shape.rank != 4:
+            x = tf.expand_dims(x, 0)
+        yield [x]
+        seen += 1
+        if seen >= n:
             break
 
 
@@ -287,6 +303,22 @@ def convert_to_int8_tflite(model: tf.keras.Model, train_ds: tf.data.Dataset, cfg
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
+    try:
+        converter.experimental_new_converter = True
+    except Exception:
+        pass
+    try:
+        converter.experimental_enable_resource_variables = True
+    except Exception:
+        pass
+    try:
+        converter._experimental_calibrate_only = False
+    except Exception:
+        pass
+    try:
+        converter._experimental_enable_composite_direct_lowering = True
+    except Exception:
+        pass
     return converter.convert()
 
 
@@ -303,6 +335,133 @@ def export_tflite_c_sources(tflite_model: bytes, array_name: str) -> Tuple[str, 
     return source_code, header_code
 
 
+def _clamp_batch_for_steps(train_count: int, user_batch: int, min_steps: int = 4) -> int:
+    """Largest batch that still leaves at least min_steps steps per epoch."""
+    min_steps = max(1, int(min_steps))
+    user_batch = max(1, int(user_batch))
+    if train_count >= min_steps:
+        max_batch_for_steps = max(2, int(train_count // min_steps))
+    else:
+        max_batch_for_steps = max(2, int(train_count))
+    return max(2, min(user_batch, max_batch_for_steps))
+
+
+def _adjust_cfg_for_dataset_size(dataset_dir: Path, cfg: TrainConfig) -> Tuple[TrainConfig, int, int]:
+    from dataclasses import replace
+
+    image_map = _list_image_files(Path(dataset_dir).resolve())
+    total_files = int(sum(len(files) for files in image_map.values()))
+    if total_files < 2:
+        return cfg, total_files, total_files
+    val_split = float(cfg.validation_split) if float(cfg.validation_split) > 0 else 0.0
+    if val_split > 0 and total_files >= 3:
+        val_count = max(1, int(total_files * val_split))
+        train_count = max(1, total_files - val_count)
+    else:
+        train_count = total_files
+    if not bool(cfg.auto_adjust_batch_and_epochs):
+        return cfg, total_files, train_count
+
+    min_steps = max(1, int(cfg.min_steps_per_epoch or 1))
+    user_batch = max(1, int(cfg.batch_size))
+    new_batch = _clamp_batch_for_steps(train_count, user_batch, min_steps)
+    steps_per_epoch = max(1, int(train_count // new_batch))
+
+    user_epochs = max(1, int(cfg.epochs))
+    target_total_updates = 800
+    min_total_updates = 300
+    suggested_epochs = user_epochs
+    if steps_per_epoch >= 1:
+        updates_at_user = steps_per_epoch * user_epochs
+        if updates_at_user < min_total_updates:
+            suggested_epochs = max(user_epochs, int(math.ceil(float(target_total_updates) / float(steps_per_epoch))))
+    suggested_epochs = max(user_epochs, min(suggested_epochs, 200))
+
+    if new_batch == user_batch and suggested_epochs == user_epochs:
+        return cfg, total_files, train_count
+
+    try:
+        new_cfg = replace(cfg, batch_size=int(new_batch), epochs=int(suggested_epochs))
+    except Exception:
+        return cfg, total_files, train_count
+    print(
+        f"[trainer] auto-adjust: total={total_files} train={train_count} "
+        f"batch {user_batch}->{new_batch}, epochs {user_epochs}->{suggested_epochs} "
+        f"(target ~{steps_per_epoch * suggested_epochs} updates)"
+    )
+    return new_cfg, total_files, train_count
+
+
+def recommend_train_params(total_samples: int, cfg: TrainConfig) -> Tuple[Dict[str, Any], List[str]]:
+    """Compute advisory recommended hyperparameters from the dataset size.
+
+    Returns ``(recommended_kwargs, reasons)`` where ``recommended_kwargs`` keys
+    match TrainConfig field names and ``reasons`` holds one human-readable line
+    per key, in the same order (batch_size, epochs, learning_rate,
+    validation_split). Values are advisory only — the caller decides whether to
+    apply them. img_size / conv filters / dense units / optimizer are left to
+    the user (no dataset-driven recommendation); img_size should match the
+    preprocessing output size (96) rather than the dataset.
+
+    Complementary to ``_adjust_cfg_for_dataset_size``, which stays the single
+    authoritative enforcement point inside ``train_and_export``: this mirrors
+    its numeric spirit as visible UI hints, but applies different rounding and
+    clamps (round-based train count, epochs clamped to [30, 300]) and is not
+    gated by ``auto_adjust_batch_and_epochs``.
+    """
+    total = max(1, int(total_samples))
+    val_split = float(cfg.validation_split) if float(cfg.validation_split) > 0 else 0.0
+    train_count = max(1, int(round(float(total) * (1.0 - val_split))))
+
+    user_batch = max(1, int(cfg.batch_size))
+    new_batch = max(2, min(user_batch, max(2, int(train_count // 4))))
+    steps_per_epoch = max(1, int(math.ceil(float(train_count) / float(new_batch))))
+    suggested_epochs = int(min(max(int(math.ceil(800.0 / float(steps_per_epoch))), 30), 300))
+    suggested_lr = 0.0008 if total < 100 else 0.001
+    suggested_val_split = 0.15 if total < 60 else 0.2
+
+    recommended_kwargs: Dict[str, Any] = {
+        "batch_size": new_batch,
+        "epochs": suggested_epochs,
+        "learning_rate": suggested_lr,
+        "validation_split": suggested_val_split,
+    }
+
+    reasons: List[str] = []
+    if new_batch != user_batch:
+        reasons.append(
+            f"only {train_count} training samples — batch {new_batch} gives "
+            f"{steps_per_epoch} step(s)/epoch; recommend ≥4 steps/epoch"
+        )
+    else:
+        reasons.append(
+            f"batch {new_batch} gives {steps_per_epoch} step(s)/epoch on {train_count} training samples"
+        )
+    reasons.append(
+        f"{steps_per_epoch} step(s)/epoch × {suggested_epochs} epochs = "
+        f"{steps_per_epoch * suggested_epochs} updates; recommend ~800 total updates"
+    )
+    if abs(float(cfg.learning_rate) - suggested_lr) > 1e-9:
+        if total < 100:
+            reasons.append(f"small dataset ({total} samples) — lower lr {suggested_lr} reduces oscillation")
+        else:
+            reasons.append(f"dataset of {total} samples — lr {suggested_lr} is a solid starting point")
+    else:
+        reasons.append(f"learning rate {suggested_lr} already matches recommendation")
+    if abs(float(cfg.validation_split) - suggested_val_split) > 1e-9:
+        if total < 60:
+            reasons.append(f"only {total} samples — val split {suggested_val_split} keeps more for training")
+        else:
+            reasons.append(
+                f"val split {suggested_val_split} leaves ~{int(round(float(total) * (1.0 - suggested_val_split)))} "
+                f"training samples from {total}"
+            )
+    else:
+        reasons.append(f"val split {suggested_val_split} already matches recommendation")
+
+    return recommended_kwargs, reasons
+
+
 def train_and_export(
     dataset_dir: Path,
     run_dir: Path,
@@ -314,6 +473,8 @@ def train_and_export(
     _ensure_tf()
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg, total_files, train_count = _adjust_cfg_for_dataset_size(dataset_dir, cfg)
 
     train_ds, val_ds, calibration_ds, labels, input_shape, class_weights = load_datasets(Path(dataset_dir), cfg)
     model = build_model(input_shape, len(labels), cfg)
@@ -341,10 +502,20 @@ def train_and_export(
         callbacks = []
 
     monitor_loss = "val_loss" if val_ds is not None else "loss"
+    steps_per_epoch_est = max(1, int(train_count // max(1, int(cfg.batch_size))))
+    if steps_per_epoch_est <= 4:
+        es_patience = 12
+        rlr_patience = 6
+    elif steps_per_epoch_est <= 8:
+        es_patience = 9
+        rlr_patience = 4
+    else:
+        es_patience = 6
+        rlr_patience = 3
     callbacks.append(
         tf.keras.callbacks.EarlyStopping(
             monitor=monitor_loss,
-            patience=6,
+            patience=int(es_patience),
             min_delta=1e-4,
             restore_best_weights=True,
             verbose=0,
@@ -354,7 +525,7 @@ def train_and_export(
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor=monitor_loss,
             factor=0.5,
-            patience=3,
+            patience=int(rlr_patience),
             min_lr=1e-5,
             verbose=0,
         )
