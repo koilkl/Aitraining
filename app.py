@@ -20,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from camera_permission import ensure_camera_access, get_camera_access_status
-from trainer import TrainConfig, new_run_dir, train_and_export
+from trainer import TrainConfig, new_run_dir, recommend_train_params, train_and_export
 from ui_styles import inject_teachable_style
 
 from dataset_io import (
@@ -34,7 +34,7 @@ from dataset_io import (
     materialize_zip_bytes,
     new_output_dir,
 )
-from serial_device import list_serial_ports, read_frame_png_from_serial
+from serial_device import list_serial_ports
 from record_controller import RecordController, SessionConfig, make_hold_button_html
 
 
@@ -345,9 +345,9 @@ def _init_session() -> None:
     if "tm_serial_channels" not in st.session_state:
         st.session_state.tm_serial_channels = 1
     if "tm_preview_dark_thresh" not in st.session_state:
-        st.session_state.tm_preview_dark_thresh = 0
+        st.session_state.tm_preview_dark_thresh = None
     if "tm_preview_lum_thresh" not in st.session_state:
-        st.session_state.tm_preview_lum_thresh = 100
+        st.session_state.tm_preview_lum_thresh = None
     if "tm_last_device_frame" not in st.session_state:
         st.session_state.tm_last_device_frame = None
     if "tm_capture_open" not in st.session_state:
@@ -774,14 +774,17 @@ def _tm_load_classes_meta() -> Optional[List[str]]:
 
 def _tm_save_classes_meta(classes: List[str]) -> None:
     p = _tm_classes_meta_path()
-    payload: Dict[str, Any] = {}
-    if p.exists():
-        try:
+    # Merge with existing meta — preserve class_preprocess / sample_preprocess
+    # written by record_controller._classes_save; only update the classes list.
+    existing: Dict[str, Any] = {}
+    try:
+        if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                payload.update(raw)
-        except Exception:
-            payload = {}
+                existing = raw
+    except Exception:
+        existing = {}
+    payload: Dict[str, Any] = dict(existing)
     payload["classes"] = list(classes)
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -997,8 +1000,8 @@ def _render_new_project() -> None:
                 _dbg_open_project_layout("A", "pre-fix", "app.py:_render_new_project", "[DEBUG] home open project restored state", {"session": str(st.session_state.session_id), "classes": list(state.get("classes") or []), "count_keys": list((state.get("counts") or {}).keys())})
                 # #endregion
                 st.session_state.tm_classes = list(state.get("classes") or ["Class 1", "Class 2"])
-                st.session_state.tm_preview_dark_thresh = int(state.get("bg_dark_thresh", 0)) if isinstance(state, dict) else 0
-                st.session_state.tm_preview_lum_thresh = int(state.get("bg_lum_thresh", 100)) if isinstance(state, dict) else 100
+                st.session_state.tm_preview_dark_thresh = 0
+                st.session_state.tm_preview_lum_thresh = 100
                 train_cfg_state = state.get("train_cfg") if isinstance(state, dict) else None
                 if isinstance(train_cfg_state, dict):
                     prev_cfg = st.session_state.train_cfg
@@ -1045,20 +1048,90 @@ def _render_new_project() -> None:
         )
 
 
+def _tm_train_recommendations(cfg: TrainConfig) -> Dict[str, Any]:
+    """Advisory training recommendations for the SPA Advanced panel."""
+    total = _tm_dataset_stats()[1]
+    try:
+        rec_kwargs, reasons = recommend_train_params(total, cfg)
+    except Exception:
+        return {}
+    return {
+        "total_samples": int(total),
+        "batch_size": int(rec_kwargs["batch_size"]),
+        "epochs": int(rec_kwargs["epochs"]),
+        "learning_rate": float(rec_kwargs["learning_rate"]),
+        "validation_split": float(rec_kwargs["validation_split"]),
+        "reasons": {
+            "batch": str(reasons[0]),
+            "epochs": str(reasons[1]),
+            "lr": str(reasons[2]),
+            "val_split": str(reasons[3]),
+        },
+    }
+
+
 def _render_train_config(cfg: TrainConfig) -> TrainConfig:
+    st.info("Recommendations are advisory — you can keep your own values.")
+    total_samples = _tm_dataset_stats()[1]
+    rec_kwargs, reasons = recommend_train_params(total_samples, cfg)
+    batch_opt = [8, 16, 32, 64]
+
+    # Snap recommendations to widget constraints (selectbox options / input caps).
+    rec_batch = int(rec_kwargs["batch_size"])
+    if rec_batch not in batch_opt:
+        rec_batch = min(batch_opt, key=lambda b: abs(b - rec_batch))
+    rec_epochs = min(int(rec_kwargs["epochs"]), 200)
+    rec_lr = float(rec_kwargs["learning_rate"])
+    rec_val_split = float(rec_kwargs["validation_split"])
+
+    # Guard against saved values outside the widget ranges.
+    cfg_batch = int(cfg.batch_size)
+    if cfg_batch not in batch_opt:
+        cfg_batch = min(batch_opt, key=lambda b: abs(b - cfg_batch))
+    cfg_epochs = min(int(cfg.epochs), 200)
+
     left, right = st.columns(2)
     with left:
         img_size = st.number_input("Image size", min_value=32, max_value=224, value=int(cfg.img_size), step=8)
+        if int(cfg.img_size) != 96:
+            st.caption("💡 Note: model input should match preprocessing (96×96)")
         color_mode = st.selectbox("Color mode", options=["rgb", "grayscale"], index=0 if cfg.color_mode == "rgb" else 1)
-        batch_size = st.selectbox("Batch size", options=[8, 16, 32, 64], index=[8, 16, 32, 64].index(cfg.batch_size))
-        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=int(cfg.epochs), step=1)
+        batch_size = st.selectbox("Batch size", options=batch_opt, index=batch_opt.index(cfg_batch))
+        if cfg_batch != rec_batch:
+            st.caption(f"💡 Recommended: {rec_batch} — {reasons[0]}")
+        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=cfg_epochs, step=1)
+        if cfg_epochs != rec_epochs:
+            st.caption(f"💡 Recommended: {rec_epochs} — {reasons[1]}")
         validation_split = st.slider("Validation split", min_value=0.05, max_value=0.5, value=float(cfg.validation_split), step=0.05)
+        if abs(float(cfg.validation_split) - rec_val_split) > 1e-9:
+            st.caption(f"💡 Recommended: {rec_val_split} — {reasons[3]}")
     with right:
         optimizer = st.selectbox("Optimizer", options=["adam", "sgd", "rmsprop"], index=["adam", "sgd", "rmsprop"].index(cfg.optimizer.lower()))
         learning_rate = st.number_input("Learning rate", min_value=1e-5, max_value=1e-1, value=float(cfg.learning_rate), format="%.5f")
+        if abs(float(cfg.learning_rate) - rec_lr) > 1e-9:
+            st.caption(f"💡 Recommended: {rec_lr} — {reasons[2]}")
         conv1_filters = st.selectbox("Conv1 filters", options=[4, 8, 16, 32], index=[4, 8, 16, 32].index(cfg.conv1_filters))
         conv2_filters = st.selectbox("Conv2 filters", options=[8, 16, 32, 64], index=[8, 16, 32, 64].index(cfg.conv2_filters))
         dense_units = st.selectbox("Dense units", options=[16, 32, 64, 128], index=[16, 32, 64, 128].index(cfg.dense_units))
+
+    if st.button("Use recommended settings", key="tm_use_recommended", use_container_width=True):
+        st.session_state.train_cfg = TrainConfig(
+            img_size=int(img_size),
+            color_mode=str(color_mode),
+            batch_size=rec_batch,
+            epochs=rec_epochs,
+            validation_split=rec_val_split,
+            seed=int(cfg.seed),
+            optimizer=str(optimizer),
+            learning_rate=rec_lr,
+            conv1_filters=int(conv1_filters),
+            conv2_filters=int(conv2_filters),
+            dense_units=int(dense_units),
+            representative_samples=int(cfg.representative_samples),
+            preprocess_mode=str(getattr(cfg, "preprocess_mode", "auto_by_label")),
+            manual_roi=getattr(cfg, "manual_roi", None),
+        )
+        st.rerun()
 
     return TrainConfig(
         img_size=int(img_size),
@@ -1299,6 +1372,22 @@ def _render_tm_old_frontend_html(
 ) -> None:
     import json as _json
 
+    # Prefer the backend-persisted config (e.g. applied recommendations) over
+    # Streamlit session memory, so frontend changes survive page reruns.
+    try:
+        saved_cfg_path = _tm_dataset_dir().parent / "runs" / "latest" / "train_config.json"
+        if saved_cfg_path.exists():
+            saved_raw = json.loads(saved_cfg_path.read_text(encoding="utf-8"))
+            if isinstance(saved_raw, dict):
+                updates = {}
+                for k in ("batch_size", "epochs", "validation_split", "learning_rate", "img_size"):
+                    if k in saved_raw and saved_raw[k] is not None:
+                        updates[k] = saved_raw[k]
+                if updates:
+                    train_cfg = TrainConfig(**{**train_cfg.__dict__, **updates})
+    except Exception:
+        pass
+
     meta = _tm_load_classes_meta_full() or {}
     payload = {
         "port": int(port),
@@ -1315,8 +1404,8 @@ def _render_tm_old_frontend_html(
         "current_serial_sync": str(current_serial_sync or "AA 55 AA"),
         "current_serial_frame_side": int(current_serial_frame_side),
         "current_serial_channels": int(current_serial_channels),
-        "preview_dark_thresh": int(st.session_state.get("tm_preview_dark_thresh", 0)),
-        "preview_lum_thresh": int(st.session_state.get("tm_preview_lum_thresh", 100)),
+        "preview_dark_thresh": int(st.session_state.get("tm_preview_dark_thresh") if st.session_state.get("tm_preview_dark_thresh") is not None else 0),
+        "preview_lum_thresh": int(st.session_state.get("tm_preview_lum_thresh") if st.session_state.get("tm_preview_lum_thresh") is not None else 100),
         "webcam_options": webcam_options,
         "current_webcam_index": int(current_webcam_index),
         "sample_previews": sample_previews,
@@ -1336,6 +1425,7 @@ def _render_tm_old_frontend_html(
             "preprocess_mode": str(getattr(train_cfg, "preprocess_mode", "auto_by_label")),
             "manual_roi": list(getattr(train_cfg, "manual_roi", []) or []) or None,
         },
+        "train_rec": _tm_train_recommendations(train_cfg),
     }
     debug_server_url = "http://127.0.0.1:7777/event"
     debug_session_id = "capture-webcam-source"
@@ -1785,6 +1875,25 @@ def _render_tm_old_frontend_html(
       display: grid;
       gap: 10px;
     }}
+    .adv-rec-hint {{
+      grid-column: 2;
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+      line-height: 1.3;
+    }}
+    .adv-use-rec {{
+      background: transparent;
+      border: 1px solid var(--accent, #4caf50);
+      color: var(--accent, #4caf50);
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 11px;
+      cursor: pointer;
+    }}
+    .adv-use-rec:hover {{
+      background: rgba(76, 175, 80, 0.1);
+    }}
     .train-adv-row {{
       display: grid;
       grid-template-columns: 1fr 128px;
@@ -2106,6 +2215,11 @@ def _render_tm_old_frontend_html(
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
       gap: 10px;
+    }}
+    .class-preprocess-window-note {{
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: var(--muted);
     }}
     .class-preprocess-thumb {{
       border: 0;
@@ -2660,14 +2774,15 @@ def _render_tm_old_frontend_html(
         <div class="advanced-row">
           <div class="advanced" id="advBtn">Advanced <span id="advChevron">▾</span></div>
           <button class="adv-reset" id="advReset" type="button">Reset</button>
+          <button class="adv-use-rec" id="advUseRec" type="button" title="Apply recommended hyperparameters">💡 Use recommended</button>
         </div>
         <div class="train-adv-panel" id="trainAdvPanel">
           <div class="train-adv-grid">
             <div class="train-adv-row"><span>Image Size</span><input id="advImgSizeInline" type="number" min="32" max="224" step="8"/></div>
-            <div class="train-adv-row"><span>Batch Size</span><input id="advBatchInline" type="number" min="1" step="1"/></div>
-            <div class="train-adv-row"><span>Epochs</span><input id="advEpochsInline" type="number" min="1" step="1"/></div>
-            <div class="train-adv-row"><span>Validation Split</span><input id="advValInline" type="number" min="0" max="0.5" step="0.05"/></div>
-            <div class="train-adv-row"><span>Learning Rate</span><input id="advLrInline" type="number" min="0" step="0.0001"/></div>
+            <div class="train-adv-row"><span>Batch Size</span><input id="advBatchInline" type="number" min="1" step="1"/><div class="adv-rec-hint" id="recBatchHint"></div></div>
+            <div class="train-adv-row"><span>Epochs</span><input id="advEpochsInline" type="number" min="1" step="1"/><div class="adv-rec-hint" id="recEpochsHint"></div></div>
+            <div class="train-adv-row"><span>Validation Split</span><input id="advValInline" type="number" min="0" max="0.5" step="0.05"/><div class="adv-rec-hint" id="recValHint"></div></div>
+            <div class="train-adv-row"><span>Learning Rate</span><input id="advLrInline" type="number" min="0" step="0.0001"/><div class="adv-rec-hint" id="recLrHint"></div></div>
             <div class="train-adv-row"><span>Conv1 Filters</span><input id="advConv1Inline" type="number" min="1" step="1"/></div>
             <div class="train-adv-row"><span>Conv2 Filters</span><input id="advConv2Inline" type="number" min="1" step="1"/></div>
             <div class="train-adv-row"><span>Dense Units</span><input id="advDenseInline" type="number" min="1" step="1"/></div>
@@ -2866,6 +2981,7 @@ function initStreamlitFrame() {{
   sendStreamlitMessage('streamlit:componentReady', {{apiVersion: 1}});
 }}
 let frameHeightRaf = 0;
+let layoutResyncRaf = 0;
 let layoutResyncTimers = [];
 let mountReflowTimers = [];
 let homeNavigateTimer = 0;
@@ -2960,9 +3076,18 @@ function scheduleLayoutResync() {{
     windowInnerHeight: window.innerHeight || 0,
   }});
   // #endregion
+  if (layoutResyncRaf) {{
+    try {{ cancelAnimationFrame(layoutResyncRaf); }} catch (e) {{}}
+    layoutResyncRaf = 0;
+  }}
+  layoutResyncTimers.forEach((t) => {{
+    try {{ clearTimeout(t); }} catch (e) {{}}
+  }});
+  layoutResyncTimers = [];
   queueFrameHeightSync();
   try {{
-    window.requestAnimationFrame(() => {{
+    layoutResyncRaf = window.requestAnimationFrame(() => {{
+      layoutResyncRaf = 0;
       if (window.__tmNavigatingAway) return;
       updateFlow();
       queueFrameHeightSync();
@@ -2983,7 +3108,7 @@ function scheduleLayoutResync() {{
 function bindLayoutImageObservers(scope) {{
   const root = scope || document;
   if (!root || !root.querySelectorAll) return;
-  root.querySelectorAll('img.sample-thumb, #previewImage').forEach((img) => {{
+  root.querySelectorAll('#previewImage, #classPreprocessImage').forEach((img) => {{
     if (!img || img.dataset.layoutBound === '1') return;
     img.dataset.layoutBound = '1';
     const onDone = () => scheduleLayoutResync();
@@ -3025,6 +3150,7 @@ dbgEvent('B', 'app.py:initialOpenSource', '[DEBUG] initial open source from payl
 let previewTimer = null;
 let previewBlobUrl = '';
 let previewRequestInFlight = false;
+let previewFrameController = null;
 let captureInFlight = false;
 let holdRecording = false;
 let holdRecordClass = '';
@@ -3032,8 +3158,12 @@ let holdRecordSource = '';
 let holdResumePreviewPredict = false;
 let holdPreviewSourceBeforeCapture = 'webcam';
 let holdSyncTimer = null;
+let holdPollController = null;
 let holdSeq = 0;
 let holdNextToken = 0;
+const SAMPLE_PREVIEW_LIMIT = 12;
+const SAMPLE_STRIP_LIMIT = 3;
+const CLASS_PREPROCESS_WINDOW = 15;
 let sourceSwitchInFlight = false;
 let sourceSwitchClass = '';
 let sourceSwitchKind = '';
@@ -3055,22 +3185,32 @@ let previewShowRaw = false;  // toggle to show original (unprocessed) image
 let previewShowScore = false;  // toggle: percentage (%) vs raw score (0.000-1.000)
 let previewDarkThresh = 0;
 let previewLumThresh = 100;
+let previewThreshUserModified = false;  // true only after user moves a slider
+let previewOodSignPctMin = 0.3;
+let previewOodSignPctMax = 70.0;
+let previewOodMaxProbMin = 0.60;
+let previewOodEntropyRatioMax = 0.70;
 let previewUploadImageSrc = '';
 let previewUploadImageB64 = '';
 let previewUploadFilename = '';
 let previewPredictTimer = null;
 let previewPredictInFlight = false;
+let previewPredictController = null;
 let previewPredictToken = 0;
 let previewSettingsOpen = false;
 let classPreprocessOpen = false;
 let classPreprocessClass = '';
 let classPreprocessDraft = null;
 let classPreprocessSampleIndex = 0;
+let classPreprocessSamples = [];
 let classPreprocessProcessedSrc = '';
 let classPreprocessBusy = false;
 let classPreprocessScrollTop = 0;
 let classPreprocessDirty = false;
 let classPreprocessAutoCrop = null;  // auto-detected crop box (normalized 0-1)
+let classPreprocessPreviewController = null;
+let classPreprocessPreviewToken = 0;
+let classPreprocessThresholdTimer = null;
 let navMenuOpen = false;
 let navMenuBound = false;
 let resizeBound = false;
@@ -3288,11 +3428,17 @@ function deleteSamplePreprocessConfig(className, filename) {{
   STATE.sample_preprocess = next;
 }}
 function selectedClassSample(className) {{
-  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  const items = getClassPreprocessSamples(className);
   if (!items.length) return null;
   const idx = Math.max(0, Math.min(items.length - 1, Number(classPreprocessSampleIndex || 0)));
   classPreprocessSampleIndex = idx;
   return items[idx];
+}}
+function getClassPreprocessSamples(className) {{
+  if (classPreprocessOpen && classPreprocessClass === className && Array.isArray(classPreprocessSamples) && classPreprocessSamples.length) {{
+    return normalizePreviewList(classPreprocessSamples);
+  }}
+  return normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
 }}
 function selectedClassSampleFilename(className) {{
   const sample = selectedClassSample(className);
@@ -3355,9 +3501,30 @@ function getClassPreprocessGridColumnCount() {{
     return 1;
   }}
 }}
+function getClassPreprocessWindow(items) {{
+  const list = Array.isArray(items) ? items : [];
+  const total = list.length;
+  if (total <= CLASS_PREPROCESS_WINDOW) {{
+    return {{
+      start: 0,
+      end: total,
+      items: list,
+    }};
+  }}
+  const current = Math.max(0, Math.min(total - 1, Number(classPreprocessSampleIndex || 0)));
+  const half = Math.floor(CLASS_PREPROCESS_WINDOW / 2);
+  let start = Math.max(0, current - half);
+  let end = Math.min(total, start + CLASS_PREPROCESS_WINDOW);
+  start = Math.max(0, end - CLASS_PREPROCESS_WINDOW);
+  return {{
+    start,
+    end,
+    items: list.slice(start, end),
+  }};
+}}
 function moveClassPreprocessSample(delta) {{
   if (!classPreprocessOpen || !classPreprocessClass) return;
-  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[classPreprocessClass]) || []);
+  const items = getClassPreprocessSamples(classPreprocessClass);
   if (!items.length) return;
   if (!maybeDiscardClassPreprocessDraft()) return;
   rememberClassPreprocessScroll();
@@ -3372,46 +3539,105 @@ function moveClassPreprocessSample(delta) {{
   refreshClassProcessedPreview();
 }}
 async function refreshClassProcessedPreview() {{
+  classPreprocessPreviewToken += 1;
+  const token = classPreprocessPreviewToken;
+  if (classPreprocessPreviewController) {{
+    try {{ classPreprocessPreviewController.abort(); }} catch (e) {{}}
+    classPreprocessPreviewController = null;
+  }}
   if (!classPreprocessOpen || !classPreprocessClass) return;
   const sample = selectedClassSample(classPreprocessClass);
   if (!sample) {{
     classPreprocessProcessedSrc = '';
+    classPreprocessBusy = false;
+    classPreprocessAutoCrop = null;
     renderClassPreprocessModal();
     return;
   }}
+  const targetClass = String(classPreprocessClass || '');
+  const targetFilename = String(previewFilename(sample) || '');
+  const targetClassConfig = getClassPreprocessConfig(targetClass);
+  const targetSampleConfig = normalizeClassPreprocessConfig(classPreprocessDraft);
   classPreprocessBusy = true;
-  renderClassPreprocessModal();
+  classPreprocessProcessedSrc = '';
+  classPreprocessAutoCrop = null;
+  refreshClassPreprocessResultPane();
+  classPreprocessPreviewController = new AbortController();
   try {{
     const res = await fetch(`${{baseUrl}}/preprocess/preview`, {{
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
+      signal: classPreprocessPreviewController.signal,
       body: JSON.stringify({{
         session: STATE.session,
-        class: classPreprocessClass,
-        filename: String(previewFilename(sample) || ''),
-        class_config: getClassPreprocessConfig(classPreprocessClass),
-        sample_config: normalizeClassPreprocessConfig(classPreprocessDraft)
+        class: targetClass,
+        filename: targetFilename,
+        class_config: targetClassConfig,
+        sample_config: targetSampleConfig
       }})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to render preprocess preview.');
+    if (
+      token !== classPreprocessPreviewToken ||
+      !classPreprocessOpen ||
+      String(classPreprocessClass || '') !== targetClass ||
+      String(selectedClassSampleFilename(targetClass) || '') !== targetFilename
+    ) {{
+      return;
+    }}
     const procB64 = data.processed_image_b64 || data.image_b64;
     classPreprocessProcessedSrc = procB64 ? `data:image/png;base64,${{procB64}}` : '';
     // Save auto-crop ROI (normalized 0-1) for overlay display
     classPreprocessAutoCrop = Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null;
   }} catch (err) {{
+    if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
+    if (
+      token !== classPreprocessPreviewToken ||
+      !classPreprocessOpen ||
+      String(classPreprocessClass || '') !== targetClass
+    ) {{
+      return;
+    }}
     classPreprocessProcessedSrc = '';
+    classPreprocessAutoCrop = null;
     toast(String(err && err.message ? err.message : err));
   }} finally {{
+    if (token !== classPreprocessPreviewToken) return;
+    classPreprocessPreviewController = null;
     classPreprocessBusy = false;
-    renderClassPreprocessModal();
+    if (!classPreprocessOpen || String(classPreprocessClass || '') !== targetClass) return;
+    refreshClassPreprocessResultPane();
     // Update ROI overlay with auto-detected crop box
     updateClassPreprocessOverlay(null);
   }}
 }}
-function openClassPreprocessEditor(className) {{
+async function loadClassPreprocessSamples(className) {{
+  if (!className) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/class_filenames?session=${{encodeURIComponent(STATE.session)}}&class=${{encodeURIComponent(className)}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to load class samples.');
+    const filenames = Array.isArray(data.filenames) ? data.filenames.map((v) => String(v || '').trim()).filter(Boolean) : [];
+    classPreprocessSamples = filenames.map((filename) => ({{
+      filename,
+      src: `${{baseUrl}}/sample_image?session=${{encodeURIComponent(STATE.session)}}&class=${{encodeURIComponent(className)}}&filename=${{encodeURIComponent(filename)}}`
+    }}));
+    if (classPreprocessOpen && classPreprocessClass === className) {{
+      const maxIndex = Math.max(0, classPreprocessSamples.length - 1);
+      classPreprocessSampleIndex = Math.max(0, Math.min(Number(classPreprocessSampleIndex || 0), maxIndex));
+      renderClassPreprocessModal();
+      refreshClassProcessedPreview();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
+async function openClassPreprocessEditor(className) {{
+  stopClassPreprocessPreviewWork();
   classPreprocessClass = String(className || '');
   classPreprocessSampleIndex = 0;
+  classPreprocessSamples = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[classPreprocessClass]) || []);
   classPreprocessDraft = normalizeClassPreprocessConfig(
     getSampleEffectivePreprocessConfig(classPreprocessClass, selectedClassSampleFilename(classPreprocessClass))
   );
@@ -3420,15 +3646,39 @@ function openClassPreprocessEditor(className) {{
   classPreprocessOpen = true;
   renderClassPreprocessModal();
   refreshClassProcessedPreview();
+  await loadClassPreprocessSamples(classPreprocessClass);
+}}
+function stopClassPreprocessPreviewWork() {{
+  classPreprocessPreviewToken += 1;
+  if (classPreprocessPreviewController) {{
+    try {{ classPreprocessPreviewController.abort(); }} catch (e) {{}}
+    classPreprocessPreviewController = null;
+  }}
+  if (classPreprocessThresholdTimer) {{
+    try {{ clearTimeout(classPreprocessThresholdTimer); }} catch (e) {{}}
+    classPreprocessThresholdTimer = null;
+  }}
+}}
+function refreshClassPreprocessResultPane() {{
+  if (!classPreprocessOpen) return;
+  const pane = document.querySelector('#classPreprocessModal .class-preprocess-result');
+  if (!pane) return;
+  pane.innerHTML = classPreprocessProcessedSrc
+    ? `<img src="${{escapeHtml(classPreprocessProcessedSrc)}}" alt="Processed preview"/>`
+    : `<div class="preview-empty">${{classPreprocessBusy ? 'Rendering...' : 'Choose a sample to preview preprocessing.'}}</div>`;
+  scheduleLayoutResync();
 }}
 function closeClassPreprocessEditor(force = false) {{
   if (!force && !maybeDiscardClassPreprocessDraft()) return;
+  stopClassPreprocessPreviewWork();
   classPreprocessOpen = false;
   classPreprocessClass = '';
+  classPreprocessSamples = [];
   classPreprocessDraft = null;
   classPreprocessProcessedSrc = '';
   classPreprocessBusy = false;
   classPreprocessDirty = false;
+  classPreprocessAutoCrop = null;
   renderClassPreprocessModal();
 }}
   function getClassPreprocessImageContentRect() {{
@@ -3631,15 +3881,22 @@ function renderClassPreprocessModal() {{
   const top = roi ? roi[1] * 100 : 0;
   const width = roi ? Math.max(0, (roi[2] - roi[0]) * 100) : 0;
   const height = roi ? Math.max(0, (roi[3] - roi[1]) * 100) : 0;
-  const samples = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[classPreprocessClass]) || []);
+  const samples = getClassPreprocessSamples(classPreprocessClass);
+  const windowed = getClassPreprocessWindow(samples);
   const dirty = currentClassPreprocessDirty();
   classPreprocessDirty = dirty;
-  const thumbs = samples.map((item, idx) => `
+  const thumbs = windowed.items.map((item, localIdx) => {{
+    const idx = windowed.start + localIdx;
+    return `
     <button class="class-preprocess-thumb${{idx === classPreprocessSampleIndex ? ' active' : ''}}${{sampleHasOwnPreprocessConfig(classPreprocessClass, String(previewFilename(item) || '')) ? ' defined' : ''}}" type="button" data-preprocess-sample="${{idx}}">
-      <img src="${{escapeHtml(previewSrc(item))}}" alt="Sample ${{idx + 1}}"/>
+      <img src="${{escapeHtml(previewSrc(item))}}" loading="lazy" decoding="async" alt="Sample ${{idx + 1}}"/>
       <div class="class-preprocess-thumb-state">${{samplePreprocessStatus(classPreprocessClass, String(previewFilename(item) || ''))}}</div>
     </button>
-  `).join('');
+  `;
+  }}).join('');
+  const thumbsMeta = samples.length > windowed.items.length
+    ? `<div class="class-preprocess-window-note">Showing ${{windowed.start + 1}}-${{windowed.end}} of ${{samples.length}} samples</div>`
+    : '';
   host.style.display = 'flex';
   host.innerHTML = `
     <div class="class-preprocess-shell">
@@ -3697,6 +3954,7 @@ function renderClassPreprocessModal() {{
         </div>
         <div>
           <div class="class-preprocess-info">Samples</div>
+          ${{thumbsMeta}}
           <div class="class-preprocess-grid">${{thumbs || '<div class="preview-empty">No samples yet.</div>'}}</div>
         </div>
         <div class="class-preprocess-actions">
@@ -3757,18 +4015,23 @@ function renderClassPreprocessModal() {{
   const lumNum       = document.getElementById('classPreprocessLumNum');
   const darkNum      = document.getElementById('classPreprocessDarkNum');
   const darkSlider   = document.getElementById('classPreprocessDark');
-  let thresholdTimer = null;
   const applyThresholds = () => {{
+    if (classPreprocessThresholdTimer) {{
+      clearTimeout(classPreprocessThresholdTimer);
+      classPreprocessThresholdTimer = null;
+    }}
     const existing = getClassPreprocessConfig(classPreprocessClass);
     existing.bg_lum_thresh = Number(lumSlider ? lumSlider.value : 100);
     existing.bg_dark_thresh = Number(darkSlider ? darkSlider.value : 0);
     setClassPreprocessConfig(classPreprocessClass, existing);
-    renderClassPreprocessModal();
     refreshClassProcessedPreview();
   }};
   const debouncedApply = () => {{
-    if (thresholdTimer) clearTimeout(thresholdTimer);
-    thresholdTimer = setTimeout(applyThresholds, 250);
+    if (classPreprocessThresholdTimer) clearTimeout(classPreprocessThresholdTimer);
+    classPreprocessThresholdTimer = setTimeout(() => {{
+      classPreprocessThresholdTimer = null;
+      applyThresholds();
+    }}, 250);
   }};
 
   // Lum/B-G slider + number sync
@@ -3886,8 +4149,15 @@ function restorePreviewState() {{
     previewShowRoi = !!data.showRoi;
     previewShowRaw = !!data.showRaw;
     previewShowScore = !!data.showScore;
-    previewDarkThresh = Number(data.darkThresh || STATE.preview_dark_thresh || 0);
-    previewLumThresh = Number(data.lumThresh || STATE.preview_lum_thresh || 100);
+    previewThreshUserModified = !!data.threshModified;
+    previewOodSignPctMin = Number(data.oodSignPctMin ?? previewOodSignPctMin ?? 0.3);
+    previewOodSignPctMax = Number(data.oodSignPctMax ?? previewOodSignPctMax ?? 70.0);
+    previewOodMaxProbMin = Number(data.oodMaxProbMin ?? previewOodMaxProbMin ?? 0.60);
+    previewOodEntropyRatioMax = Number(data.oodEntropyRatioMax ?? previewOodEntropyRatioMax ?? 0.70);
+    if (previewThreshUserModified) {{
+      previewDarkThresh = Number(data.darkThresh ?? STATE.preview_dark_thresh ?? 0);
+      previewLumThresh = Number(data.lumThresh ?? STATE.preview_lum_thresh ?? 100);
+    }}
   }} catch (e) {{}}
 }}
 function persistPreviewState() {{
@@ -3899,8 +4169,13 @@ function persistPreviewState() {{
       showRoi: !!previewShowRoi,
       showRaw: !!previewShowRaw,
       showScore: !!previewShowScore,
-      darkThresh: Number(previewDarkThresh || 0),
-      lumThresh: Number(previewLumThresh || 100)
+      darkThresh: Number((previewDarkThresh ?? 0)),
+      lumThresh: Number((previewLumThresh ?? 100)),
+      oodSignPctMin: Number((previewOodSignPctMin ?? 0.3)),
+      oodSignPctMax: Number((previewOodSignPctMax ?? 70.0)),
+      oodMaxProbMin: Number((previewOodMaxProbMin ?? 0.60)),
+      oodEntropyRatioMax: Number((previewOodEntropyRatioMax ?? 0.70)),
+      threshModified: !!previewThreshUserModified
     }}));
   }} catch (e) {{}}
 }}
@@ -4117,6 +4392,11 @@ function reloadParent() {{
   window.location.reload();
 }}
 function stopPreviewLoop() {{
+  if (previewFrameController) {{
+    try {{ previewFrameController.abort(); }} catch (e) {{}}
+    previewFrameController = null;
+  }}
+  previewRequestInFlight = false;
   if (previewTimer) {{
     clearInterval(previewTimer);
     previewTimer = null;
@@ -4129,6 +4409,10 @@ function startPreviewLoop() {{
 }}
 function stopHoldSyncLoop() {{
   holdNextToken += 1;
+  if (holdPollController) {{
+    try {{ holdPollController.abort(); }} catch (e) {{}}
+    holdPollController = null;
+  }}
   if (holdSyncTimer) {{
     clearInterval(holdSyncTimer);
     holdSyncTimer = null;
@@ -4190,7 +4474,8 @@ function refreshPreviewImage() {{
   if (!img || !note) return;
   const url = `${{baseUrl}}/live/frame?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&_ts=${{Date.now()}}`;
   previewRequestInFlight = true;
-  fetch(url).then(async (res) => {{
+  previewFrameController = new AbortController();
+  fetch(url, {{ signal: previewFrameController.signal }}).then(async (res) => {{
     if (!res.ok) {{
       let msg = '';
       try {{
@@ -4219,11 +4504,13 @@ function refreshPreviewImage() {{
     img.src = previewBlobUrl;
     note.textContent = '';
   }}).catch((err) => {{
+    if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
     clearPreviewBlob();
     img.removeAttribute('src');
     note.textContent = String(err && err.message ? err.message : err);
   }}).finally(() => {{
     previewRequestInFlight = false;
+    previewFrameController = null;
   }});
 }}
 async function openSourcePanel(kind, className) {{
@@ -4303,6 +4590,7 @@ async function captureSource() {{
     }}
     incrementSampleCount(openSourceClass, 1);
     recomputeTrainEnabled();
+  refreshTrainRec();
     updateOpenSamplesPanel(openSourceClass);
     toast('1 sample captured.');
   }} finally {{
@@ -4552,12 +4840,14 @@ function applyProjectState(state) {{
   holdRecordSource = '';
   openSourceClass = '';
   openSourceKind = '';
+  stopClassPreprocessPreviewWork();
   classPreprocessOpen = false;
   classPreprocessClass = '';
   classPreprocessDraft = null;
   classPreprocessSampleIndex = 0;
   classPreprocessProcessedSrc = '';
   classPreprocessBusy = false;
+  classPreprocessAutoCrop = null;
   clearOpenSourceState();
   previewInputOn = false;
   persistPreviewState();
@@ -4587,6 +4877,7 @@ function applyProjectState(state) {{
   if (typeof s.bg_lum_thresh === 'number') previewLumThresh = s.bg_lum_thresh;
   persistPreviewState();
   recomputeTrainEnabled();
+  refreshTrainRec();
   try {{
     document.documentElement.scrollTop = 0;
     document.documentElement.scrollLeft = 0;
@@ -4640,8 +4931,8 @@ async function saveProject() {{
           }}),
           class_preprocess: Object.assign({{}}, STATE.class_preprocess || {{}}),
           sample_preprocess: normalizeSamplePreprocessMap(STATE.sample_preprocess || {{}}),
-          bg_dark_thresh: Number(previewDarkThresh || 0),
-          bg_lum_thresh: Number(previewLumThresh || 100)
+          bg_dark_thresh: Number((previewDarkThresh ?? 0)),
+          bg_lum_thresh: Number((previewLumThresh ?? 100))
         }}
       }})
     }});
@@ -4914,6 +5205,7 @@ async function uploadFiles(className, files) {{
     }}
   }}
   syncTrainUi();
+  refreshTrainRec();
   if (openSourceClass === className) updateOpenSamplesPanel(className);
   toast(uploaded > 0 ? `Uploaded ${{uploaded}} image(s).` : 'Upload failed.');
 }}
@@ -4968,7 +5260,7 @@ function prependSamplePreview(className, item) {{
   if (!className || !normalized) return;
   const items = Array.isArray(STATE.sample_previews[className]) ? STATE.sample_previews[className].slice() : [];
   items.unshift(normalized);
-  STATE.sample_previews[className] = items;
+  STATE.sample_previews[className] = normalizePreviewList(items).slice(0, SAMPLE_PREVIEW_LIMIT);
 }}
 function removePreviewItemLocal(className, filename) {{
   if (!className || !filename) return;
@@ -4993,8 +5285,9 @@ async function syncClassState(className) {{
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to refresh class state.');
     STATE.counts[className] = Number(data.count || 0);
-    STATE.sample_previews[className] = normalizePreviewList(data.previews);
+    STATE.sample_previews[className] = normalizePreviewList(data.previews).slice(0, SAMPLE_PREVIEW_LIMIT);
     recomputeTrainEnabled();
+  refreshTrainRec();
     syncTrainUi();
   }} catch (err) {{
     toast(String(err && err.message ? err.message : err));
@@ -5031,10 +5324,14 @@ async function startHoldCapture() {{
     holdSeq = 0;
     const token = holdNextToken + 1;
     holdNextToken = token;
+    holdPollController = new AbortController();
     (async () => {{
       while (holdRecording && holdRecordClass && holdNextToken === token) {{
         try {{
-          const nextRes = await fetch(`${{baseUrl}}/record/next?session=${{encodeURIComponent(STATE.session)}}&since=${{encodeURIComponent(String(holdSeq))}}`);
+          const nextRes = await fetch(
+            `${{baseUrl}}/record/next?session=${{encodeURIComponent(STATE.session)}}&since=${{encodeURIComponent(String(holdSeq))}}`,
+            {{ signal: holdPollController ? holdPollController.signal : undefined }}
+          );
           const nextData = await nextRes.json().catch(() => ({{ok:'0'}}));
           if (!holdRecording || holdNextToken !== token) break;
           if (!nextRes.ok || nextData.ok !== '1') throw new Error(nextData.error || 'Unable to read hold capture updates.');
@@ -5058,16 +5355,21 @@ async function startHoldCapture() {{
             }});
             STATE.counts[holdRecordClass] = Number(nextData.count || STATE.counts[holdRecordClass] || 0);
             recomputeTrainEnabled();
-            if (openSourceClass === holdRecordClass) updateOpenSamplesPanel(holdRecordClass);
+            refreshTrainRec();
+            // Keep hold capture responsive: avoid rebuilding the whole sample
+            // panel on every frame. We sync the full panel once on release.
+            setClassSampleCountLabel(holdRecordClass);
           }} else {{
             holdSeq = seq;
           }}
           if (String(nextData.recording || '1') !== '1') break;
         }} catch (err) {{
+          if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) break;
           toast(String(err && err.message ? err.message : err));
           await new Promise((r) => setTimeout(r, 250));
         }}
       }}
+      if (holdNextToken === token) holdPollController = null;
     }})().catch(() => {{}});
   }} catch (err) {{
     toast(String(err && err.message ? err.message : err));
@@ -5457,20 +5759,22 @@ function buildSampleTileMarkup(item, idx) {{
   const filename = escapeHtml(previewFilename(item));
   return `
     <div class="sample-item">
-      <img class="sample-thumb" src="${{src}}" alt="Sample ${{idx+1}}"/>
+      <img class="sample-thumb" src="${{src}}" loading="lazy" decoding="async" alt="Sample ${{idx+1}}"/>
       <button class="sample-delete" type="button" data-filename="${{filename}}" aria-label="Delete sample">✕</button>
     </div>
   `;
 }}
 function buildSamplesMarkup(className) {{
-  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []).slice(0, SAMPLE_PREVIEW_LIMIT);
   if (!items.length) return '<div class="samples-empty">No samples yet.</div>';
   return `<div class="samples-grid">${{items.map((item, idx) => buildSampleTileMarkup(item, idx)).join('')}}</div>`;
 }}
 function buildSamplesStripMarkup(className) {{
-  const items = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  const allItems = normalizePreviewList((STATE.sample_previews && STATE.sample_previews[className]) || []);
+  const items = allItems.slice(0, SAMPLE_STRIP_LIMIT);
   if (!items.length) return '<div class="samples-strip-empty">No samples yet.</div>';
-  return `<div class="samples-strip">${{items.map((item, idx) => buildSampleTileMarkup(item, idx)).join('')}}</div>`;
+  const more = allItems.length > items.length ? `<div class="samples-strip-more">+${{allItems.length - items.length}}</div>` : '';
+  return `<div class="samples-strip">${{items.map((item, idx) => buildSampleTileMarkup(item, idx)).join('')}}${{more}}</div>`;
 }}
 function createIcon(kind) {{
   if (kind === 'webcam') return `<svg viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"></rect><path d="M22 8l-6 4 6 4V8z"></path></svg>`;
@@ -5501,6 +5805,11 @@ function latestPreviewImage() {{
 }}
 function stopPreviewPredictLoop() {{
   previewPredictToken += 1;
+  if (previewPredictController) {{
+    try {{ previewPredictController.abort(); }} catch (e) {{}}
+    previewPredictController = null;
+  }}
+  previewPredictInFlight = false;
   if (previewPredictTimer) {{
     clearInterval(previewPredictTimer);
     previewPredictTimer = null;
@@ -5556,11 +5865,12 @@ async function refreshPreviewPrediction(token) {{
   if (previewPredictInFlight) return;
   if (token !== previewPredictToken) return;
   previewPredictInFlight = true;
+  previewPredictController = new AbortController();
   const pane = document.getElementById('previewPane');
   const note = document.getElementById('previewNote');
   const imgId = 'previewImage';
   try {{
-    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(String(previewDarkThresh || 0))}}&bg_lum=${{encodeURIComponent(String(previewLumThresh || 100))}}&_ts=${{Date.now()}}`);
+    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(previewThreshUserModified ? String(previewDarkThresh ?? '') : '')}}&bg_lum=${{encodeURIComponent(previewThreshUserModified ? String(previewLumThresh ?? '') : '')}}&ood_sign_min=${{encodeURIComponent(String(previewOodSignPctMin ?? 0.3))}}&ood_sign_max=${{encodeURIComponent(String(previewOodSignPctMax ?? 70.0))}}&ood_max_prob=${{encodeURIComponent(String(previewOodMaxProbMin ?? 0.60))}}&ood_entropy_max=${{encodeURIComponent(String(previewOodEntropyRatioMax ?? 0.70))}}&_ts=${{Date.now()}}`, {{ signal: previewPredictController.signal }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
@@ -5591,13 +5901,18 @@ async function refreshPreviewPrediction(token) {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
-      note.textContent = top ? `Top: ${{top}} (${{p}}%)${{roiMsg}}` : roiMsg.trim();
+      const roiMsg = data.processed_variant ? (previewPreprocessMode === 'manual_roi' ? ' · ROI/manual crop input' : ' · sign search + crop input') : '';
+      const debugMsg = data.ood
+        ? ` · OOD: ${{String(data.ood_reason || 'suppressed')}} · sign=${{Number(data.sign_pct || 0).toFixed(1)}}% · max=${{Number(data.max_prob || 0).toFixed(3)}} · ent=${{Number(data.entropy_ratio || 0).toFixed(3)}}`
+        : ` · sign=${{Number(data.sign_pct || 0).toFixed(1)}}% · max=${{Number(data.max_prob || 0).toFixed(3)}} · ent=${{Number(data.entropy_ratio || 0).toFixed(3)}}`;
+      note.textContent = top ? `Top: ${{top}} (${{p}}%)${{roiMsg}}${{debugMsg}}` : `${{roiMsg.trim()}}${{debugMsg}}`.trim();
     }}
   }} catch (err) {{
+    if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
     if (note) note.textContent = String(err && err.message ? err.message : err);
   }} finally {{
     previewPredictInFlight = false;
+    previewPredictController = null;
   }}
 }}
 async function runPreviewUploadPrediction() {{
@@ -5619,8 +5934,12 @@ async function runPreviewUploadPrediction() {{
         session: STATE.session,
         image_b64: previewUploadImageB64,
         preprocess: previewPreprocessMode,
-        bg_dark: Number(previewDarkThresh || 0),
-        bg_lum: Number(previewLumThresh || 100),
+        bg_dark: previewThreshUserModified ? Number(previewDarkThresh ?? 0) : '',
+        bg_lum: previewThreshUserModified ? Number(previewLumThresh ?? 0) : '', 
+        ood_sign_min: Number(previewOodSignPctMin ?? 0.3),
+        ood_sign_max: Number(previewOodSignPctMax ?? 70.0),
+        ood_max_prob: Number(previewOodMaxProbMin ?? 0.60),
+        ood_entropy_max: Number(previewOodEntropyRatioMax ?? 0.70),
       }})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
@@ -5645,8 +5964,13 @@ async function runPreviewUploadPrediction() {{
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
       const p = Math.round(Number(data.top_prob || 0) * 1000) / 10;
-      const roiMsg = data.processed_variant ? ` · ${{String(data.processed_variant)}}` : '';
-      note.textContent = top ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)${{roiMsg}}` : `Upload: ${{String(previewUploadFilename || 'image')}}${{roiMsg}}`;
+      const roiMsg = data.processed_variant ? (previewPreprocessMode === 'manual_roi' ? ' · ROI/manual crop input' : ' · sign search + crop input') : '';
+      const debugMsg = data.ood
+        ? ` · OOD: ${{String(data.ood_reason || 'suppressed')}} · sign=${{Number(data.sign_pct || 0).toFixed(1)}}% · max=${{Number(data.max_prob || 0).toFixed(3)}} · ent=${{Number(data.entropy_ratio || 0).toFixed(3)}}`
+        : ` · sign=${{Number(data.sign_pct || 0).toFixed(1)}}% · max=${{Number(data.max_prob || 0).toFixed(3)}} · ent=${{Number(data.entropy_ratio || 0).toFixed(3)}}`;
+      note.textContent = top
+        ? `Upload: ${{String(previewUploadFilename || 'image')}} · Top: ${{top}} (${{p}}%)${{roiMsg}}${{debugMsg}}`
+        : `Upload: ${{String(previewUploadFilename || 'image')}}${{roiMsg}}${{debugMsg}}`;
     }}
   }} catch (err) {{
     if (note) note.textContent = String(err && err.message ? err.message : err);
@@ -5798,11 +6122,30 @@ function buildPreviewSettingsMarkup() {{
       </select>
     </label>
   `;
+  const oodFields = `
+    <label title="Minimum sign_pct before Preview treats the frame as empty / invalid.">
+      OOD sign min %
+      <input id="previewOodSignPctMin" type="number" min="0" max="100" step="0.1" value="${{Number(previewOodSignPctMin ?? 0.3)}}"/>
+    </label>
+    <label title="Maximum sign_pct before Preview treats the frame as too full / shadowed.">
+      OOD sign max %
+      <input id="previewOodSignPctMax" type="number" min="0" max="100" step="0.1" value="${{Number(previewOodSignPctMax ?? 70.0)}}"/>
+    </label>
+    <label title="Minimum softmax confidence required before Preview accepts a class result.">
+      OOD max prob
+      <input id="previewOodMaxProbMin" type="number" min="0" max="1" step="0.01" value="${{Number(previewOodMaxProbMin ?? 0.60)}}"/>
+    </label>
+    <label title="Maximum entropy ratio allowed before Preview suppresses to No Sign.">
+      OOD entropy max
+      <input id="previewOodEntropyRatioMax" type="number" min="0" max="1" step="0.01" value="${{Number(previewOodEntropyRatioMax ?? 0.70)}}"/>
+    </label>
+  `;
   if (previewSource === 'upload') {{
     return `
       <div class="source-settings-panel" id="previewSettingsPanel">
         <div class="source-settings-grid">
           ${{exportFields}}
+          ${{oodFields}}
           <label>
             Test Image
             <button class="upload-pick" type="button" id="previewUploadPick">Choose image</button>
@@ -5824,6 +6167,7 @@ function buildPreviewSettingsMarkup() {{
       <div class="source-settings-panel" id="previewSettingsPanel">
         <div class="source-settings-grid">
           ${{exportFields}}
+          ${{oodFields}}
           <label>
             Device Port
             <select id="previewDevicePort">${{buildDeviceOptions(currentSerialPort)}}</select>
@@ -5856,6 +6200,7 @@ function buildPreviewSettingsMarkup() {{
     <div class="source-settings-panel" id="previewSettingsPanel">
       <div class="source-settings-grid">
         ${{exportFields}}
+        ${{oodFields}}
         <label>
           Camera
           <select id="previewCamera">${{buildWebcamOptions(currentWebcamIndex)}}</select>
@@ -5940,10 +6285,18 @@ function renderPreviewSettings() {{
         if (camEl && String(camEl.value) !== String(currentWebcamIndex)) await setWebcamIndexGlobal(camEl.value);
         if (rateEl) previewIntervalMs = Number(rateEl.value || previewIntervalMs || 80);
       }}
+      const oodSignMinEl = document.getElementById('previewOodSignPctMin');
+      const oodSignMaxEl = document.getElementById('previewOodSignPctMax');
+      const oodMaxProbEl = document.getElementById('previewOodMaxProbMin');
+      const oodEntropyEl = document.getElementById('previewOodEntropyRatioMax');
+      previewOodSignPctMin = Math.max(0, Math.min(100, Number(oodSignMinEl ? oodSignMinEl.value : (previewOodSignPctMin ?? 0.3))));
+      previewOodSignPctMax = Math.max(0, Math.min(100, Number(oodSignMaxEl ? oodSignMaxEl.value : (previewOodSignPctMax ?? 70.0))));
+      previewOodMaxProbMin = Math.max(0, Math.min(1, Number(oodMaxProbEl ? oodMaxProbEl.value : (previewOodMaxProbMin ?? 0.60))));
+      previewOodEntropyRatioMax = Math.max(0, Math.min(1, Number(oodEntropyEl ? oodEntropyEl.value : (previewOodEntropyRatioMax ?? 0.70))));
       const darkEl = document.getElementById('previewDarkThresh');
       const lumEl = document.getElementById('previewLumThresh');
-      previewDarkThresh = Number(darkEl ? darkEl.value : previewDarkThresh || 0);
-      previewLumThresh = Number(lumEl ? lumEl.value : previewLumThresh || 100);
+      previewDarkThresh = Number(darkEl ? darkEl.value : (previewDarkThresh ?? 0));
+      previewLumThresh = Number(lumEl ? lumEl.value : (previewLumThresh ?? 100));
       persistPreviewState();
       previewSettingsOpen = false;
       renderPreviewSettings();
@@ -5973,17 +6326,18 @@ function bindPreviewThreshBar() {{
   const lumNum = document.getElementById('previewLumNum');
   if (!darkSlider || !lumSlider) return;
   if (darkSlider.dataset.bound === '1') {{
-    darkSlider.value = String(previewDarkThresh || 0);
-    darkNum.value = String(previewDarkThresh || 0);
-    lumSlider.value = String(previewLumThresh || 100);
-    lumNum.value = String(previewLumThresh || 100);
+    darkSlider.value = String((previewDarkThresh ?? 0));
+    darkNum.value = String((previewDarkThresh ?? 0));
+    lumSlider.value = String((previewLumThresh ?? 100));
+    lumNum.value = String((previewLumThresh ?? 100));
     return;
   }}
   darkSlider.dataset.bound = '1';
   const syncDark = (src) => {{
-    const v = Math.max(0, Math.min(255, Number(src.value || 0)));
+    const v = Math.max(0, Math.min(100, Number(src.value ?? 0)));
     if (previewDarkThresh !== v) {{
       previewDarkThresh = v;
+      previewThreshUserModified = true;
       persistPreviewState();
       if (previewInputOn) {{ if (previewPredictTimer) stopPreviewPredictLoop(); startPreviewPredictLoop(); }}
     }}
@@ -5991,9 +6345,10 @@ function bindPreviewThreshBar() {{
     darkNum.value = String(v);
   }};
   const syncLum = (src) => {{
-    const v = Math.max(50, Math.min(255, Number(src.value || 100)));
+    const v = Math.max(50, Math.min(255, Number(src.value ?? 100)));
     if (previewLumThresh !== v) {{
       previewLumThresh = v;
+      previewThreshUserModified = true;
       persistPreviewState();
       if (previewInputOn) {{ if (previewPredictTimer) stopPreviewPredictLoop(); startPreviewPredictLoop(); }}
     }}
@@ -6004,10 +6359,10 @@ function bindPreviewThreshBar() {{
   darkNum.onchange = () => syncDark(darkNum);
   lumSlider.oninput = () => syncLum(lumSlider);
   lumNum.onchange = () => syncLum(lumNum);
-  darkSlider.value = String(previewDarkThresh || 0);
-  darkNum.value = String(previewDarkThresh || 0);
-  lumSlider.value = String(previewLumThresh || 100);
-  lumNum.value = String(previewLumThresh || 100);
+  darkSlider.value = String((previewDarkThresh ?? 0));
+  darkNum.value = String((previewDarkThresh ?? 0));
+  lumSlider.value = String((previewLumThresh ?? 100));
+  lumNum.value = String((previewLumThresh ?? 100));
 }}
 function renderPreviewCard() {{
   const pane = document.getElementById('previewPane');
@@ -6096,9 +6451,15 @@ function bindPreviewControls() {{
   if (toggle.dataset.bound === '1') return;
   toggle.dataset.bound = '1';
   roiToggle.dataset.bound = '1';
-  toggle.onchange = () => {{
+  toggle.onchange = async () => {{
     previewInputOn = !!toggle.checked;
     persistPreviewState();
+    if (!previewInputOn && (previewSource === 'webcam' || previewSource === 'device')) {{
+      stopPreviewPredictLoop();
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}`);
+      }} catch (e) {{}}
+    }}
     renderPreviewCard();
   }};
   roiToggle.onchange = () => {{
@@ -6189,6 +6550,9 @@ async function deleteSample(className, filename) {{
     const next = data.state || {{}};
     STATE.counts[className] = Number(next.count || 0);
     STATE.sample_previews[className] = normalizePreviewList(next.previews);
+    if (classPreprocessOpen && classPreprocessClass === className) {{
+      classPreprocessSamples = normalizePreviewList(classPreprocessSamples).filter((item) => String(previewFilename(item) || '') !== String(filename || ''));
+    }}
     STATE.processed_previews[className] = normalizePreviewList(
       normalizePreviewList(STATE.processed_previews[className]).filter((item) => String(previewFilename(item) || '') !== String(filename || ''))
     );
@@ -6205,6 +6569,7 @@ async function deleteSample(className, filename) {{
       refreshClassProcessedPreview();
     }}
     recomputeTrainEnabled();
+  refreshTrainRec();
     syncTrainUi();
     const openHost = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
     if (openHost) {{
@@ -6255,6 +6620,7 @@ async function renameClass(oldName) {{
     if (holdRecordClass === oldName) holdRecordClass = nextName;
     persistOpenSourceState();
     recomputeTrainEnabled();
+  refreshTrainRec();
     render();
   }} catch (err) {{
     toast(String(err && err.message ? err.message : err));
@@ -6272,6 +6638,7 @@ async function addClass() {{
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to add class.');
     applyClassesState(Array.isArray(data.classes) ? data.classes : prev, prev);
     recomputeTrainEnabled();
+  refreshTrainRec();
     render();
   }} catch (err) {{
     toast(String(err && err.message ? err.message : err));
@@ -6312,6 +6679,7 @@ async function deleteClass(name) {{
       holdRecordSource = '';
     }}
     recomputeTrainEnabled();
+  refreshTrainRec();
     render();
   }} catch (err) {{
     toast(String(err && err.message ? err.message : err));
@@ -6374,6 +6742,7 @@ function updateFlow() {{
   setFlowPath('flowTrainPreview', `M ${{tr}} ${{ty}} C ${{tr + 34}} ${{ty}}, ${{px - 34}} ${{py}}, ${{px}} ${{py}}`);
 }}
 let trainAdvancedOpen = false;
+let recHintsForced = false;
 function manualRoiOrDefault(cfg) {{
   const roi = cfg && Array.isArray(cfg.manual_roi) && cfg.manual_roi.length === 4 ? cfg.manual_roi : [0.00, 0.00, 1.00, 1.00];
   return roi.map((v, idx) => {{
@@ -6381,6 +6750,73 @@ function manualRoiOrDefault(cfg) {{
     if (!isFinite(n)) return idx < 2 ? 0 : 1;
     return Math.max(0, Math.min(1, n));
   }});
+}}
+async function refreshTrainRec() {{
+  try {{
+    const res = await fetch(`${{baseUrl}}/train/recommend`, {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ session: STATE.session, cfg: STATE.train_cfg || {{}} }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (res.ok && data.ok === '1' && data.train_rec) {{
+      STATE.train_rec = data.train_rec;
+      refreshRecHints();
+    }}
+  }} catch (err) {{}}
+}}
+function refreshRecHints() {{
+  const cfg = STATE.train_cfg || {{}};
+  const rec = STATE.train_rec || null;
+  const FIELDS = [
+    ['recBatchHint', 'batch_size', 'batch'],
+    ['recEpochsHint', 'epochs', 'epochs'],
+    ['recLrHint', 'learning_rate', 'lr'],
+    ['recValHint', 'validation_split', 'val_split']
+  ];
+  let anyDiffers = false;
+  for (let i = 0; i < FIELDS.length; i++) {{
+    const id = FIELDS[i][0];
+    const key = FIELDS[i][1];
+    const fmt = FIELDS[i][2];
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (!rec || typeof rec[key] === 'undefined' || rec[key] === null) {{ el.textContent = ''; continue; }}
+    const cur = Number(cfg[key]);
+    const recV = Number(rec[key]);
+    const differs = isFinite(cur) && isFinite(recV) && Math.abs(cur - recV) >= 1e-9;
+    if (differs) anyDiffers = true;
+    const reason = rec.reasons && rec.reasons[fmt] ? String(rec.reasons[fmt]) : '';
+    if (differs) {{
+      el.textContent = `💡 Recommended: ${{recV}} — ${{reason}}`;
+    }} else if (recHintsForced) {{
+      el.textContent = `✓ Recommended: ${{recV}} — ${{reason}}`;
+    }} else {{
+      el.textContent = '';
+    }}
+  }}
+  const imgSizeHint = document.getElementById('imgSizeHint');
+  if (imgSizeHint) {{
+    const cfg0 = STATE.train_cfg || {{}};
+    const side = Number(nullish(cfg0.img_size, 96));
+    const cur = Number(currentSerialFrameSide || 0);
+    imgSizeHint.textContent = (cur === side)
+      ? `Device sketch: IMG_SIZE=${{side}} ✓`
+      : `Device sketch must use IMG_SIZE=${{side}} (capture side now ${{cur}})`;
+  }}
+  const recBtn = document.getElementById('advUseRec');
+  if (recBtn) {{
+    const hasRec = !!(rec && rec.total_samples >= 2);
+    recBtn.style.display = hasRec ? '' : 'none';
+    if (!hasRec) return;
+    if (anyDiffers) {{
+      recBtn.textContent = '💡 Use recommended';
+    }} else if (recHintsForced) {{
+      recBtn.textContent = 'Hide recommendation';
+    }} else {{
+      recBtn.textContent = '💡 Show recommendation';
+    }}
+  }}
 }}
 function syncAdvancedInlineInputs() {{
   const cfg = STATE.train_cfg || {{}};
@@ -6397,6 +6833,7 @@ function syncAdvancedInlineInputs() {{
   set('advConv1Inline', nullish(cfg.conv1_filters, 8));
   set('advConv2Inline', nullish(cfg.conv2_filters, 16));
   set('advDenseInline', nullish(cfg.dense_units, 32));
+  refreshRecHints();
 }}
 function setTrainCfgField(key, rawValue) {{
   const cfg = STATE.train_cfg || {{}};
@@ -6416,6 +6853,7 @@ function setTrainCfgField(key, rawValue) {{
   STATE.train_cfg = next;
   persistTrainCfgStorage();
   renderTrainStatus();
+  refreshRecHints();
 }}
 function setManualRoiField(index, rawValue) {{
   const cfg = Object.assign({{}}, STATE.train_cfg || {{}});
@@ -6439,6 +6877,44 @@ function renderAdvancedPanel() {{
   if (chev) chev.textContent = trainAdvancedOpen ? '▴' : '▾';
   if (trainAdvancedOpen) syncAdvancedInlineInputs();
   updateFlow();
+}}
+async function applyRecommendedTrainCfg() {{
+  const rec = STATE.train_rec || null;
+  if (!rec) return;
+  const cfg = Object.assign({{}}, STATE.train_cfg || {{}});
+  let differs = false;
+  const applyKey = (key) => {{
+    if (!isFinite(Number(rec[key]))) return;
+    const cur = Number(cfg[key]);
+    const recV = Number(rec[key]);
+    if (!isFinite(cur) || Math.abs(cur - recV) >= 1e-9) differs = true;
+    cfg[key] = recV;
+  }};
+  applyKey('batch_size');
+  applyKey('epochs');
+  applyKey('learning_rate');
+  applyKey('validation_split');
+  if (differs) {{
+    STATE.train_cfg = cfg;
+    persistTrainCfgStorage();
+    recHintsForced = false;
+    syncAdvancedInlineInputs();
+    // Persist to backend so the applied values survive page reruns
+    try {{
+      await fetch(`${{baseUrl}}/train/config`, {{
+        method: 'POST',
+        headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify({{ session: STATE.session, cfg: STATE.train_cfg }})
+      }});
+      toast('Recommended settings applied.');
+    }} catch (err) {{
+      toast('Applied in this session (backend save failed).');
+    }}
+  }} else {{
+    recHintsForced = !recHintsForced;
+    refreshRecHints();
+    toast(recHintsForced ? 'Showing recommendations.' : 'Hiding recommendations.');
+  }}
 }}
 function toggleAdvancedInline() {{
   trainAdvancedOpen = !trainAdvancedOpen;
@@ -6635,6 +7111,7 @@ function render() {{
 
   const trainBtn = document.getElementById('trainBtn');
   recomputeTrainEnabled();
+  refreshTrainRec();
   syncTrainUi();
   trainBtn.onclick = () => {{
     if (!STATE.train_enabled) return;
@@ -6676,6 +7153,8 @@ function render() {{
   document.getElementById('advBtn').onclick = toggleAdvancedInline;
   const advReset = document.getElementById('advReset');
   if (advReset) advReset.onclick = () => resetTrainCfg();
+  const advUseRec = document.getElementById('advUseRec');
+  if (advUseRec) advUseRec.onclick = () => applyRecommendedTrainCfg();
   bindAdvancedInlineHandlers();
   renderAdvancedPanel();
   const nav = document.getElementById('goHome');
@@ -6741,6 +7220,7 @@ function render() {{
       }};
       holdBtn.onpointercancel = () => stopHoldCapture();
       holdBtn.onpointerleave = () => stopHoldCapture();
+      holdBtn.onlostpointercapture = () => stopHoldCapture();
     }}
     if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
     if (devSel) {{
@@ -6789,6 +7269,10 @@ function render() {{
     resizeBound = true;
   }}
   window.onpointerup = () => stopHoldCapture();
+  window.onblur = () => stopHoldCapture();
+  document.onvisibilitychange = () => {{
+    if (document.hidden) stopHoldCapture();
+  }};
   toast(STATE.notice);
 }}
 window.addEventListener('load', () => {{
@@ -7089,9 +7573,21 @@ def _render_image_project() -> None:
     if not notice:
         notice = str(st.session_state.get("tm_frontend_notice", "") or "")
     st.session_state.tm_frontend_notice = ""
-    sample_previews = _tm_sample_previews(classes)
+    sample_previews = _tm_sample_previews(classes, limit_per_class=12)
     initial_open_source_class = str(st.session_state.get("tm_open_source_class", "") or "")
     initial_open_source_kind = str(st.session_state.get("tm_open_source_kind", "") or "")
+    # Sync live device settings from the controller — the SPA changes them
+    # via /live/config, and Streamlit session state would otherwise go
+    # stale (e.g. frame side reverting to 96 after a page rerun).
+    _live_cfg = controller.get_config(str(st.session_state.session_id))
+    if _live_cfg is not None:
+        st.session_state.tm_serial_port = str(_live_cfg.serial_port or "")
+        st.session_state.tm_serial_baud = int(_live_cfg.serial_baud)
+        st.session_state.tm_serial_sync = str(_live_cfg.serial_sync or "")
+        st.session_state.tm_serial_frame_side = int(_live_cfg.serial_frame_side)
+        st.session_state.tm_serial_channels = int(_live_cfg.serial_channels)
+        st.session_state.tm_webcam_index = int(_live_cfg.webcam_index)
+
     _render_tm_old_frontend_html(
         port=int(controller.port),
         session_id=str(st.session_state.session_id),
@@ -7543,6 +8039,8 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
             st.session_state.tm_serial_port,
             int(st.session_state.tm_serial_baud),
             str(st.session_state.tm_serial_sync),
+            frame_side=int(st.session_state.tm_serial_frame_side),
+            channels=int(st.session_state.tm_serial_channels),
         )
         if preview is None:
             st.warning("Unable to preview device stream. Check serial port and baudrate.")

@@ -137,6 +137,8 @@ class RecordController:
         self._configs: Dict[str, SessionConfig] = {}
         self._active: Dict[str, Dict[str, Any]] = {}
         self._live: Dict[str, Dict[str, Any]] = {}
+        self._live_threads: Dict[str, threading.Thread] = {}
+        self._record_threads: Dict[str, threading.Thread] = {}
         self._record_conds: Dict[str, threading.Condition] = {}
         self._train: Dict[str, Dict[str, Any]] = {}
         self._train_conds: Dict[str, threading.Condition] = {}
@@ -196,6 +198,10 @@ class RecordController:
             self._configs[session_id] = updated
             return updated
 
+    def get_config(self, session_id: str) -> Optional["SessionConfig"]:
+        with self._lock:
+            return self._configs.get(session_id)
+
     def status(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             return dict(self._active.get(session_id, {}))
@@ -226,7 +232,7 @@ class RecordController:
             reader = SerialFrameReader(port=port, baud=int(baud), sync_header=sync_header, frame_side=int(frame_side), channels=int(channels))
             reader.open()
             try:
-                raw = reader.read_frame(timeout_s=2.0)
+                raw = reader.read_frame()  # auto-scaled timeout (frame_size × baud)
             finally:
                 reader.close()
             side = int(frame_side)
@@ -317,6 +323,7 @@ class RecordController:
         if path == "/class_state":
             session_id = (qs.get("session") or [""])[0]
             class_name = (qs.get("class") or [""])[0]
+            limit_raw = (qs.get("limit") or [""])[0]
             if not session_id or not class_name:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -324,7 +331,43 @@ class RecordController:
             if cfg is None:
                 _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                 return
-            _send_json(req, self._class_state_payload(cfg.dataset_root, class_name), cors=True)
+            try:
+                limit = int(limit_raw) if str(limit_raw).strip() else 12
+            except Exception:
+                limit = 12
+            _send_json(req, self._class_state_payload(cfg.dataset_root, class_name, limit=None if limit <= 0 else limit), cors=True)
+            return
+        if path == "/class_filenames":
+            session_id = (qs.get("session") or [""])[0]
+            class_name = (qs.get("class") or [""])[0]
+            if not session_id or not class_name:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            _send_json(req, self._class_filenames_payload(cfg.dataset_root, class_name), cors=True)
+            return
+        if path == "/sample_image":
+            session_id = (qs.get("session") or [""])[0]
+            class_name = (qs.get("class") or [""])[0]
+            filename = (qs.get("filename") or [""])[0]
+            if not session_id or not class_name or not filename:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            try:
+                png = self._sample_image_png(cfg.dataset_root, class_name, filename)
+            except FileNotFoundError:
+                _send_json(req, {"ok": "0", "error": "sample not found"}, status=404, cors=True)
+                return
+            # Sample filenames are immutable in practice, so allow browser-side
+            # caching to avoid re-downloading the same thumbnail on every re-render.
+            _send_png(req, png, cors=True, cache_control="private, max-age=86400, immutable")
             return
         if path == "/preview":
             session_id = (qs.get("session") or [""])[0]
@@ -458,8 +501,18 @@ class RecordController:
             session_id = (qs.get("session") or [""])[0]
             source = (qs.get("source") or [""])[0]
             preprocess_mode = (qs.get("preprocess") or [""])[0]
-            bg_dark_thresh = int((qs.get("bg_dark") or ["0"])[0] or 0)
-            bg_lum_thresh = int((qs.get("bg_lum") or ["100"])[0] or 100)
+            bg_dark_raw = (qs.get("bg_dark") or [""])[0]
+            bg_lum_raw  = (qs.get("bg_lum") or [""])[0]
+            ood_sign_min_raw = (qs.get("ood_sign_min") or [""])[0]
+            ood_sign_max_raw = (qs.get("ood_sign_max") or [""])[0]
+            ood_max_prob_raw = (qs.get("ood_max_prob") or [""])[0]
+            ood_entropy_max_raw = (qs.get("ood_entropy_max") or [""])[0]
+            bg_dark_thresh = int(bg_dark_raw) if str(bg_dark_raw).strip() != "" else None
+            bg_lum_thresh  = int(bg_lum_raw)  if str(bg_lum_raw).strip()  != "" else None
+            ood_sign_pct_min = float(ood_sign_min_raw) if str(ood_sign_min_raw).strip() != "" else None
+            ood_sign_pct_max = float(ood_sign_max_raw) if str(ood_sign_max_raw).strip() != "" else None
+            ood_max_prob_min = float(ood_max_prob_raw) if str(ood_max_prob_raw).strip() != "" else None
+            ood_entropy_ratio_max = float(ood_entropy_max_raw) if str(ood_entropy_max_raw).strip() != "" else None
             if not session_id or source not in {"webcam", "device"}:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -470,8 +523,17 @@ class RecordController:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
                     return
-                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode,
-                                              bg_dark_thresh=bg_dark_thresh, bg_lum_thresh=bg_lum_thresh)
+                pred = self._preview_predict(
+                    session_id=session_id,
+                    png=png,
+                    preprocess_mode=preprocess_mode,
+                    bg_dark_thresh=bg_dark_thresh,
+                    bg_lum_thresh=bg_lum_thresh,
+                    ood_sign_pct_min=ood_sign_pct_min,
+                    ood_sign_pct_max=ood_sign_pct_max,
+                    ood_max_prob_min=ood_max_prob_min,
+                    ood_entropy_ratio_max=ood_entropy_ratio_max,
+                )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -483,6 +545,11 @@ class RecordController:
                     "probs": pred.get("probs") or [],
                     "top_label": str(pred.get("top_label") or ""),
                     "top_prob": float(pred.get("top_prob") or 0.0),
+                    "ood": bool(pred.get("ood")),
+                    "ood_reason": str(pred.get("ood_reason") or ""),
+                    "sign_pct": float(pred.get("sign_pct") or 0.0),
+                    "max_prob": float(pred.get("max_prob") or 0.0),
+                    "entropy_ratio": float(pred.get("entropy_ratio") or 0.0),
                     "image_b64": base64.b64encode(png).decode("ascii"),
                     "processed_image_b64": str(pred.get("processed_image_b64") or ""),
                     "crop_image_b64": str(pred.get("crop_image_b64") or ""),
@@ -603,7 +670,7 @@ class RecordController:
         if path == "/live/close":
             session_id = (qs.get("session") or [""])[0]
             source = (qs.get("source") or [""])[0]
-            self._stop_live(session_id=session_id, source=source if source else None)
+            self._stop_live(session_id=session_id, source=source if source else None, wait=True, timeout_s=2.0)
             _send_json(req, {"ok": "1"}, cors=True)
             return
         _send_json(req, {"ok": "0", "error": "not found"}, status=404)
@@ -622,6 +689,8 @@ class RecordController:
         if path not in {
             "/upload",
             "/train/start",
+            "/train/config",
+            "/train/recommend",
             "/export/run",
             "/dataset/export",
             "/project/save",
@@ -656,6 +725,30 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1"}, cors=True)
+            return
+        if path == "/train/config":
+            session_id = str(payload.get("session") or "").strip()
+            cfg = payload.get("cfg") or {}
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                self._save_train_cfg(session_id=session_id, cfg=cfg)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1"}, cors=True)
+            return
+        if path == "/train/recommend":
+            session_id = str(payload.get("session") or "").strip()
+            cfg = payload.get("cfg") or {}
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                _send_json(req, {"ok": "1", **self._train_recommend(session_id=session_id, cfg=cfg)}, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
             return
         if path == "/preprocess/preview":
             session_id = str(payload.get("session") or "").strip()
@@ -706,15 +799,34 @@ class RecordController:
             session_id = str(payload.get("session") or "").strip()
             image_b64 = str(payload.get("image_b64") or "").strip()
             preprocess_mode = str(payload.get("preprocess") or "").strip()
-            bg_dark_thresh = int(payload.get("bg_dark") or 0)
-            bg_lum_thresh = int(payload.get("bg_lum") or 100)
+            bg_dark_thresh = payload.get("bg_dark")
+            bg_lum_thresh = payload.get("bg_lum")
+            ood_sign_pct_min = payload.get("ood_sign_min")
+            ood_sign_pct_max = payload.get("ood_sign_max")
+            ood_max_prob_min = payload.get("ood_max_prob")
+            ood_entropy_ratio_max = payload.get("ood_entropy_max")
+            bg_dark_thresh = int(bg_dark_thresh) if bg_dark_thresh is not None and str(bg_dark_thresh).strip() != "" else None
+            bg_lum_thresh  = int(bg_lum_thresh)  if bg_lum_thresh  is not None and str(bg_lum_thresh).strip()  != "" else None
+            ood_sign_pct_min = float(ood_sign_pct_min) if ood_sign_pct_min is not None and str(ood_sign_pct_min).strip() != "" else None
+            ood_sign_pct_max = float(ood_sign_pct_max) if ood_sign_pct_max is not None and str(ood_sign_pct_max).strip() != "" else None
+            ood_max_prob_min = float(ood_max_prob_min) if ood_max_prob_min is not None and str(ood_max_prob_min).strip() != "" else None
+            ood_entropy_ratio_max = float(ood_entropy_ratio_max) if ood_entropy_ratio_max is not None and str(ood_entropy_ratio_max).strip() != "" else None
             if not session_id or not image_b64:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
             try:
                 png = base64.b64decode(image_b64, validate=True)
-                pred = self._preview_predict(session_id=session_id, png=png, preprocess_mode=preprocess_mode,
-                                              bg_dark_thresh=bg_dark_thresh, bg_lum_thresh=bg_lum_thresh)
+                pred = self._preview_predict(
+                    session_id=session_id,
+                    png=png,
+                    preprocess_mode=preprocess_mode,
+                    bg_dark_thresh=bg_dark_thresh,
+                    bg_lum_thresh=bg_lum_thresh,
+                    ood_sign_pct_min=ood_sign_pct_min,
+                    ood_sign_pct_max=ood_sign_pct_max,
+                    ood_max_prob_min=ood_max_prob_min,
+                    ood_entropy_ratio_max=ood_entropy_ratio_max,
+                )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -1077,6 +1189,11 @@ class RecordController:
         return updated
 
     def _start_record(self, session_id: str, source: str, class_name: str) -> None:
+        self._stop_record(session_id=session_id, wait=True, timeout_s=2.5)
+        # Stop the live preview but DON'T block the HTTP request here — the
+        # record worker waits for the live reader to release the port before
+        # opening its own (otherwise /start hangs and hold-release feels late).
+        self._stop_live(session_id=session_id, source=source)
         with self._lock:
             cfg = self._configs.get(session_id)
             if cfg is None:
@@ -1101,22 +1218,34 @@ class RecordController:
             if session_id not in self._record_conds:
                 self._record_conds[session_id] = threading.Condition()
 
+        with self._lock:
+            live_thread = self._live_threads.get(self._live_key(session_id, source))
         t = threading.Thread(
             target=self._record_worker,
-            args=(session_id, source, class_name),
+            args=(session_id, source, class_name, live_thread),
             daemon=True,
         )
+        with self._lock:
+            self._record_threads[session_id] = t
         t.start()
 
-    def _stop_record(self, session_id: str) -> None:
+    def _stop_record(self, session_id: str, *, wait: bool = True, timeout_s: float = 2.5) -> None:
+        thread: Optional[threading.Thread] = None
         with self._lock:
             cur = self._active.get(session_id)
             if cur:
                 cur["recording"] = "0"
+            thread = self._record_threads.get(session_id)
         cond = self._record_conds.get(session_id)
         if cond is not None:
             with cond:
                 cond.notify_all()
+        if wait and thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout_s)))
+        with self._lock:
+            current = self._record_threads.get(session_id)
+            if current is thread and (thread is None or not thread.is_alive()):
+                self._record_threads.pop(session_id, None)
 
     def _wait_next_record(self, session_id: str, since: int, timeout_s: float = 10.0) -> Dict[str, Any]:
         cond = self._record_conds.get(session_id)
@@ -1664,8 +1793,8 @@ class RecordController:
         config = normalize_class_preprocess(sample_config if sample_config is not None else class_config)
         mode = str(config.get("mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
         # User-adjustable thresholds from class-level config (shared across samples)
-        bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 0)) if class_cfg else 20
-        bg_lum_thresh  = int(class_cfg.get("bg_lum_thresh", 100)) if class_cfg else 180
+        bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 0)) if class_cfg else 0
+        bg_lum_thresh  = int(class_cfg.get("bg_lum_thresh", 100)) if class_cfg else 100
         print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} (G-channel)")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
@@ -1678,15 +1807,20 @@ class RecordController:
                                          bg_lum_thresh=bg_lum_thresh,
                                          return_crop_box=True,
                                          fast_mode=fast_mode)
-        if isinstance(result, tuple) and len(result) >= 4:
+        if isinstance(result, tuple) and len(result) >= 5:
+            arr, crop_norm, masked_preview, crop_preview, full_preview = result
+        elif isinstance(result, tuple) and len(result) >= 4:
             arr, crop_norm, masked_preview, crop_preview = result
+            full_preview = None
         elif isinstance(result, tuple) and len(result) == 3:
             arr, crop_norm, masked_preview = result
             crop_preview = None
+            full_preview = None
         else:
             arr, crop_norm = result
             masked_preview = None
             crop_preview = None
+            full_preview = None
         out = np.asarray(np.clip(arr * 255.0, 0.0, 255.0), dtype=np.uint8)
         if out.ndim == 3:
             out = out[:, :, 0]
@@ -1728,18 +1862,20 @@ class RecordController:
             dst_dir.mkdir(parents=True, exist_ok=True)
             if not src_dir.exists():
                 continue
-            config = class_preprocess.get(class_name, {"mode": global_preprocess_mode})
+            raw_cfg = class_preprocess.get(class_name, {"mode": global_preprocess_mode})
+            config = dict(raw_cfg) if isinstance(raw_cfg, dict) else {"mode": global_preprocess_mode}
             class_sample_map = sample_preprocess.get(class_name, {})
             processed_count = 0
             for src in _list_class_image_files(src_dir):
                 try:
                     png = src.read_bytes()
+                    sample_cfg = class_sample_map.get(src.name)
                     out_png = self._preprocess_image_png(
                         png,
                         label_name=class_name,
                         class_config=config,
                         fast_mode=True,
-                        sample_config=class_sample_map.get(src.name),
+                        sample_config=sample_cfg,
                         out_size=int(out_size),
                     )
                     (dst_dir / f"{src.stem}.png").write_bytes(out_png)
@@ -1900,7 +2036,18 @@ class RecordController:
             self._preview[session_id] = cur
         return cur
 
-    def _preview_predict(self, session_id: str, png: bytes, preprocess_mode: str = "", bg_dark_thresh: int = 0, bg_lum_thresh: int = 100) -> Dict[str, Any]:
+    def _preview_predict(
+        self,
+        session_id: str,
+        png: bytes,
+        preprocess_mode: str = "",
+        bg_dark_thresh: Optional[int] = None,
+        bg_lum_thresh: Optional[int] = None,
+        ood_sign_pct_min: Optional[float] = None,
+        ood_sign_pct_max: Optional[float] = None,
+        ood_max_prob_min: Optional[float] = None,
+        ood_entropy_ratio_max: Optional[float] = None,
+    ) -> Dict[str, Any]:
         model = self._preview_load_model(session_id=session_id)
         interpreter = model["interpreter"]
         input_details = model["input_details"]
@@ -1924,8 +2071,8 @@ class RecordController:
             preprocess_mode=preprocess_mode,
             manual_roi=manual_roi,
             class_preprocess=class_preprocess,
-            bg_dark_thresh=int(bg_dark_thresh),
-            bg_lum_thresh=int(bg_lum_thresh),
+            bg_dark_thresh=(int(bg_dark_thresh) if bg_dark_thresh is not None else None),
+            bg_lum_thresh=(int(bg_lum_thresh)  if bg_lum_thresh  is not None else None),
         )
         qscale = 0.0
         qzp = 0
@@ -1950,6 +2097,16 @@ class RecordController:
             out_idx = int(output_details.get("index"))
             in_idx = int(input_details.get("index"))
             with self._preview_model_lock(session_id):
+                import numpy as _np
+                try:
+                    _xi = _np.asarray(x).reshape(-1)
+                    _cs = int(_np.abs(_xi).sum()) % 100000
+                    print(f"[DBG host input] min={int(_xi.min())} max={int(_xi.max())} mean={float(_xi.mean()):.1f} checksum={_cs} first8={[int(v) for v in _xi[:8].tolist()]}")
+                    _xi2 = _np.asarray(x).reshape(-1)[:9216]
+                    if _xi2.size == 9216:
+                        _np.save('/tmp/host_input.npy', _xi2.astype(_np.int8))
+                except Exception:
+                    pass
                 interpreter.set_tensor(in_idx, x)
                 interpreter.invoke()
                 out = interpreter.get_tensor(out_idx)
@@ -1974,12 +2131,93 @@ class RecordController:
                 scores = expv / float(np.sum(expv) + 1e-12)
             return np.clip(scores, 0.0, 1.0)
 
-        variant_probs = {name: _invoke_one(arr) for name, arr in prepared.items()}
-        probs = next(iter(variant_probs.values()))
+        variant_probs: Dict[str, np.ndarray] = {}
+        mask_stats: Any = prepared.get("mask_stats") if isinstance(prepared, dict) else None
+        for name, arr in prepared.items():
+            if name == "mask_stats":
+                continue
+            if not isinstance(arr, np.ndarray):
+                continue
+            try:
+                variant_probs[name] = _invoke_one(arr)
+            except Exception:
+                pass
+        probs = None
+        for k in ("default", "crop_preview", "masked_preview", "full_preview"):
+            if k in variant_probs:
+                probs = variant_probs[k]
+                break
+        if probs is None and variant_probs:
+            probs = next(iter(variant_probs.values()))
+        if probs is None:
+            raise RuntimeError("no usable processed arrays for inference")
 
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
         top_i = int(np.argmax(probs)) if probs.size else 0
+        max_prob = float(probs[top_i]) if probs.size else 0.0
+        eps = 1e-12
+        entropy = float(-np.sum(probs * np.log(np.clip(probs, eps, 1.0)))) if probs.size else 0.0
+        n_classes = max(1, int(probs.shape[0]))
+        max_entropy = float(np.log(n_classes)) if n_classes > 1 else 1.0
+        entropy_ratio = float(entropy / max_entropy) if max_entropy > 0 else 1.0
+
+        sign_pct = 0.0
+        if isinstance(mask_stats, dict):
+            try:
+                sign_pct = float(mask_stats.get("sign_pct") or 0.0)
+            except Exception:
+                sign_pct = 0.0
+
+        NO_SIGN_LABEL = "No Sign"
+
+        # Layer 1: sign-mask presence prior (strongest signal, no inference cost)
+        # Expected for our training signs: ~2% to ~40% of the (full-frame) pixels
+        # have G in [dark, lum).  If too few → empty scene / overexposed; if too
+        # many → all-black / all-shadow frame.  Both are clearly "no sign".
+        SIGN_PCT_MIN = float(ood_sign_pct_min if ood_sign_pct_min is not None else 0.3)
+        SIGN_PCT_MAX = float(ood_sign_pct_max if ood_sign_pct_max is not None else 70.0)
+
+        # Layer 2: softmax calibration.  OOD inputs often get "confidently wrong"
+        # by softmax, but combining MAX_PROB threshold with ENTROPY (how "spread
+        # out" the votes are) works reliably on small CNNs.  If the net is
+        # confident (high prob) AND the decision is sharp (low entropy) → we
+        # trust it; otherwise suppress to "No Sign".
+        MAX_PROB_MIN = float(ood_max_prob_min if ood_max_prob_min is not None else 0.60)
+        ENTROPY_RATIO_MAX = float(ood_entropy_ratio_max if ood_entropy_ratio_max is not None else 0.70)  # 1.0 = uniform / perfectly uncertain
+        SIGN_PCT_MIN = max(0.0, min(100.0, SIGN_PCT_MIN))
+        SIGN_PCT_MAX = max(0.0, min(100.0, SIGN_PCT_MAX))
+        MAX_PROB_MIN = max(0.0, min(1.0, MAX_PROB_MIN))
+        ENTROPY_RATIO_MAX = max(0.0, min(1.0, ENTROPY_RATIO_MAX))
+        if SIGN_PCT_MIN > SIGN_PCT_MAX:
+            SIGN_PCT_MIN, SIGN_PCT_MAX = SIGN_PCT_MAX, SIGN_PCT_MIN
+
+        is_ood = False
+        suppress_reason = ""
+        if sign_pct < SIGN_PCT_MIN or sign_pct > SIGN_PCT_MAX:
+            is_ood = True
+            suppress_reason = f"mask sign_pct={sign_pct:.1f}% outside [{SIGN_PCT_MIN:.1f},{SIGN_PCT_MAX:.1f}]"
+        elif max_prob < MAX_PROB_MIN:
+            is_ood = True
+            suppress_reason = f"max_prob={max_prob:.3f} < {MAX_PROB_MIN:.2f}"
+        elif entropy_ratio > ENTROPY_RATIO_MAX:
+            is_ood = True
+            suppress_reason = f"entropy_ratio={entropy_ratio:.3f} > {ENTROPY_RATIO_MAX:.2f}"
+
+        if is_ood:
+            # Suppress: declare "No Sign", keep raw probs for debug, push top_prob
+            # down to the highest "unconfident" level so downstream decisions don't fire.
+            top_label_out = NO_SIGN_LABEL
+            top_prob_out = float(0.0)
+            labels_out = list(labels) + [NO_SIGN_LABEL]
+            probs_out = [float(0.0)] * (len(labels) + 1)
+            probs_out[-1] = 1.0
+        else:
+            top_label_out = str(labels[top_i]) if 0 <= top_i < len(labels) else ""
+            top_prob_out = float(max_prob)
+            labels_out = list(labels)
+            probs_out = [float(x) for x in probs.tolist()]
+
         # Build a displayable preview of the after-processed model input
         processed_variant = next(iter(prepared.keys()), "")
         # Use masked_preview (thresholded G-channel) for the ROI toggle so the
@@ -2004,14 +2242,19 @@ class RecordController:
         processed_img = _model_input_array_to_preview_image(processed_arr)
         processed_png = _to_png_bytes(processed_img)
         return {
-            "labels": labels,
-            "probs": [float(x) for x in probs.tolist()],
-            "top_label": str(labels[top_i]) if 0 <= top_i < len(labels) else "",
-            "top_prob": float(probs[top_i]) if probs.size else 0.0,
+            "labels": labels_out,
+            "probs": probs_out,
+            "top_label": top_label_out,
+            "top_prob": float(top_prob_out),
             "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
             "crop_image_b64": base64.b64encode(crop_png).decode("ascii") if crop_png else "",
             "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
             "processed_variant": str(processed_variant or ""),
+            "ood": bool(is_ood),
+            "ood_reason": str(suppress_reason or ""),
+            "sign_pct": float(sign_pct),
+            "max_prob": float(max_prob),
+            "entropy_ratio": float(entropy_ratio),
         }
 
     def _start_train(self, session_id: str, cfg: Any) -> None:
@@ -2036,6 +2279,69 @@ class RecordController:
 
         t = threading.Thread(target=self._train_worker, args=(session_id, dict(cfg or {})), daemon=True)
         t.start()
+
+    def _save_train_cfg(self, session_id: str, cfg: Any) -> None:
+        """Persist training config (e.g. applied recommendations) so the next
+        page render picks it up. Merges with the existing train_config.json."""
+        with self._lock:
+            sess_cfg = self._configs.get(session_id)
+        if sess_cfg is None:
+            raise RuntimeError("missing config")
+        run_dir = Path(sess_cfg.dataset_root).parent / "runs" / "latest"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = run_dir / "train_config.json"
+        existing: Dict[str, Any] = {}
+        if cfg_path.exists():
+            try:
+                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except Exception:
+                existing = {}
+        merged = dict(existing)
+        if isinstance(cfg, dict):
+            for k, v in cfg.items():
+                if v is not None:
+                    merged[str(k)] = v
+        cfg_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _train_recommend(self, session_id: str, cfg: Any) -> Dict[str, Any]:
+        """Recompute dataset-aware recommendations from the CURRENT sample count."""
+        from trainer import TrainConfig, recommend_train_params
+
+        with self._lock:
+            sess_cfg = self._configs.get(session_id)
+        if sess_cfg is None:
+            raise RuntimeError("missing config")
+        dataset_root = Path(sess_cfg.dataset_root)
+        total = 0
+        if dataset_root.exists():
+            for class_dir in dataset_root.iterdir():
+                if class_dir.is_dir():
+                    total += len(_list_class_image_files(class_dir))
+        src = cfg if isinstance(cfg, dict) else {}
+        train_cfg = TrainConfig(
+            batch_size=int(src.get("batch_size") or 16),
+            epochs=int(src.get("epochs") or 10),
+            validation_split=float(src.get("validation_split") or 0.2),
+            learning_rate=float(src.get("learning_rate") or 0.001),
+        )
+        rec_kwargs, reasons = recommend_train_params(total, train_cfg)
+        return {
+            "train_rec": {
+                "total_samples": int(total),
+                "batch_size": int(rec_kwargs["batch_size"]),
+                "epochs": int(rec_kwargs["epochs"]),
+                "learning_rate": float(rec_kwargs["learning_rate"]),
+                "validation_split": float(rec_kwargs["validation_split"]),
+                "reasons": {
+                    "batch": str(reasons[0]),
+                    "epochs": str(reasons[1]),
+                    "lr": str(reasons[2]),
+                    "val_split": str(reasons[3]),
+                },
+            }
+        }
 
     def _train_status_payload(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
@@ -2083,6 +2389,17 @@ class RecordController:
         try:
             from trainer import TrainConfig, TrainResult, new_run_dir, train_and_export
 
+            project_classes = self._classes_load(sess_cfg.dataset_root)
+            project_class_preprocess = self._class_preprocess_load(sess_cfg.dataset_root)
+            project_sample_preprocess = self._sample_preprocess_load(sess_cfg.dataset_root)
+
+            raw_class_preprocess = cfg_dict.get("class_preprocess")
+            if raw_class_preprocess is None or (isinstance(raw_class_preprocess, dict) and not raw_class_preprocess):
+                raw_class_preprocess = project_class_preprocess
+            raw_sample_preprocess = cfg_dict.get("sample_preprocess")
+            if raw_sample_preprocess is None or (isinstance(raw_sample_preprocess, dict) and not raw_sample_preprocess):
+                raw_sample_preprocess = project_sample_preprocess
+
             cfg = TrainConfig(
                 img_size=int(cfg_dict.get("img_size") or 96),
                 color_mode="grayscale",
@@ -2098,9 +2415,12 @@ class RecordController:
                 representative_samples=int(cfg_dict.get("representative_samples") or 200),
                 preprocess_mode=str(cfg_dict.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
                 manual_roi=normalize_manual_roi(cfg_dict.get("manual_roi")),
-                class_preprocess=normalize_class_preprocess_map(cfg_dict.get("class_preprocess")),
-                sample_preprocess=normalize_sample_preprocess_map(cfg_dict.get("sample_preprocess")),
+                class_preprocess=normalize_class_preprocess_map(raw_class_preprocess),
+                sample_preprocess=normalize_sample_preprocess_map(raw_sample_preprocess),
                 use_preprocessed_dataset=True,
+                class_names_order=list(project_classes) if project_classes else None,
+                min_steps_per_epoch=int(cfg_dict.get("min_steps_per_epoch") or 4),
+                auto_adjust_batch_and_epochs=bool(cfg_dict.get("auto_adjust_batch_and_epochs", True)),
             )
 
             workspace_root = sess_cfg.dataset_root.parent
@@ -2119,7 +2439,30 @@ class RecordController:
             def on_progress(p: float, msg: str) -> None:
                 self._train_set(session_id, progress=p, message=msg)
 
-            self._train_set(session_id, progress=0.03, message="Starting training...")
+            start_msg = "Starting training..."
+            if not bool(cfg.auto_adjust_batch_and_epochs):
+                # Advisory recommendation when the trainer-side auto-adjust is
+                # disabled: surface recommended batch/epochs in the progress
+                # message. Purely informational — guarded so it can never
+                # break the training flow.
+                try:
+                    from trainer import recommend_train_params
+
+                    total_samples = sum(
+                        len(_list_class_image_files(sess_cfg.dataset_root / sanitize_class_name(c)))
+                        for c in project_classes
+                    )
+                    rec_kwargs, _reasons = recommend_train_params(total_samples, cfg)
+                    rec_batch = int(rec_kwargs.get("batch_size") or cfg.batch_size)
+                    rec_epochs = int(rec_kwargs.get("epochs") or cfg.epochs)
+                    if rec_batch != int(cfg.batch_size) or rec_epochs != int(cfg.epochs):
+                        start_msg = (
+                            f"Starting training... (recommended: batch {rec_batch}, "
+                            f"epochs {rec_epochs} for {total_samples} samples)"
+                        )
+                except Exception:
+                    pass
+            self._train_set(session_id, progress=0.03, message=start_msg)
             result: TrainResult = train_and_export(
                 dataset_dir=processed_dataset_dir,
                 run_dir=run_dir,
@@ -2148,12 +2491,16 @@ class RecordController:
         except Exception as e:
             self._train_set(session_id, error=str(e), done=True)
 
-    def _record_worker(self, session_id: str, source: str, class_name: str) -> None:
-        cfg = self._configs.get(session_id)
-        if cfg is None:
-            return
-        interval = 1.0 / max(1.0, float(cfg.fps))
+    def _record_worker(self, session_id: str, source: str, class_name: str, live_thread: Optional[threading.Thread] = None) -> None:
+        # Wait (bounded) for the live reader to release the serial port so the
+        # record reader doesn't fight it — but never block the hold-release.
         try:
+            if live_thread is not None and live_thread.is_alive():
+                live_thread.join(timeout=2.0)
+            cfg = self._configs.get(session_id)
+            if cfg is None:
+                return
+            interval = 1.0 / max(1.0, float(cfg.fps))
             if source == "device":
                 self._record_serial(session_id, cfg, class_name, interval)
                 return
@@ -2173,17 +2520,48 @@ class RecordController:
             if cond is not None:
                 with cond:
                     cond.notify_all()
+        finally:
+            with self._lock:
+                cur = self._active.get(session_id)
+                if cur is not None:
+                    cur["recording"] = "0"
+                thread = self._record_threads.get(session_id)
+                if thread is threading.current_thread():
+                    self._record_threads.pop(session_id, None)
+            cond = self._record_conds.get(session_id)
+            if cond is not None:
+                with cond:
+                    cond.notify_all()
 
     def _live_key(self, session_id: str, source: str) -> str:
         return f"{session_id}:{source}"
 
-    def _stop_live(self, session_id: str, source: Optional[str] = None) -> None:
+    def _stop_live(self, session_id: str, source: Optional[str] = None, *, wait: bool = False, timeout_s: float = 2.0) -> None:
+        threads: List[threading.Thread] = []
         with self._lock:
             keys = [self._live_key(session_id, source)] if source else [k for k in self._live if k.startswith(f"{session_id}:")]
             for key in keys:
                 state = self._live.get(key)
                 if state is not None:
                     state["running"] = False
+                thread = self._live_threads.get(key)
+                if thread is not None:
+                    threads.append(thread)
+        if wait:
+            deadline = time.time() + max(0.0, float(timeout_s))
+            for thread in threads:
+                if thread is threading.current_thread():
+                    continue
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                if thread.is_alive():
+                    thread.join(timeout=remaining)
+        with self._lock:
+            for thread in threads:
+                for key, current in list(self._live_threads.items()):
+                    if current is thread and not thread.is_alive():
+                        self._live_threads.pop(key, None)
 
     def _ensure_live(self, session_id: str, source: str) -> None:
         cfg = self._configs.get(session_id)
@@ -2219,6 +2597,8 @@ class RecordController:
             }
             self._live[key] = state
         t = threading.Thread(target=self._live_worker, args=(key, session_id, source), daemon=True)
+        with self._lock:
+            self._live_threads[key] = t
         t.start()
 
     def _get_live_preview(self, session_id: str, source: str) -> Optional[bytes]:
@@ -2280,25 +2660,54 @@ class RecordController:
             return
         try:
             if source == "webcam":
-                self._live_webcam(key, cfg)
+                self._live_webcam(key, session_id, cfg)
             elif source == "device":
-                self._live_serial(key, cfg)
+                self._live_serial(key, session_id, cfg)
         finally:
             with self._lock:
                 state = self._live.get(key)
                 if state is not None:
                     state["running"] = False
                     state["last_touch"] = time.time()
+                thread = self._live_threads.get(key)
+                if thread is threading.current_thread():
+                    self._live_threads.pop(key, None)
 
-    def _live_serial(self, key: str, cfg: SessionConfig) -> None:
+    def _live_serial(self, key: str, session_id: str, cfg: SessionConfig) -> None:
         if not cfg.serial_port:
             self._live_set(key, error="Serial port is not configured.")
             return
         last_error = ""
+        reader = None
+        reader_sig = None
         while self._live_running(key):
-            reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
+            # Re-read the live config every iteration so setting changes
+            # (baud / frame side / port / channels) take effect immediately.
+            fresh = self._configs.get(session_id)
+            if fresh is not None:
+                cfg = fresh
+            sig = (str(cfg.serial_port), int(cfg.serial_baud), str(cfg.serial_sync), int(cfg.serial_frame_side), int(cfg.serial_channels))
+            if reader is None or sig != reader_sig:
+                # Reuse ONE reader across iterations — per-frame open/close churn
+                # becomes dominant at 160×160 and after record contention.
+                if reader is not None:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+                reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
+                reader_sig = sig
+                try:
+                    reader.open()
+                except Exception as e:
+                    msg = str(e) or "Unable to open serial device."
+                    self._live_set(key, error=msg[:220])
+                    last_error = msg
+                    reader = None
+                    reader_sig = None
+                    time.sleep(0.25)
+                    continue
             try:
-                reader.open()
                 # Scale timeout with frame size (10 bits/byte at 8N1, ×2.5 margin, floor 1.5 s).
                 frame_bytes = int(cfg.serial_frame_side) * int(cfg.serial_frame_side) * int(cfg.serial_channels)
                 baud = int(cfg.serial_baud) if int(cfg.serial_baud) > 0 else 921600
@@ -2316,13 +2725,13 @@ class RecordController:
                     self._live_set(key, error=msg)
                     last_error = msg
                 time.sleep(0.06)
-            finally:
-                try:
-                    reader.close()
-                except Exception:
-                    pass
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
 
-    def _live_webcam(self, key: str, cfg: SessionConfig) -> None:
+    def _live_webcam(self, key: str, session_id: str, cfg: SessionConfig) -> None:
         permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
         if not permission.allowed:
             self._live_set(key, error=permission.message or "Camera permission denied.")
@@ -2382,7 +2791,7 @@ class RecordController:
                 reader = SerialFrameReader(port=cfg.serial_port, baud=int(cfg.serial_baud), sync_header=cfg.serial_sync, frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
                 reader.open()
                 try:
-                    raw = reader.read_frame(timeout_s=2.0)
+                    raw = reader.read_frame()  # auto-scaled timeout (frame_size × baud)
                 finally:
                     reader.close()
                 return _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
@@ -2421,7 +2830,7 @@ class RecordController:
         try:
             reader.open()
             while self._is_recording(session_id):
-                raw = reader.read_frame(timeout_s=2.0)
+                raw = reader.read_frame()  # auto-scaled timeout (frame_size × 12 bits/byte / baud)
                 png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
                 p = _save_png(cfg.dataset_root, class_name, png)
                 with self._lock:
@@ -2506,6 +2915,30 @@ class RecordController:
             "previews": previews,
         }
 
+    def _class_filenames_payload(self, dataset_root: Path, class_name: str) -> Dict[str, Any]:
+        class_dir = dataset_root / sanitize_class_name(class_name)
+        files = _list_class_image_files(class_dir) if class_dir.exists() else []
+        return {
+            "ok": "1",
+            "class": class_name,
+            "count": str(len(files)),
+            "filenames": [str(p.name) for p in files],
+        }
+
+    def _sample_image_png(self, dataset_root: Path, class_name: str, filename: str) -> bytes:
+        class_dir = dataset_root / sanitize_class_name(class_name)
+        path = (class_dir / str(filename)).resolve()
+        if not str(path).startswith(str(class_dir.resolve())) or not path.exists() or not path.is_file():
+            raise FileNotFoundError(filename)
+        img = Image.open(path)
+        try:
+            return _to_png_bytes(img.convert("RGB" if img.mode not in {"L", "RGB"} else img.mode))
+        finally:
+            try:
+                img.close()
+            except Exception:
+                pass
+
     def _dataset_labels_load(self, dataset_dir: Path) -> List[str]:
         labels_json = dataset_dir / "labels.json"
         if labels_json.exists():
@@ -2546,11 +2979,11 @@ def _send_json(req: BaseHTTPRequestHandler, obj: Dict[str, Any], status: int = 2
     req.wfile.write(data)
 
 
-def _send_png(req: BaseHTTPRequestHandler, data: bytes, cors: bool = False) -> None:
+def _send_png(req: BaseHTTPRequestHandler, data: bytes, cors: bool = False, cache_control: str = "no-store, max-age=0") -> None:
     req.send_response(200)
     if cors:
         req.send_header("Access-Control-Allow-Origin", "*")
-    req.send_header("Cache-Control", "no-store, max-age=0")
+    req.send_header("Cache-Control", str(cache_control or "no-store, max-age=0"))
     req.send_header("Content-Type", "image/png")
     req.send_header("Content-Length", str(len(data)))
     req.end_headers()
@@ -2634,14 +3067,15 @@ def _raw96_to_png(
     return _to_png_bytes(img)
 
 
-def _raw96_preview_png(raw: bytes) -> bytes:
+def _raw96_preview_png(raw: bytes, frame_side: int = 96) -> bytes:
+    side = int(frame_side)
     n = len(raw)
-    if n == 96 * 96 * 3:
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96, 3))
-        img = Image.fromarray(arr, mode="RGB").resize((288, 288), Image.NEAREST)
+    if n == side * side * 3:
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side, 3))
+        img = Image.fromarray(arr, mode="RGB").resize((side * 3, side * 3), Image.NEAREST)
     else:
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape((96, 96))
-        img = Image.fromarray(arr, mode="L").resize((288, 288), Image.NEAREST)
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((side, side))
+        img = Image.fromarray(arr, mode="L").resize((side * 3, side * 3), Image.NEAREST)
     return _to_png_bytes(img)
 
 

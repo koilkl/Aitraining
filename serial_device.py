@@ -58,14 +58,29 @@ class SerialFrameReader:
             finally:
                 self._ser = None
 
-    def read_frame(self, timeout_s: float = 3.0) -> bytes:
+    def read_frame(self, timeout_s: Optional[float] = None) -> bytes:
         if self._ser is None:
             raise RuntimeError("Serial not opened")
+        # Auto-scale: one frame takes frame_size * ~12 bits/byte at baud.
+        # 96×96×3 @ 921600 ≈ 0.3s, 160×160×3 @ 115200 ≈ 6.7s — the old
+        # fixed 2-3s timeout was too short for large frames at low baud.
+        min_timeout = max(3.0, float(self._frame_size) * 12.0 / max(1, self._baud))
+        if timeout_s is None:
+            timeout_s = min_timeout
+        else:
+            # Floor caller-supplied timeouts: a fixed 2s timeout cannot
+            # transfer a 160×160 frame at 115200, so it would time out
+            # every frame and recording would stall.
+            timeout_s = max(float(timeout_s), min_timeout)
         start = time.time()
         header = self._header
         header_len = len(header)
         while time.time() - start < timeout_s:
-            chunk = self._ser.read(4096)
+            # Scale the read size with frame size so large frames (160×160×3
+            # = 76800 bytes) are consumed in few reads instead of many
+            # 4096-byte chunks; reads return as soon as bytes are available.
+            read_size = min(max(4096, self._frame_size), 65536)
+            chunk = self._ser.read(read_size)
             if chunk:
                 self._buf.extend(chunk)
                 # Keep at least 4× frame_size so we never discard a pending frame.
@@ -96,7 +111,6 @@ class SerialFrameReader:
                         continue
                 frame = bytes(self._buf[after:need])
                 del self._buf[:need]
-                print(f"[Serial] frame ok: {len(frame)} bytes (expecting {self._frame_size}), buf_remaining={len(self._buf)}")
                 return frame
         raise TimeoutError(f"Timeout waiting for frame header (need {self._frame_size} bytes, buf has {len(self._buf)}, waited {timeout_s:.1f}s)")
 
@@ -138,7 +152,7 @@ def read_frame_png_from_serial(
     port: str,
     baud: int,
     sync_header: bytes | str | None = None,
-    timeout_s: float = 3.0,
+    timeout_s: Optional[float] = None,
     frame_side: int = DEFAULT_FRAME_SIDE,
     channels: int = 1,
 ) -> bytes:

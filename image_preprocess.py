@@ -662,7 +662,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                bg_dark_thresh: int = 0,
                                bg_lum_thresh: int = 100,
                                return_crop_box: bool = False,
-                               fast_mode: bool = False):
+                               fast_mode: bool = False,
+                               return_stats: bool = False):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -756,13 +757,25 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     out = _contrast_stretch_u8(out_arr)
     result = out.astype(np.float32) / 255.0
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
+    stats = {
+        "sign_pct": float(sign_pct),
+        "too_dark_pct": float(too_dark_pct),
+        "too_bright_pct": float(too_bright_pct),
+        "bg_dark_thresh": int(bg_dark_thresh),
+        "bg_lum_thresh": int(bg_lum_thresh),
+    } if return_stats else None
+    # Backward compatible return structure: stats appended ONLY when return_stats=True.
+    # When both return_crop_box + return_stats → stats is always LAST element.
     if return_crop_box:
         if masked_preview is not None and crop_preview is not None and full_preview is not None:
-            return image, crop_norm, masked_preview, crop_preview, full_preview
-        return image, crop_norm
+            t = (image, crop_norm, masked_preview, crop_preview, full_preview)
+            return (*t, stats) if return_stats else t
+        t = (image, crop_norm)
+        return (*t, stats) if return_stats else t
     if masked_preview is not None and crop_preview is not None and full_preview is not None:
-        return image, masked_preview, crop_preview, full_preview
-    return image
+        t = (image, masked_preview, crop_preview, full_preview)
+        return (*t, stats) if return_stats else t
+    return (image, stats) if return_stats else image
 
 
 def preprocess_manual_roi_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale", manual_roi: Any = None) -> np.ndarray:
@@ -800,8 +813,14 @@ def preprocess_for_label(
         resolved_roi = resolved.get("manual_roi")
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], resolved_roi)
-    # Always B-G; mode only controls how the ROI is chosen
-    return preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi)
+    class_cfg = normalize_class_preprocess(class_preprocess.get(str(label_name or ""))) if class_preprocess else {}
+    fast_mode = bool(mode == PREPROCESS_MODE_MANUAL_ROI)
+    return preprocess_blue_diff_array(
+        arr, out_size=out_size, color_mode=color_mode, roi=roi,
+        bg_dark_thresh=int(class_cfg.get("bg_dark_thresh", 0)),
+        bg_lum_thresh=int(class_cfg.get("bg_lum_thresh", 100)),
+        fast_mode=fast_mode,
+    )
 
 
 def prepare_inference_inputs(
@@ -811,24 +830,51 @@ def prepare_inference_inputs(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
-    bg_dark_thresh: int = 0,
-    bg_lum_thresh: int = 100,
-) -> Dict[str, np.ndarray]:
+    bg_dark_thresh: Optional[int] = None,
+    bg_lum_thresh: Optional[int] = None,
+) -> Dict[str, Any]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
     if mode == PREPROCESS_MODE_MANUAL_ROI:
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], manual_roi)
+    use_dark = int(bg_dark_thresh) if bg_dark_thresh is not None else 0
+    use_lum  = int(bg_lum_thresh)  if bg_lum_thresh  is not None else 100
+    use_dark = max(0, min(255, use_dark))
+    use_lum = max(1, min(255, use_lum))
+    fast_mode = bool(mode == PREPROCESS_MODE_MANUAL_ROI)
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
-                                        bg_dark_thresh=int(bg_dark_thresh),
-                                        bg_lum_thresh=int(bg_lum_thresh))
-    if isinstance(result, tuple) and len(result) >= 4:
-        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2], "full_preview": result[3]}
-    if isinstance(result, tuple) and len(result) >= 3:
-        return {"default": result[0], "masked_preview": result[1], "crop_preview": result[2]}
-    if isinstance(result, tuple) and len(result) == 2:
-        return {"default": result[0], "masked_preview": result[1]}
-    return {"default": result}
+                                        bg_dark_thresh=use_dark,
+                                        bg_lum_thresh=use_lum,
+                                        return_crop_box=True,
+                                        fast_mode=fast_mode,
+                                        return_stats=True)
+    out: Dict[str, Any] = {"default": None, "mask_stats": None}
+    stats: Any = None
+    if isinstance(result, tuple):
+        image = result[0]
+        out["default"] = image
+        if len(result) >= 6 and isinstance(result[-1], dict):
+            stats = result[-1]
+            out["mask_stats"] = stats
+            result = result[:-1]
+        if len(result) >= 5 and result[2] is not None:
+            out["masked_preview"] = result[2]
+        if len(result) >= 5 and result[3] is not None:
+            out["crop_preview"] = result[3]
+        if len(result) >= 5 and result[4] is not None:
+            out["full_preview"] = result[4]
+        if len(result) >= 2 and len(result) < 4:
+            out["masked_preview"] = image
+    else:
+        out["default"] = result
+    if "masked_preview" not in out:
+        out["masked_preview"] = out.get("default")
+    if "crop_preview" not in out:
+        out["crop_preview"] = out.get("default")
+    if "full_preview" not in out:
+        out["full_preview"] = out.get("default")
+    return out
 
 
 def focus_and_enhance_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscale") -> np.ndarray:
