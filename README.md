@@ -227,6 +227,16 @@ If no sign is found: center crop fallback (50%, 50% position, 40% side).
 
 The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.  Note this search tends to crop ~13 px right of the sign centroid and is for *visual* ROI feedback only — live predictions use the center-60 % model-input path above.
 
+**Device gray direct-feed** — when the live source is the device and the serial
+stream is 1-channel grayscale (`channels=1`), Preview feeds the streamed frame
+straight into the interpreter instead of re-running the host transform.  The
+stream already IS the device model input (the firmware applied center-60 % crop
+→ BT.601 → bilinear → contrast stretch → int8 gray−128 — TFLite.ino
+`kCaptureGray` / `kInferGray` modes), so double-processing would hide what the
+device really fed the model.  In this mode the OOD sign_pct gate is computed on
+the streamed (already-cropped) frame, so the host and device gates are close
+but not identical.
+
 ## Export Behavior
 
 - Export directory selection:
@@ -252,6 +262,12 @@ The **processed preview** (ROI toggle / class edit page) shows step 2: white = f
 - Export naming:
   - `Export name` controls the `.tflite` base name and the generated `*_model_data.*` file names
   - `Array name` controls the C/C++ tensor array symbol used inside generated source files
+- Deployed-model pin:
+  - Every export also copies the train meta to `<workspace>/deployed.json`
+  - Preview then keeps validating that exact exported model — later training
+    runs do NOT advance the Preview model until the next export, so Preview
+    always matches the model actually flashed to the device
+  - Workspaces that never exported keep using the latest trained model
 
 ## Dataset Folder Structure
 
