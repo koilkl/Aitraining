@@ -146,6 +146,13 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
    | **Epochs** | 20 | Training iterations |
    | **Learning Rate** | 0.0016 | Optimization step size |
 
+   Click **💡 Use recommended** in **Advanced** — the app computes
+   dataset-aware suggestions for Batch Size / Epochs / Learning Rate /
+   Validation Split from your current sample count and shows a one-line
+   reason next to each field (small datasets → lower learning rate and a
+   batch sized so each epoch keeps ≥ 4 steps, ~800 total updates).
+   Recommendations are advisory only — you can override any value.
+
 3. Training takes 10-60 seconds.  A progress bar shows status.
 
 > **Showcase**: The **Image Size** parameter is independent of capture resolution.  You can capture at 160×160 but train at 96×96 (or vice versa).
@@ -191,6 +198,7 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
 | 6 | Image Size as training hyperparameter | Training → Advanced |
 | 7 | Full project save/restore (.tmproj) | Top-left menu |
 | 8 | MCU-ready export (.tflite + C sources) | Export button |
+| 9 | Training hyperparameter recommendations (💡 Use recommended) | Training → Advanced |
 
 ---
 
