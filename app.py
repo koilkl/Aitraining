@@ -7675,6 +7675,13 @@ def _render_image_project() -> None:
                 (export_dir / "model.h").write_text(hdr, encoding="utf-8")
                 (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
                 (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
+                # Stamp the deployed pointer so Preview keeps validating the
+                # exported (device) model instead of silently following later
+                # training runs.
+                try:
+                    shutil.copyfile(_tm_train_latest_path(), _tm_dataset_dir().parent / "deployed.json")
+                except Exception:
+                    pass
                 notice = f"Exported to: {export_dir}"
             st.rerun()
 

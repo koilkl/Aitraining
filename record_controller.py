@@ -567,6 +567,7 @@ class RecordController:
                     ood_sign_pct_max=ood_sign_pct_max,
                     ood_max_prob_min=ood_max_prob_min,
                     ood_entropy_ratio_max=ood_entropy_ratio_max,
+                    source=source,
                 )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
@@ -1430,6 +1431,16 @@ class RecordController:
         )
         (export_dir / "model_settings.h").write_text(model_settings_h, encoding="utf-8")
         (export_dir / "model_settings.cpp").write_text(model_settings_cpp, encoding="utf-8")
+        # Stamp the deployed pointer: Preview must keep validating the SAME
+        # model that was just exported to the device.  Without this, every
+        # later training run silently advances the Preview model while the
+        # device keeps running the exported one — train/export/device drift.
+        try:
+            latest_meta = self._train_result_path(cfg.dataset_root)
+            if latest_meta.exists():
+                shutil.copyfile(latest_meta, cfg.dataset_root.parent / "deployed.json")
+        except Exception:
+            pass
         return export_dir
 
     def _dataset_export(self, session_id: str, export_dir: Path) -> Path:
@@ -2012,9 +2023,16 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         latest = self._train_result_path(cfg.dataset_root)
-        if not latest.exists():
+        # Preview must validate the DEPLOYED model (the one exported to the
+        # device) when a deployed.json stamp exists — otherwise every new
+        # training run silently advances the Preview model while the device
+        # keeps running the exported one.  Fall back to tm_train_latest for
+        # workspaces that never exported.
+        deployed = cfg.dataset_root.parent / "deployed.json"
+        src = deployed if deployed.exists() else latest
+        if not src.exists():
             raise RuntimeError("missing trained model")
-        meta = json.loads(latest.read_text(encoding="utf-8"))
+        meta = json.loads(src.read_text(encoding="utf-8"))
         tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser()
         if not tflite_path.exists():
             raise RuntimeError("missing .tflite file")
@@ -2058,6 +2076,7 @@ class RecordController:
         ood_sign_pct_max: Optional[float] = None,
         ood_max_prob_min: Optional[float] = None,
         ood_entropy_ratio_max: Optional[float] = None,
+        source: str = "",
     ) -> Dict[str, Any]:
         model = self._preview_load_model(session_id=session_id)
         interpreter = model["interpreter"]
@@ -2075,16 +2094,59 @@ class RecordController:
         _, h, w, c = shape
         # Always RGB — B-G difference is computed inside the pipeline.
         img = Image.open(_bytes_io(png)).convert("RGB")
-        prepared = prepare_inference_inputs(
-            np.asarray(img),
-            out_size=int(w),
-            color_mode="grayscale" if int(c) == 1 else "rgb",
-            preprocess_mode=preprocess_mode,
-            manual_roi=manual_roi,
-            class_preprocess=class_preprocess,
-            bg_dark_thresh=(int(bg_dark_thresh) if bg_dark_thresh is not None else None),
-            bg_lum_thresh=(int(bg_lum_thresh)  if bg_lum_thresh  is not None else None),
-        )
+        # ── Device grayscale streams ARE the device's tensor input ──────
+        # TFLite.ino kCaptureGray / kInferGray stream `input->data.int8 + 128`
+        # (already center-cropped + stretched).  Re-running
+        # prepare_inference_inputs on that frame double-processes it and the
+        # host never sees what the device actually fed the model.  When the
+        # source is the device and the stream is 1-channel, feed the gray
+        # frame straight to the interpreter (int8 = gray − 128) so Preview
+        # and device evaluate the EXACT same tensor.
+        direct_feed = False
+        if source == "device":
+            with self._lock:
+                cfg = self._configs.get(session_id)
+            if cfg is not None and int(cfg.serial_channels or 1) == 1:
+                direct_feed = True
+        if direct_feed:
+            gray = np.asarray(img.convert("L"), dtype=np.uint8)
+            if gray.shape != (int(h), int(w)):
+                gray = np.asarray(
+                    Image.fromarray(gray).resize((int(w), int(h)), Image.BILINEAR),
+                    dtype=np.uint8,
+                )
+            gray_f = gray.astype(np.float32) / 255.0
+            arr = np.expand_dims(gray_f, axis=-1)
+            d = int(bg_dark_thresh) if bg_dark_thresh is not None else 0
+            l = int(bg_lum_thresh) if bg_lum_thresh is not None else 100
+            is_sign = (gray > d) & (gray < l)
+            # NOTE: sign_pct is computed on the streamed (cropped) frame; the
+            # device computes it on the full pre-crop frame, so the two L1
+            # gates are close but not identical.
+            prepared = {
+                "default": arr,
+                "masked_preview": arr,
+                "crop_preview": arr,
+                "full_preview": arr,
+                "mask_stats": {
+                    "sign_pct": float(is_sign.mean() * 100.0),
+                    "too_dark_pct": float((gray <= d).mean() * 100.0),
+                    "too_bright_pct": float((gray >= l).mean() * 100.0),
+                    "bg_dark_thresh": d,
+                    "bg_lum_thresh": l,
+                },
+            }
+        else:
+            prepared = prepare_inference_inputs(
+                np.asarray(img),
+                out_size=int(w),
+                color_mode="grayscale" if int(c) == 1 else "rgb",
+                preprocess_mode=preprocess_mode,
+                manual_roi=manual_roi,
+                class_preprocess=class_preprocess,
+                bg_dark_thresh=(int(bg_dark_thresh) if bg_dark_thresh is not None else None),
+                bg_lum_thresh=(int(bg_lum_thresh)  if bg_lum_thresh  is not None else None),
+            )
         qscale = 0.0
         qzp = 0
         q = input_details.get("quantization")
