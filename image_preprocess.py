@@ -108,6 +108,76 @@ def _contrast_stretch_u8(arr: np.ndarray) -> np.ndarray:
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+# ── Device-exact model-input transform ──────────────────────────────────
+# Bit-for-bit mirror of TFLite/image_provider.cpp crop_resize_bilinear() +
+# contrast_stretch_int8() (the pipeline GetImage runs in GRAY mode and in
+# BG mode with BG_ENABLE_BLOB_SEARCH=0).  float32 arithmetic, operator
+# order, the PIL-style center mapping ((x+0.5)*side/out - 0.5, including
+# the device's negative border weights) and the BT.601 round-half-up are
+# all replicated so host and device produce IDENTICAL int8 inputs from the
+# same RGB frame.  Keep this in sync with crop_resize_bilinear().
+_DEV_LUM_R = np.float32(30.0)
+_DEV_LUM_G = np.float32(59.0)
+_DEV_LUM_B = np.float32(11.0)
+_DEV_LUM_DIV = np.float32(100.0)
+_DEV_LUM_HALF = np.float32(0.5)
+
+
+def _device_crop_resize_bilinear_lum(crop_rgb: np.ndarray, out_size: int) -> np.ndarray:
+    """Device crop_resize_bilinear() mirror: RGB crop → bilinear → BT.601 lum.
+
+    crop_rgb: uint8 (ch, cw, 3) crop.  Returns uint8 (out_size, out_size)
+    luminance BEFORE contrast stretch (caller applies _contrast_stretch_u8).
+    For a square crop this is bit-identical to the firmware.
+    """
+    ch, cw = crop_rgb.shape[:2]
+    if ch < 1 or cw < 1:
+        raise ValueError("empty crop")
+    f32 = np.float32
+    ys = np.arange(out_size, dtype=np.float32)
+    xs = np.arange(out_size, dtype=np.float32)
+    # fy = (y + 0.5) * cside / OUT - 0.5  — float32, same rounding as C++
+    fy = (((ys + f32(0.5)) * f32(ch)) / f32(out_size)) - f32(0.5)
+    fx = (((xs + f32(0.5)) * f32(cw)) / f32(out_size)) - f32(0.5)
+    y0 = np.floor(fy).astype(np.int32)
+    x0 = np.floor(fx).astype(np.int32)
+    np.maximum(y0, 0, out=y0)
+    np.maximum(x0, 0, out=x0)
+    y1 = np.minimum(y0 + 1, ch - 1)
+    x1 = np.minimum(x0 + 1, cw - 1)
+    # NOTE: computed AFTER clamping, like the C++ — border rows keep the
+    # (possibly negative) fractional weight the firmware uses.
+    wy = (fy - y0.astype(np.float32)).astype(np.float32)
+    wx = (fx - x0.astype(np.float32)).astype(np.float32)
+    omx = f32(1.0) - wx   # (out_size,)
+    omy = f32(1.0) - wy   # (out_size,)
+    # 2D bilinear weights: outer product of x/y terms (cross product, not
+    # elementwise pairing).
+    omx2 = omx[None, :]
+    omy2 = omy[:, None]
+    wx2 = wx[None, :]
+    wy2 = wy[:, None]
+    w00 = (omx2 * omy2).astype(np.float32)
+    w10 = (wx2 * omy2).astype(np.float32)
+    w01 = (omx2 * wy2).astype(np.float32)
+    w11 = (wx2 * wy2).astype(np.float32)
+
+    i00 = crop_rgb[y0[:, None], x0[None, :]].astype(np.float32)
+    i10 = crop_rgb[y0[:, None], x1[None, :]].astype(np.float32)
+    i01 = crop_rgb[y1[:, None], x0[None, :]].astype(np.float32)
+    i11 = crop_rgb[y1[:, None], x1[None, :]].astype(np.float32)
+
+    # Left-assoc float32 sums, term order identical to the C++.
+    r = ((w00 * i00[:, :, 0] + w10 * i10[:, :, 0]) + w01 * i01[:, :, 0]) + w11 * i11[:, :, 0]
+    g = ((w00 * i00[:, :, 1] + w10 * i10[:, :, 1]) + w01 * i01[:, :, 1]) + w11 * i11[:, :, 1]
+    b = ((w00 * i00[:, :, 2] + w10 * i10[:, :, 2]) + w01 * i01[:, :, 2]) + w11 * i11[:, :, 2]
+
+    # lum = (r*30 + g*59 + b*11) / 100 + 0.5  → float32 → truncate (=floor
+    # for positive values), same as the firmware's (uint8_t) cast.
+    lum = ((((r * _DEV_LUM_R + g * _DEV_LUM_G) + b * _DEV_LUM_B) / _DEV_LUM_DIV) + _DEV_LUM_HALF)
+    return np.clip(np.floor(lum), 0.0, 255.0).astype(np.uint8)
+
+
 def _center_bbox(h: int, w: int, frac: float = 0.60) -> Tuple[int, int, int, int]:
     """Simple center crop → sign is always in the middle of the frame."""
     side = int(min(h, w) * frac)
@@ -561,7 +631,8 @@ def preprocess_array(arr: np.ndarray, out_size: int, color_mode: str = "grayscal
     else:
         # Use G channel for shadow search — best SNR in green-biased lighting.
         # Dark sign absorbs green → low G.  White background reflects → high G.
-        x1, y1, x2, y2 = _focus_bbox(g.astype(np.uint8))
+        g_chan = src[:, :, 1] if src.shape[-1] >= 3 else src[:, :, 0]
+        x1, y1, x2, y2 = _focus_bbox(g_chan.astype(np.uint8))
         preserve_aspect = False
     crop = src[y1:y2, x1:x2]
     if crop.size == 0:
@@ -687,7 +758,6 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     sign_pct = is_sign.mean() * 100
     too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
     too_bright_pct = (gray >= bg_lum_thresh).mean() * 100
-    print(f"[MASK] sign={sign_pct:.1f}% dark={too_dark_pct:.1f}% bright={too_bright_pct:.1f}%  (G>{bg_dark_thresh} & G<{bg_lum_thresh})")
     gray[~is_sign] = 255
 
     # Crop: shadow search (live preview) or center crop (batch/cache)
@@ -734,26 +804,32 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Crop-only preview: cropped RGB → luminance, resized, NO threshold/stretch.
     crop_preview = None
     try:
-        cp_rgb = src[y1:y2, x1:x2, :3].astype(np.float32)
-        cp_gray = (cp_rgb[:,:,0] * 0.299 + cp_rgb[:,:,1] * 0.587 + cp_rgb[:,:,2] * 0.114).astype(np.uint8)
+        cp_rgb = src[y1:y2, x1:x2, :3].astype(np.int32)
+        cp_gray = ((cp_rgb[:,:,0] * 30 + cp_rgb[:,:,1] * 59 + cp_rgb[:,:,2] * 11 + 50) // 100).astype(np.uint8)
         cp_img = Image.fromarray(cp_gray, mode="L")
         cp_img = cp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
         crop_preview = np.expand_dims(np.asarray(cp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
     except Exception:
         pass
 
-    # Crop from original RGB, then convert to BT.601 luminance.
-    # ROI search used the masked G-channel for detection, but the final
-    # pixels come from the unmodified source — much sharper.
-    crop_rgb = src[y1:y2, x1:x2, :3].astype(np.float32)
-    gray = (crop_rgb[:,:,0] * 0.299 + crop_rgb[:,:,1] * 0.587 + crop_rgb[:,:,2] * 0.114).astype(np.uint8)
-
-    # Resize
-    img = Image.fromarray(gray, mode="L")
-    img = img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+    # ── Model-input pixels: device-exact transform ──────────────────────
+    # Mirrors TFLite/image_provider.cpp crop_resize_bilinear() +
+    # contrast_stretch_int8() bit-for-bit: bilinear-resample the RGB crop
+    # (float32, PIL-style center mapping, incl. the firmware's negative
+    # border weights) → BT.601 luminance (30/59/11, round half up) →
+    # contrast stretch (span ≥ 24) → int8 gray−128.
+    # The old host-only path (0.299/0.587/0.114 truncation, then PIL
+    # BILINEAR on uint8) differed from the device by up to ±2 LSB on ~52 %
+    # of pixels; the device-exact version is bit-identical for the same
+    # frame.  For grayscale inputs (replicated channels) the BT.601 step is
+    # an exact identity, so the IMX219_Grayscale_Serial training captures
+    # also stop losing 1 LSB to float-sum truncation.
+    crop_rgb = src[y1:y2, x1:x2, :3]
+    if crop_rgb.shape[0] < 1 or crop_rgb.shape[1] < 1:
+        crop_rgb = src[:, :, :3]
+    out_arr = _device_crop_resize_bilinear_lum(np.asarray(crop_rgb, dtype=np.uint8), int(out_size))
 
     # Contrast stretch — matches C++ side exactly
-    out_arr = np.asarray(img, dtype=np.uint8)
     out = _contrast_stretch_u8(out_arr)
     result = out.astype(np.float32) / 255.0
     image = np.expand_dims(result, axis=-1)  # (96,96) → (96,96,1)
@@ -814,13 +890,22 @@ def preprocess_for_label(
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], resolved_roi)
     class_cfg = normalize_class_preprocess(class_preprocess.get(str(label_name or ""))) if class_preprocess else {}
-    fast_mode = bool(mode == PREPROCESS_MODE_MANUAL_ROI)
-    return preprocess_blue_diff_array(
+    # Training must use the SAME transform the model is deployed with: the
+    # center 60 % crop (fast_mode) with the device-exact bilinear/BT.601
+    # math.  roi (manual ROI mode) still takes precedence when set inside
+    # preprocess_blue_diff_array; otherwise _focus_bbox (a preview aid that
+    # crops ~13 px off-center) must never reach the training pixels.
+    fast_mode = True
+    result = preprocess_blue_diff_array(
         arr, out_size=out_size, color_mode=color_mode, roi=roi,
         bg_dark_thresh=int(class_cfg.get("bg_dark_thresh", 0)),
         bg_lum_thresh=int(class_cfg.get("bg_lum_thresh", 100)),
         fast_mode=fast_mode,
     )
+    # preprocess_blue_diff_array returns a preview tuple when the optional
+    # previews are computed; training callers (trainer.py numpy_function)
+    # need the single model-input array.
+    return result[0] if isinstance(result, tuple) else result
 
 
 def prepare_inference_inputs(

@@ -10,3 +10,6 @@ AItraining.code-workspace
 model.h
 model.cpp
 g_model.tflite
+AI training.docx
+*.docx
+*.pdf

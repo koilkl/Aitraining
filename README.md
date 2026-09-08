@@ -145,6 +145,13 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
    | **Epochs** | 20 | Training iterations |
    | **Learning Rate** | 0.0016 | Optimization step size |
 
+   Click **💡 Use recommended** in **Advanced** — the app computes
+   dataset-aware suggestions for Batch Size / Epochs / Learning Rate /
+   Validation Split from your current sample count and shows a one-line
+   reason next to each field (small datasets → lower learning rate and a
+   batch sized so each epoch keeps ≥ 4 steps, ~800 total updates).
+   Recommendations are advisory only — you can override any value.
+
 3. Training takes 10-60 seconds.  A progress bar shows status.
 
 > **Showcase**: The **Image Size** parameter is independent of capture resolution.  You can capture at 160×160 but train at 96×96 (or vice versa).
@@ -190,6 +197,7 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
 | 6 | Image Size as training hyperparameter | Training → Advanced |
 | 7 | Full project save/restore (.tmproj) | Top-left menu |
 | 8 | MCU-ready export (.tflite + C sources) | Export button |
+| 9 | Training hyperparameter recommendations (💡 Use recommended) | Training → Advanced |
 
 ---
 
@@ -201,15 +209,19 @@ Two different crops exist — know which one the model actually receives:
 transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
 
 1. Center **60 % square crop** of the frame (`_center_bbox(frac=0.60)`)
-2. BT.601 luminance of the cropped original RGB (no WB, no masking)
-3. Bilinear resize to the training image size (default 96×96)
+2. Bilinear resize of the cropped RGB to the training image size (default
+   96×96) — float32, PIL-style center mapping, a bit-for-bit mirror of the
+   firmware's `crop_resize_bilinear()`
+3. BT.601 luminance (30/59/11, round half up) of the resampled pixels (no
+   WB, no masking)
 4. Contrast stretch (only if pixel span ≥ 24)
 5. int8 = gray − 128
 
 The dark/lum mask never touches these pixels; it only drives the previews and
 the sign_pct OOD statistic. This transform is identical to the device firmware
 (`BG_ENABLE_BLOB_SEARCH=0` + `BG_FALLBACK_CENTER_FRAC=0.60`) — verified
-86/86 training frames → 0 label flips (2026-08-26).
+bit-identical on random frames against a C transliteration of the firmware,
+and 86/86 training frames → 0 label flips (2026-08-26).
 
 **Shadow-search preview** (`_focus_bbox`, used by the ROI overlay, the class
 edit page's auto mode, and the masked previews) — a G-channel dark-object +
@@ -225,6 +237,16 @@ edge detector:
 If no sign is found: center crop fallback (50%, 50% position, 40% side).
 
 The **processed preview** (ROI toggle / class edit page) shows step 2: white = filtered out, dark = candidate pixels.  Tune Dark/Lum thresholds in the slider bar to adjust what the detector considers a sign.  Note this search tends to crop ~13 px right of the sign centroid and is for *visual* ROI feedback only — live predictions use the center-60 % model-input path above.
+
+**Device gray direct-feed** — when the live source is the device and the serial
+stream is 1-channel grayscale (`channels=1`), Preview feeds the streamed frame
+straight into the interpreter instead of re-running the host transform.  The
+stream already IS the device model input (the firmware applied center-60 % crop
+→ BT.601 → bilinear → contrast stretch → int8 gray−128 — TFLite.ino
+`kCaptureGray` / `kInferGray` modes), so double-processing would hide what the
+device really fed the model.  In this mode the OOD sign_pct gate is computed on
+the streamed (already-cropped) frame, so the host and device gates are close
+but not identical.
 
 ## Export Behavior
 
@@ -250,6 +272,12 @@ The **processed preview** (ROI toggle / class edit page) shows step 2: white = f
 - Export naming:
   - `Export name` controls the `.tflite` base name and the generated `*_model_data.*` file names
   - `Array name` controls the C/C++ tensor array symbol used inside generated source files
+- Deployed-model pin:
+  - Every export also copies the train meta to `<workspace>/deployed.json`
+  - Preview then keeps validating that exact exported model — later training
+    runs do NOT advance the Preview model until the next export, so Preview
+    always matches the model actually flashed to the device
+  - Workspaces that never exported keep using the latest trained model
 
 ## Dataset Folder Structure
 
