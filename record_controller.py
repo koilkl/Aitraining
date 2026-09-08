@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import shutil
 import socket
 import threading
@@ -1817,7 +1818,6 @@ class RecordController:
         # User-adjustable thresholds from class-level config (shared across samples)
         bg_dark_thresh = int(class_cfg.get("bg_dark_thresh", 0)) if class_cfg else 0
         bg_lum_thresh  = int(class_cfg.get("bg_lum_thresh", 100)) if class_cfg else 100
-        print(f"[PREPROCESS] dark={bg_dark_thresh} lum={bg_lum_thresh} (G-channel)")
         # Always B-G; keep RGB colour information.
         img = Image.open(_bytes_io(png)).convert("RGB")
         roi = None
@@ -2155,7 +2155,7 @@ class RecordController:
             qzp = int(q[1] or 0)
         dtype = input_details.get("dtype")
 
-        def _invoke_one(arr: np.ndarray) -> np.ndarray:
+        def _invoke_one(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             batch = np.expand_dims(arr, axis=0)
             if dtype is not None and dtype != np.float32 and qscale > 0:
                 qarr = np.round(batch / qscale + qzp)
@@ -2170,16 +2170,6 @@ class RecordController:
             out_idx = int(output_details.get("index"))
             in_idx = int(input_details.get("index"))
             with self._preview_model_lock(session_id):
-                import numpy as _np
-                try:
-                    _xi = _np.asarray(x).reshape(-1)
-                    _cs = int(_np.abs(_xi).sum()) % 100000
-                    print(f"[DBG host input] min={int(_xi.min())} max={int(_xi.max())} mean={float(_xi.mean()):.1f} checksum={_cs} first8={[int(v) for v in _xi[:8].tolist()]}")
-                    _xi2 = _np.asarray(x).reshape(-1)[:9216]
-                    if _xi2.size == 9216:
-                        _np.save('/tmp/host_input.npy', _xi2.astype(_np.int8))
-                except Exception:
-                    pass
                 interpreter.set_tensor(in_idx, x)
                 interpreter.invoke()
                 out = interpreter.get_tensor(out_idx)
@@ -2191,6 +2181,18 @@ class RecordController:
                 oscale = float(oq[0] or 0.0)
                 ozp = int(oq[1] or 0)
             odtype = output_details.get("dtype")
+            # Raw device-mirror scores: TFLite.ino ood_is_in_distribution /
+            # pick_label_and_confidence use (int8 + 128) / (uint8) / (f*255),
+            # clamped to [0,255], and derive max_prob + entropy from THOSE
+            # values — NOT from dequantised softmax probabilities.  Return
+            # the raw tensor so the OOD L2/L3 gates below fire on exactly
+            # the same numbers the firmware computes.
+            if odtype == np.int8:
+                raw_out = np.clip(out.astype(np.int32) + 128, 0, 255).astype(np.int32)
+            elif odtype == np.uint8:
+                raw_out = out.astype(np.int32)
+            else:
+                raw_out = np.clip((out.astype(np.float32) * 255.0).astype(np.int32), 0, 255)
             if odtype is not None and odtype != np.float32 and oscale > 0:
                 scores = (out.astype(np.float32) - float(ozp)) * float(oscale)
             else:
@@ -2202,9 +2204,9 @@ class RecordController:
                 scores = scores - float(np.max(scores))
                 expv = np.exp(scores)
                 scores = expv / float(np.sum(expv) + 1e-12)
-            return np.clip(scores, 0.0, 1.0)
+            return np.clip(scores, 0.0, 1.0), raw_out
 
-        variant_probs: Dict[str, np.ndarray] = {}
+        variant_probs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         mask_stats: Any = prepared.get("mask_stats") if isinstance(prepared, dict) else None
         for name, arr in prepared.items():
             if name == "mask_stats":
@@ -2216,12 +2218,13 @@ class RecordController:
             except Exception:
                 pass
         probs = None
+        raw_out = None
         for k in ("default", "crop_preview", "masked_preview", "full_preview"):
             if k in variant_probs:
-                probs = variant_probs[k]
+                probs, raw_out = variant_probs[k]
                 break
         if probs is None and variant_probs:
-            probs = next(iter(variant_probs.values()))
+            probs, raw_out = next(iter(variant_probs.values()))
         if probs is None:
             raise RuntimeError("no usable processed arrays for inference")
 
@@ -2229,11 +2232,32 @@ class RecordController:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
         top_i = int(np.argmax(probs)) if probs.size else 0
         max_prob = float(probs[top_i]) if probs.size else 0.0
-        eps = 1e-12
-        entropy = float(-np.sum(probs * np.log(np.clip(probs, eps, 1.0)))) if probs.size else 0.0
         n_classes = max(1, int(probs.shape[0]))
-        max_entropy = float(np.log(n_classes)) if n_classes > 1 else 1.0
-        entropy_ratio = float(entropy / max_entropy) if max_entropy > 0 else 1.0
+        # Device-exact OOD L2/L3 values (TFLite.ino ood_is_in_distribution):
+        # max_prob = raw_best / Σraw, entropy over p = raw/Σraw with natural
+        # log, ratio normalised by ln(N) and clamped to 1.0.  float32
+        # arithmetic and op order replicate the firmware so host and device
+        # reject the same frames.
+        raw_total = int(np.sum(raw_out)) if raw_out is not None else 0
+        if raw_total <= 0:
+            raw_total = 1
+        ood_max_prob = float(np.float32(np.max(raw_out)) / np.float32(raw_total)) if raw_out is not None else 0.0
+        ood_entropy = np.float32(0.0)
+        if raw_out is not None:
+            f_total = np.float32(raw_total)
+            for v in raw_out:
+                p = np.float32(v) / f_total
+                if float(p) <= 1e-6:
+                    continue
+                ood_entropy = ood_entropy - p * np.float32(math.log(float(p)))
+        ood_entropy = float(ood_entropy)
+        max_entropy = float(math.log(n_classes)) if n_classes > 1 else 1.0
+        ood_entropy_ratio = float(np.float32(ood_entropy) / np.float32(max_entropy)) if max_entropy > 0 else 1.0
+        ood_entropy_ratio = min(1.0, ood_entropy_ratio)
+        # Keep the softmax-side values for the OOD gate names below (they are
+        # what the UI labels refer to), but gate on the device-math values.
+        max_prob = ood_max_prob
+        entropy_ratio = ood_entropy_ratio
 
         sign_pct = 0.0
         if isinstance(mask_stats, dict):

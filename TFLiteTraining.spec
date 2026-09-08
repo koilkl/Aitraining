@@ -84,6 +84,10 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# App icon: AIoScouts.icns (macOS .app bundle) / AIoScouts.ico (Windows .exe),
+# generated from the repo-root AIoScouts.png.
+app_icon = 'AIoScouts.icns' if sys.platform == 'darwin' else 'AIoScouts.ico'
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -100,6 +104,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon,
 )
 exe_console = EXE(
     pyz,
@@ -117,6 +122,7 @@ exe_console = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon,
 )
 coll = COLLECT(
     exe,
@@ -128,13 +134,12 @@ coll = COLLECT(
     upx_exclude=[],
     name='TFLiteTraining',
 )
-
 # macOS: bundle into .app; Windows: COLLECT alone produces a dist folder with the .exe
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name='TFLiteTraining.app',
-        icon=None,
+        icon='AIoScouts.icns',
         bundle_identifier='ai.tflite.training',
         info_plist={
             'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',

@@ -210,15 +210,19 @@ Two different crops exist — know which one the model actually receives:
 transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
 
 1. Center **60 % square crop** of the frame (`_center_bbox(frac=0.60)`)
-2. BT.601 luminance of the cropped original RGB (no WB, no masking)
-3. Bilinear resize to the training image size (default 96×96)
+2. Bilinear resize of the cropped RGB to the training image size (default
+   96×96) — float32, PIL-style center mapping, a bit-for-bit mirror of the
+   firmware's `crop_resize_bilinear()`
+3. BT.601 luminance (30/59/11, round half up) of the resampled pixels (no
+   WB, no masking)
 4. Contrast stretch (only if pixel span ≥ 24)
 5. int8 = gray − 128
 
 The dark/lum mask never touches these pixels; it only drives the previews and
 the sign_pct OOD statistic. This transform is identical to the device firmware
 (`BG_ENABLE_BLOB_SEARCH=0` + `BG_FALLBACK_CENTER_FRAC=0.60`) — verified
-86/86 training frames → 0 label flips (2026-08-26).
+bit-identical on random frames against a C transliteration of the firmware,
+and 86/86 training frames → 0 label flips (2026-08-26).
 
 **Shadow-search preview** (`_focus_bbox`, used by the ROI overlay, the class
 edit page's auto mode, and the masked previews) — a G-channel dark-object +

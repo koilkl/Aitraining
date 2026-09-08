@@ -13,3 +13,6 @@ model.cpp
 g_model.tflite
 /dist-packages
 TFLiteTraining.pdf
+AI training.docx
+*.docx
+*.pdf
