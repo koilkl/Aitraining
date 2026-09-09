@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -16,6 +17,15 @@ PREPROCESS_MODE_NONE = "none"
 PREPROCESS_MODE_SIGN = "sign"
 PREPROCESS_MODE_JUNCTION = "junction"
 PREPROCESS_MODE_BLUE_DIFF = "blue_diff"  # B-G extraction for blue/purple signs
+
+# Model-input crop selection (train + live predict + device firmware must agree):
+#   CROP_MODE_AUTO_SEARCH — the auto shadow-search box (_focus_bbox C port on
+#       the device, BG_ENABLE_FOCUS_SEARCH=1).  Removes background outside the
+#       detected sign.  Default for NEW trainings.
+#   CROP_MODE_CENTER — legacy deterministic center 60 % crop (device
+#       BG_ENABLE_FOCUS_SEARCH=0).  Old deployed models keep this.
+CROP_MODE_AUTO_SEARCH = "auto_search"
+CROP_MODE_CENTER = "center"
 
 _SEARCH_LEFT_FRAC = 0.10
 _SEARCH_RIGHT_FRAC = 0.90
@@ -279,14 +289,42 @@ def _estimate_sign_center_and_side(
     kernel_size = max(3, int(round(min(search_h, search_w) * _SIGN_PROJECTION_FRAC)))
     if kernel_size % 2 == 0:
         kernel_size += 1
-    kernel = np.ones(kernel_size, dtype=np.float32)
+    half = kernel_size // 2
 
-    score_map = np.apply_along_axis(lambda v: np.convolve(v, kernel, mode="same"), 1, target_map)
-    score_map = np.apply_along_axis(lambda v: np.convolve(v, kernel, mode="same"), 0, score_map)
-    ys = np.linspace(0.0, 1.0, search_h, dtype=np.float32)
-    xs = np.linspace(0.0, 1.0, search_w, dtype=np.float32)
-    prior_x = np.exp(-0.5 * ((xs - _SIGN_PRIOR_CENTER_X_FRAC) / max(_SIGN_PRIOR_SIGMA_X_FRAC, 1e-6)) ** 2)
-    prior_y = np.exp(-0.5 * ((ys - _SIGN_PRIOR_CENTER_Y_FRAC) / max(_SIGN_PRIOR_SIGMA_Y_FRAC, 1e-6)) ** 2)
+    # Deterministic separable box blur in float32, running-sum (cumsum) with
+    # the kernel centered and zero padding — mirrors the device C port
+    # (fb box_blur) BIT-FOR-BIT.  np.convolve uses SIMD summation whose
+    # rounding order is machine-dependent and cannot be reproduced on the
+    # MCU, which used to shift the auto crop box by ~1 px on some frames.
+    def _blur_axis(a: np.ndarray, axis: int) -> np.ndarray:
+        pad_shape = [(0, 0), (0, 0)]
+        pad_shape[axis] = (half, half)
+        p = np.pad(a, pad_shape, mode="constant")
+        c = np.cumsum(p, axis=axis, dtype=np.float32)
+        # out[j] = sum of vpad[j .. j+K-1] = C[j+K-1] - C[j-1]  (C[-1] = 0)
+        n = int(a.shape[axis])
+        hi_sl = slice(kernel_size - 1, kernel_size - 1 + n)
+        if axis == 1:
+            hi = c[:, hi_sl]
+            lo = np.concatenate([np.zeros((c.shape[0], 1), dtype=np.float32), c[:, : n - 1]], axis=1)
+            return hi - lo
+        hi = c[hi_sl, :]
+        lo = np.concatenate([np.zeros((1, c.shape[1]), dtype=np.float32), c[: n - 1, :]], axis=0)
+        return hi - lo
+
+    score_map = _blur_axis(_blur_axis(target_map.astype(np.float32), 1), 0)
+    # Priors: linspace in float64, exp in float64, cast to float32 — same
+    # double math as the device C port (exp() then (float) cast).
+    ys = np.linspace(0.0, 1.0, search_h, dtype=np.float64)
+    xs = np.linspace(0.0, 1.0, search_w, dtype=np.float64)
+    prior_y = np.asarray(
+        [math.exp(-0.5 * ((float(y) - _SIGN_PRIOR_CENTER_Y_FRAC) / max(_SIGN_PRIOR_SIGMA_Y_FRAC, 1e-6)) ** 2) for y in ys],
+        dtype=np.float32,
+    )
+    prior_x = np.asarray(
+        [math.exp(-0.5 * ((float(x) - _SIGN_PRIOR_CENTER_X_FRAC) / max(_SIGN_PRIOR_SIGMA_X_FRAC, 1e-6)) ** 2) for x in xs],
+        dtype=np.float32,
+    )
     score_map = score_map * prior_y[:, None] * prior_x[None, :]
     peak_value = float(score_map.max(initial=0.0))
     if peak_value <= 0.0:
@@ -876,6 +914,7 @@ def preprocess_for_label(
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
     manual_roi: Any = None,
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
+    crop_mode: str = CROP_MODE_AUTO_SEARCH,
 ) -> np.ndarray:
     resolved = resolve_preprocess_config(
         label_name=label_name,
@@ -890,12 +929,13 @@ def preprocess_for_label(
         src = _to_uint8_image(arr)
         roi = manual_roi_to_pixels(src.shape[0], src.shape[1], resolved_roi)
     class_cfg = normalize_class_preprocess(class_preprocess.get(str(label_name or ""))) if class_preprocess else {}
-    # Training must use the SAME transform the model is deployed with: the
-    # center 60 % crop (fast_mode) with the device-exact bilinear/BT.601
-    # math.  roi (manual ROI mode) still takes precedence when set inside
-    # preprocess_blue_diff_array; otherwise _focus_bbox (a preview aid that
-    # crops ~13 px off-center) must never reach the training pixels.
-    fast_mode = True
+    # Training must use the SAME transform the model is deployed with.
+    # crop_mode selects the model-input crop (auto shadow-search box or the
+    # deterministic center 60 % crop); a manual ROI still takes precedence.
+    if mode == PREPROCESS_MODE_MANUAL_ROI:
+        fast_mode = True
+    else:
+        fast_mode = (str(crop_mode or CROP_MODE_CENTER) != CROP_MODE_AUTO_SEARCH)
     result = preprocess_blue_diff_array(
         arr, out_size=out_size, color_mode=color_mode, roi=roi,
         bg_dark_thresh=int(class_cfg.get("bg_dark_thresh", 0)),
@@ -917,6 +957,7 @@ def prepare_inference_inputs(
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None,
     bg_dark_thresh: Optional[int] = None,
     bg_lum_thresh: Optional[int] = None,
+    crop_mode: str = CROP_MODE_CENTER,
 ) -> Dict[str, Any]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
@@ -927,13 +968,19 @@ def prepare_inference_inputs(
     use_lum  = int(bg_lum_thresh)  if bg_lum_thresh  is not None else 100
     use_dark = max(0, min(255, use_dark))
     use_lum = max(1, min(255, use_lum))
-    # Live prediction must use the SAME transform the model was trained on:
-    # training always goes through the preprocessed cache (fast_mode=True →
-    # _center_bbox central 60 % crop), and the device firmware crops the
-    # same way.  The _focus_bbox dark-object search is only a preview aid —
-    # on the training set it crops ~13 px right of the sign and flips
-    # 24/40 LEFT samples to RIGHT.  A manual ROI still takes precedence.
-    fast_mode = True
+    # Crop selection — MUST match how the model was trained and how the
+    # device firmware crops (BG_ENABLE_FOCUS_SEARCH):
+    #   crop_mode = CROP_MODE_AUTO_SEARCH → auto shadow-search box is the
+    #       MODEL INPUT (background removed).  Mirrors the device C port
+    #       bit-for-bit.
+    #   crop_mode = CROP_MODE_CENTER → deterministic center 60 % crop
+    #       (legacy; old deployed models).
+    # A manual ROI still takes precedence in manual_roi mode.
+    auto_search = (str(crop_mode or CROP_MODE_CENTER) == CROP_MODE_AUTO_SEARCH)
+    if mode == PREPROCESS_MODE_MANUAL_ROI:
+        fast_mode = True  # roi box wins regardless
+    else:
+        fast_mode = not auto_search
     result = preprocess_blue_diff_array(arr, out_size=out_size, color_mode=color_mode, roi=roi,
                                         bg_dark_thresh=use_dark,
                                         bg_lum_thresh=use_lum,
@@ -942,9 +989,12 @@ def prepare_inference_inputs(
                                         return_stats=True)
     out: Dict[str, Any] = {"default": None, "mask_stats": None}
     stats: Any = None
+    crop_norm: Any = None
     if isinstance(result, tuple):
         image = result[0]
         out["default"] = image
+        if len(result) >= 2:
+            crop_norm = result[1]
         if len(result) >= 6 and isinstance(result[-1], dict):
             stats = result[-1]
             out["mask_stats"] = stats
@@ -965,6 +1015,38 @@ def prepare_inference_inputs(
         out["crop_preview"] = out.get("default")
     if "full_preview" not in out:
         out["full_preview"] = out.get("default")
+    # Auto search box for the UI (green box overlay + the ROI crop view
+    # tracks the search).  In CROP_MODE_AUTO_SEARCH the box IS the model
+    # crop — reuse the main run's crop_norm (no second search).  In center
+    # mode the model input keeps the center crop, but the preview variants
+    # (masked / crop / full) come from a focus-search run so the ROI view
+    # still shows the JUMPING auto-detected crop, like the pre-fast_mode
+    # era.  Manual mode reuses the manual box.
+    search_box: Any = None
+    if mode == PREPROCESS_MODE_MANUAL_ROI:
+        search_box = list(crop_norm) if crop_norm is not None else None
+    elif auto_search and roi is None:
+        search_box = list(crop_norm) if crop_norm is not None else None
+    elif roi is None:
+        try:
+            box_result = preprocess_blue_diff_array(
+                arr, out_size=out_size, color_mode=color_mode, roi=None,
+                bg_dark_thresh=use_dark, bg_lum_thresh=use_lum,
+                return_crop_box=True, fast_mode=False,
+            )
+            if isinstance(box_result, tuple):
+                if len(box_result) >= 2 and box_result[1] is not None:
+                    search_box = list(box_result[1])
+                if len(box_result) >= 5:
+                    if box_result[2] is not None:
+                        out["masked_preview"] = box_result[2]
+                    if box_result[3] is not None:
+                        out["crop_preview"] = box_result[3]
+                    if box_result[4] is not None:
+                        out["full_preview"] = box_result[4]
+        except Exception:
+            search_box = None
+    out["search_box"] = search_box
     return out
 
 

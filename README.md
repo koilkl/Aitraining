@@ -46,10 +46,10 @@ Goal: students should not need to install Python. Double-click to launch.
     - `Full Frame`: disable extra ROI cropping for that class
 - Preview / Export:
       - The right `Preview` panel runs preview inference after training
-      - Toggle `Input` to start/stop live predictions; toggle `ROI` to apply the auto-crop; toggle `Orig` to apply the thresholded filter (enable both for the cropped + filtered view)
+      - Toggle `Input` to start/stop live predictions; toggle `ROI` to show the auto search-box CROP image (jumps with the detection — the same auto crop the class-edit page shows); toggle `Orig` for the thresholded full-frame view (enable both for the cropped + filtered view)
       - The prediction bars show per-class confidence; the button under them toggles between percentage (`Show Score`) and raw 0–1 score (`Show %`)
       - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
-      - Live predictions use the same center-60 % crop the model was trained on (matches the device firmware); the ROI view is visual feedback only
+      - Live predictions use the same crop the model was trained on — the auto search box (default `crop_mode="auto_search"`, device `BG_ENABLE_FOCUS_SEARCH=1`) or the legacy center-60 % crop — matching the device firmware
       - `Export Model` writes model files and MCU helper files to the selected export folder
 - Default output directories:
   - macOS: `~/Library/Application Support/TFLiteTraining/`
@@ -207,9 +207,13 @@ A step-by-step walkthrough that showcases every major feature.  Ideal for presen
 Two different crops exist — know which one the model actually receives:
 
 **Model input (training = live predict = device firmware)** — the canonical
-transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
+transform, applied by `preprocess_blue_diff_array`:
 
-1. Center **60 % square crop** of the frame (`_center_bbox(frac=0.60)`)
+1. Crop: **auto shadow-search box** by default (`crop_mode="auto_search"` —
+   the training default, device `BG_ENABLE_FOCUS_SEARCH=1`) removes the
+   background outside the detected sign; legacy `crop_mode="center"` keeps
+   the deterministic center **60 % square crop** (`_center_bbox(frac=0.60)`,
+   old deployed models).  Retrain after switching.
 2. Bilinear resize of the cropped RGB to the training image size (default
    96×96) — float32, PIL-style center mapping, a bit-for-bit mirror of the
    firmware's `crop_resize_bilinear()`
@@ -219,10 +223,12 @@ transform, applied by `preprocess_blue_diff_array(fast_mode=True)`:
 5. int8 = gray − 128
 
 The dark/lum mask never touches these pixels; it only drives the previews and
-the sign_pct OOD statistic. This transform is identical to the device firmware
-(`BG_ENABLE_BLOB_SEARCH=0` + `BG_FALLBACK_CENTER_FRAC=0.60`) — verified
-bit-identical on random frames against a C transliteration of the firmware,
-and 86/86 training frames → 0 label flips (2026-08-26).
+the sign_pct OOD statistic, and it IS the search-box input (non-sign pixels
+→ white before the shadow search, same on host and device). This transform is
+identical to the device firmware — verified bit-identical on random frames
+against a C transliteration of the firmware (65/65 search boxes, 20/20
+end-to-end model inputs), and 86/86 training frames → 0 label flips
+(2026-08-26, center-crop era).
 
 **Shadow-search preview** (`_focus_bbox`, used by the ROI overlay, the class
 edit page's auto mode, and the masked previews) — a G-channel dark-object +

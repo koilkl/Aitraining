@@ -2243,6 +2243,18 @@ def _render_tm_old_frontend_html(
       box-shadow: 0 0 0 1px rgba(255,255,255,0.35) inset;
       pointer-events: none;
     }}
+    .preview-stage {{
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }}
+    .preview-stage img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }}
     .class-preprocess-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
@@ -5982,19 +5994,20 @@ async function refreshPreviewPrediction(token) {{
     const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
     // Each button is an independent state; they stack:
     //   Orig ON  = apply processed filter (no crop change)
-    //   ROI  ON  = apply crop (no filter)
-    //   both ON  = cropped AND filtered (processed_image_b64)
+    //   ROI  ON  = the auto search-box CROP image (jumps with detection)
+    //   both ON  = cropped AND filtered (processed_image_b64, no box)
     let src = rawSrc;
     if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
     else if (previewShowRaw) src = fullSrc || rawSrc;
     else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
       if (!pane.dataset.ready) {{
-        pane.innerHTML = `<img id="${{imgId}}" alt="Preview"/>`;
+        pane.innerHTML = `<div class="preview-stage"><img id="${{imgId}}" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`;
         pane.dataset.ready = '1';
       }}
       const img = document.getElementById(imgId);
       if (img && src) img.src = src;
+      updatePreviewRoiOverlay(Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null, previewPreprocessMode === 'manual_roi');
     }}
     if (openSourceClass && openSourceKind === previewSource) {{
       const sImg = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
@@ -6017,6 +6030,56 @@ async function refreshPreviewPrediction(token) {{
     previewPredictInFlight = false;
     previewPredictController = null;
   }}
+}}
+// ── Preview ROI overlay: auto search box (same UX as the class-edit page) ──
+// Green border = auto-detected shadow-search box, blue = manual ROI box.
+function getPreviewImageContentRect() {{
+  const stage = document.querySelector('#previewPane .preview-stage');
+  const img = document.getElementById('previewImage');
+  if (!stage || !img) return null;
+  const stageRect = stage.getBoundingClientRect();
+  if (!stageRect.width || !stageRect.height) return null;
+  const naturalW = Number(img.naturalWidth || 0);
+  const naturalH = Number(img.naturalHeight || 0);
+  if (naturalW <= 0 || naturalH <= 0) {{
+    return {{ offsetX: 0, offsetY: 0, width: stageRect.width, height: stageRect.height }};
+  }}
+  const scale = Math.min(stageRect.width / naturalW, stageRect.height / naturalH);
+  const width = naturalW * scale;
+  const height = naturalH * scale;
+  const offsetX = (stageRect.width - width) * 0.5;
+  const offsetY = (stageRect.height - height) * 0.5;
+  return {{ offsetX, offsetY, width, height }};
+}}
+function updatePreviewRoiOverlay(crop, isManual) {{
+  const overlay = document.getElementById('previewRoiOverlay');
+  if (!overlay) return;
+  const valid = Array.isArray(crop) && crop.length === 4;
+  // Green/blue box shows on the ORIGINAL frame when both toggles are OFF.
+  // ROI ON alone displays the jumping CROP image itself (the search box
+  // effect); Orig ON shows the thresholded view — a box there would be
+  // spatially misplaced.
+  const show = valid && !previewShowRoi && !previewShowRaw;
+  if (!show) {{
+    overlay.style.display = 'none';
+    return;
+  }}
+  const rect = getPreviewImageContentRect();
+  if (!rect || !rect.width || !rect.height) {{
+    overlay.style.display = 'none';
+    return;
+  }}
+  const x1 = Math.max(0, Math.min(1, Number(crop[0] || 0)));
+  const y1 = Math.max(0, Math.min(1, Number(crop[1] || 0)));
+  const x2 = Math.max(x1, Math.min(1, Number(crop[2] || x1)));
+  const y2 = Math.max(y1, Math.min(1, Number(crop[3] || y1)));
+  overlay.style.display = 'block';
+  overlay.style.left = `${{rect.offsetX + x1 * rect.width}}px`;
+  overlay.style.top = `${{rect.offsetY + y1 * rect.height}}px`;
+  overlay.style.width = `${{Math.max(0, (x2 - x1) * rect.width)}}px`;
+  overlay.style.height = `${{Math.max(0, (y2 - y1) * rect.height)}}px`;
+  // Green border = auto-detected, blue border = manual ROI
+  overlay.style.borderColor = isManual ? 'var(--accent)' : '#4caf50';
 }}
 async function runPreviewUploadPrediction() {{
   if (!previewInputOn || !STATE.export_enabled) return;
@@ -6053,15 +6116,16 @@ async function runPreviewUploadPrediction() {{
     const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
     // Each button is an independent state; they stack:
     //   Orig ON  = apply processed filter (no crop change)
-    //   ROI  ON  = apply crop (no filter)
-    //   both ON  = cropped AND filtered (processed_image_b64)
+    //   ROI  ON  = the auto search-box CROP image (jumps with detection)
+    //   both ON  = cropped AND filtered (processed_image_b64, no box)
     let src = rawSrc;
     if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
     else if (previewShowRaw) src = fullSrc || rawSrc;
     else if (previewShowRoi) src = cropSrc || rawSrc;
     if (pane) {{
-      pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
+      pane.innerHTML = src ? `<div class="preview-stage"><img id="previewImage" src="${{src}}" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
       pane.dataset.ready = '1';
+      updatePreviewRoiOverlay(Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null, previewPreprocessMode === 'manual_roi');
     }}
     renderOutputBars(data.labels || [], data.probs || []);
     if (note) {{
