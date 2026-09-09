@@ -281,7 +281,8 @@ def _weighted_center_in_bbox(
 
 
 def _estimate_sign_center_and_side(
-    target_map: np.ndarray, search_h: int, search_w: int, max_crop_side: int
+    target_map: np.ndarray, search_h: int, search_w: int, max_crop_side: int,
+    dark_mask: Optional[np.ndarray] = None,
 ) -> Optional[Tuple[float, float, int, float, float, float, Tuple[int, int, int, int]]]:
     if target_map.size == 0:
         return None
@@ -411,8 +412,17 @@ def _estimate_sign_center_and_side(
 
     span_w, span_h = best_span
     component_side_frac = float(max(span_w, span_h)) / float(max(1, min(search_h, search_w)))
-    support_mask = score_map >= (peak_value * _SIGN_SUPPORT_PEAK_RATIO)
-    support_bbox = _connected_bbox_from_seed(support_mask, best_peak[0], best_peak[1])
+    # Support bbox = the DARK-MASK connected component seeded at the peak
+    # (NOT the score-based support mask): flat dark sign interiors have ~0
+    # edge weight, so the score support ring only covers border fragments
+    # and the crop misses large flat signs.  The score mask remains the
+    # fallback when no dark component contains the peak.
+    support_bbox = None
+    if dark_mask is not None:
+        support_bbox = _connected_bbox_from_seed(dark_mask, best_peak[0], best_peak[1])
+    if support_bbox is None:
+        support_mask = score_map >= (peak_value * _SIGN_SUPPORT_PEAK_RATIO)
+        support_bbox = _connected_bbox_from_seed(support_mask, best_peak[0], best_peak[1])
     if support_bbox is None:
         support_bbox = best_bbox
     sup_min_x, sup_min_y, sup_max_x, sup_max_y = support_bbox
@@ -471,18 +481,25 @@ def _focus_bbox(gray: np.ndarray) -> Tuple[int, int, int, int]:
     edge_thr = max(_EDGE_MIN, _percentile_from_hist(edge_hist, total, _EDGE_PERCENTILE))
 
     mask = (region <= thr) & (edge >= edge_thr)
+    dark_thr = thr  # pure-dark threshold for the support seed (tracks the mask)
     dark_strength = np.clip(thr - region.astype(np.int16), 0, None).astype(np.float32)
     edge_strength = np.clip(edge.astype(np.int16) - edge_thr, 0, None).astype(np.float32)
     target_map = dark_strength * (edge_strength + 1.0)
     if int(mask.sum()) < _MIN_FOCUS_PIXELS:
         relax_thr = max(_EDGE_RELAX, edge_thr - 6)
         mask = (region <= p20) & (edge >= relax_thr)
+        dark_thr = p20
         edge_strength = np.clip(edge.astype(np.int16) - relax_thr, 0, None).astype(np.float32)
         target_map = np.clip(p20 - region.astype(np.int16), 0, None).astype(np.float32) * (edge_strength + 1.0)
     if int(mask.sum()) < _MIN_FOCUS_PIXELS:
         return _fallback_bbox(h, w)
 
-    estimated = _estimate_sign_center_and_side(target_map, region.shape[0], region.shape[1], min(h, w))
+    # dark_mask for support seeding: pure dark set at the current threshold
+    # (the sign mass, incl. flat interiors with no edge content)
+    dark_mask = (region <= dark_thr).astype(bool)
+    estimated = _estimate_sign_center_and_side(
+        target_map, region.shape[0], region.shape[1], min(h, w), dark_mask=dark_mask
+    )
     if estimated is None:
         return _fallback_bbox(h, w)
 
