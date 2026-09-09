@@ -13,6 +13,7 @@ import tensorflow as tf
 from tensorflow.lite.python.util import convert_bytes_to_c_source
 
 from image_preprocess import (
+    CROP_MODE_AUTO_SEARCH,
     PREPROCESS_MODE_AUTO_BY_LABEL,
     normalize_class_preprocess_map,
     normalize_sample_preprocess_map,
@@ -36,6 +37,7 @@ class TrainConfig:
     dense_units: int = 64
     representative_samples: int = 200
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL
+    crop_mode: str = CROP_MODE_AUTO_SEARCH  # auto shadow-search box = model input (device BG_ENABLE_FOCUS_SEARCH=1)
     manual_roi: Optional[Tuple[float, float, float, float]] = None
     class_preprocess: Optional[Dict[str, Dict[str, Any]]] = None
     sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -179,6 +181,7 @@ def load_datasets(
                 preprocess_mode=preprocess_mode,
                 manual_roi=manual_roi,
                 class_preprocess=class_preprocess,
+                crop_mode=str(cfg.crop_mode or CROP_MODE_AUTO_SEARCH),
             )
 
         x = tf.map_fn(

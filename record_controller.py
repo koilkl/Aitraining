@@ -23,6 +23,8 @@ from camera_permission import ensure_camera_access
 from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
 from dataset_io import IMAGE_EXTS, sanitize_class_name
 from image_preprocess import (
+    CROP_MODE_AUTO_SEARCH,
+    CROP_MODE_CENTER,
     PREPROCESS_MODE_AUTO_BY_LABEL,
     PREPROCESS_MODE_MANUAL_ROI,
     _BG_LUM_THRESH,
@@ -557,6 +559,7 @@ class RecordController:
                     "crop_image_b64": str(pred.get("crop_image_b64") or ""),
                     "full_image_b64": str(pred.get("full_image_b64") or ""),
                     "processed_variant": str(pred.get("processed_variant") or ""),
+                    "crop": pred.get("crop"),
                 },
                 cors=True,
             )
@@ -1882,6 +1885,7 @@ class RecordController:
         sample_preprocess: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
         global_preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL,
         out_size: int = 96,
+        fast_mode: bool = True,
     ) -> None:
         classes = self._classes_load(dataset_root)
         cache_root = self._processed_cache_dir(dataset_root)
@@ -1908,7 +1912,7 @@ class RecordController:
                         png,
                         label_name=class_name,
                         class_config=config,
-                        fast_mode=True,
+                        fast_mode=fast_mode,
                         sample_config=sample_cfg,
                         out_size=int(out_size),
                     )
@@ -2067,6 +2071,7 @@ class RecordController:
             "tflite_mtime": mtime,
             "labels": list(labels),
             "preprocess_mode": str(meta.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL) if isinstance(meta, dict) else PREPROCESS_MODE_AUTO_BY_LABEL,
+            "crop_mode": str(meta.get("crop_mode") or CROP_MODE_CENTER) if isinstance(meta, dict) else CROP_MODE_CENTER,
             "manual_roi": normalize_manual_roi(meta.get("manual_roi")) if isinstance(meta, dict) else None,
             "class_preprocess": normalize_class_preprocess_map(meta.get("class_preprocess")) if isinstance(meta, dict) else {},
             "interpreter": interpreter,
@@ -2097,6 +2102,10 @@ class RecordController:
         labels: List[str] = list(model.get("labels") or [])
         model_preprocess_mode = str(model.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL)
         preprocess_mode = str(preprocess_mode or model_preprocess_mode or PREPROCESS_MODE_AUTO_BY_LABEL).strip().lower()
+        # The model defines the crop: new trainings save "auto_search"
+        # (shadow-search box = model input, device BG_ENABLE_FOCUS_SEARCH=1);
+        # old deployments without the field keep the legacy center crop.
+        model_crop_mode = str(model.get("crop_mode") or CROP_MODE_CENTER)
         manual_roi = normalize_manual_roi(model.get("manual_roi"))
         class_preprocess = normalize_class_preprocess_map(model.get("class_preprocess"))
         shape_raw = input_details.get("shape")
@@ -2135,11 +2144,31 @@ class RecordController:
             # NOTE: sign_pct is computed on the streamed (cropped) frame; the
             # device computes it on the full pre-crop frame, so the two L1
             # gates are close but not identical.
+            # Preview variants for the ROI/Orig toggles keep the pre-direct-
+            # feed visuals: rebuild them with the normal prepare_inference_
+            # inputs pipeline (mask / crop / full-frame views) so the buttons
+            # behave exactly as before.  Only the MODEL input ("default") is
+            # the direct-fed stream — that part must NOT be re-processed.
+            try:
+                legacy_views = prepare_inference_inputs(
+                    np.asarray(img),
+                    out_size=int(w),
+                    color_mode="grayscale",
+                    preprocess_mode=preprocess_mode,
+                    manual_roi=manual_roi,
+                    class_preprocess=class_preprocess,
+                    bg_dark_thresh=d,
+                    bg_lum_thresh=l,
+                    crop_mode=model_crop_mode,
+                )
+            except Exception:
+                legacy_views = {}
             prepared = {
                 "default": arr,
-                "masked_preview": arr,
-                "crop_preview": arr,
-                "full_preview": arr,
+                "masked_preview": legacy_views.get("masked_preview", arr),
+                "crop_preview": legacy_views.get("crop_preview", arr),
+                "full_preview": legacy_views.get("full_preview", arr),
+                "search_box": legacy_views.get("search_box"),
                 "mask_stats": {
                     "sign_pct": float(is_sign.mean() * 100.0),
                     "too_dark_pct": float((gray <= d).mean() * 100.0),
@@ -2158,6 +2187,7 @@ class RecordController:
                 class_preprocess=class_preprocess,
                 bg_dark_thresh=(int(bg_dark_thresh) if bg_dark_thresh is not None else None),
                 bg_lum_thresh=(int(bg_lum_thresh)  if bg_lum_thresh  is not None else None),
+                crop_mode=model_crop_mode,
             )
         qscale = 0.0
         qzp = 0
@@ -2350,11 +2380,19 @@ class RecordController:
             full_png = None
         processed_img = _model_input_array_to_preview_image(processed_arr)
         processed_png = _to_png_bytes(processed_img)
+        # Auto search box (normalized 0-1) for the preview ROI overlay —
+        # same contract as the class-edit page ("crop" field).
+        search_box: Any = None
+        if isinstance(prepared, dict):
+            sb = prepared.get("search_box")
+            if isinstance(sb, (list, tuple)) and len(sb) == 4:
+                search_box = [float(x) for x in sb]
         return {
             "labels": labels_out,
             "probs": probs_out,
             "top_label": top_label_out,
             "top_prob": float(top_prob_out),
+            "crop": search_box,
             "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
             "crop_image_b64": base64.b64encode(crop_png).decode("ascii") if crop_png else "",
             "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
@@ -2523,6 +2561,7 @@ class RecordController:
                 dense_units=int(cfg_dict.get("dense_units") or 32),
                 representative_samples=int(cfg_dict.get("representative_samples") or 200),
                 preprocess_mode=str(cfg_dict.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
+                crop_mode=str(cfg_dict.get("crop_mode") or CROP_MODE_AUTO_SEARCH),
                 manual_roi=normalize_manual_roi(cfg_dict.get("manual_roi")),
                 class_preprocess=normalize_class_preprocess_map(raw_class_preprocess),
                 sample_preprocess=normalize_sample_preprocess_map(raw_sample_preprocess),
@@ -2543,6 +2582,7 @@ class RecordController:
                 sample_preprocess=cfg.sample_preprocess,
                 global_preprocess_mode=cfg.preprocess_mode,
                 out_size=int(cfg.img_size),
+                fast_mode=(str(cfg.crop_mode or CROP_MODE_CENTER) != CROP_MODE_AUTO_SEARCH),
             )
 
             def on_progress(p: float, msg: str) -> None:
@@ -2590,6 +2630,7 @@ class RecordController:
                 "img_size": int(cfg.img_size),
                 "color_mode": str(cfg.color_mode),
                 "preprocess_mode": str(cfg.preprocess_mode),
+                "crop_mode": str(cfg.crop_mode or CROP_MODE_AUTO_SEARCH),
                 "manual_roi": list(cfg.manual_roi) if cfg.manual_roi is not None else None,
                 "class_preprocess": normalize_class_preprocess_map(cfg.class_preprocess),
                 "sample_preprocess": normalize_sample_preprocess_map(cfg.sample_preprocess),
