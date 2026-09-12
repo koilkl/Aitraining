@@ -2,7 +2,7 @@
 import sys
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.')]
+datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('mac_camera.py', '.')]
 binaries = []
 hiddenimports = []
 
@@ -50,7 +50,8 @@ if sys.platform == 'darwin':
     # Camera names in the packaged app: AVFoundation (pyobjc) provides the
     # device list; without bundling these the app falls back to unnamed
     # "Camera 0/1" labels.
-    for _pkg in ('AVFoundation', 'objc'):
+    # mac_camera.py also needs CoreMedia / Quartz (CoreVideo) / Foundation
+    for _pkg in ('AVFoundation', 'objc', 'Quartz', 'CoreMedia', 'Foundation'):
         try:
             tmp_ret = collect_all(_pkg)
             datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
