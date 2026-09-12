@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from camera_permission import ensure_camera_access
 from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
@@ -50,6 +50,43 @@ class SessionConfig:
     webcam_index: int
     fps: float
     crop_box: Optional[Tuple[int, int, int, int]]
+    # When True, a 1-channel device stream is fed STRAIGHT to the model
+    # (the firmware already streams the preprocessed tensor — TFLite.ino
+    # kCaptureGray/kInferGray).  Default False: the stream is a RAW frame
+    # (IMX219_Grayscale_Serial example firmware) and must go through the
+    # full crop pipeline like the training data did.  Direct-feeding a raw
+    # frame into a crop-trained model was the "model always wrong" bug.
+    direct_tensor_stream: bool = False
+    # macOS AVCaptureDevice uniqueID of the selected camera.  Resolved to the
+    # current cv2 index at OPEN time so the name→index pairing stays correct
+    # when virtual cameras (Iriun etc.) connect or disconnect.
+    webcam_id: Optional[str] = None
+    # Training image size (the "Image Size" hyperparameter).  Captured /
+    # uploaded samples and their processed-cache previews are stored at this
+    # size so 160×160 (or 48/128/192) projects are never downsampled to 96.
+    img_size: int = 96
+
+
+def _persist_webcam_choice(cfg: "SessionConfig") -> None:
+    """Remember the last-used camera (uniqueID + index) in the workspace so a
+    fresh session auto-selects the user's camera instead of the first
+    non-virtual one."""
+    try:
+        p = Path(cfg.dataset_root).parent / "webcam.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(
+                {
+                    "webcam_id": str(getattr(cfg, "webcam_id", None) or ""),
+                    "webcam_index": int(getattr(cfg, "webcam_index", 0) or 0),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 class ExportConflictError(RuntimeError):
@@ -157,6 +194,23 @@ class RecordController:
             raise RuntimeError("Controller server not started")
         return self._port
 
+    def stop(self) -> None:
+        """Shut the HTTP server down and join its thread (hot-reload support)."""
+        with self._lock:
+            server = self._server
+            thread = self._thread
+            self._server = None
+            self._thread = None
+            self._port = None
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
     def start(self) -> None:
         with self._lock:
             if self._server is not None:
@@ -179,11 +233,14 @@ class RecordController:
         session_id: str,
         *,
         webcam_index: Optional[int] = None,
+        webcam_id: Optional[str] = None,
+        img_size: Optional[int] = None,
         serial_port: Optional[str] = None,
         serial_baud: Optional[int] = None,
         serial_sync: Optional[str] = None,
         serial_frame_side: Optional[int] = None,
         serial_channels: Optional[int] = None,
+        direct_tensor_stream: Optional[bool] = None,
     ) -> SessionConfig:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -192,6 +249,8 @@ class RecordController:
             updated = replace(
                 cfg,
                 webcam_index=int(cfg.webcam_index if webcam_index is None else webcam_index),
+                webcam_id=(str(cfg.webcam_id) if cfg.webcam_id else "") if webcam_id is None else str(webcam_id),
+                img_size=int(cfg.img_size if img_size is None else img_size),
                 serial_port=str(cfg.serial_port if serial_port is None else serial_port),
                 serial_baud=int(cfg.serial_baud if serial_baud is None else serial_baud),
                 serial_sync=str(cfg.serial_sync if serial_sync is None else serial_sync),
@@ -199,6 +258,7 @@ class RecordController:
                 serial_channels=int(cfg.serial_channels if serial_channels is None else serial_channels),
             )
             self._configs[session_id] = updated
+            _persist_webcam_choice(updated)
             return updated
 
     def get_config(self, session_id: str) -> Optional["SessionConfig"]:
@@ -209,21 +269,18 @@ class RecordController:
         with self._lock:
             return dict(self._active.get(session_id, {}))
 
-    def preview_webcam_png(self, webcam_index: int) -> Optional[bytes]:
+    def preview_webcam_png(self, webcam_index: int, webcam_id: Optional[str] = None) -> Optional[bytes]:
         permission = ensure_camera_access(webcam_index=int(webcam_index))
         if not permission.allowed:
             return None
-        try:
-            import cv2
-        except Exception:
-            return None
-        cap = cv2.VideoCapture(int(webcam_index))
-        if not cap.isOpened():
+        cap, _actual = _open_working_camera(int(webcam_index), unique_id=webcam_id)
+        if cap is None or not cap.isOpened():
             return None
         ok, frame = cap.read()
         cap.release()
         if not ok or frame is None:
             return None
+        import cv2
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(frame)
         return _to_png_bytes(img)
@@ -254,30 +311,33 @@ class RecordController:
         controller = self
 
         class Handler(BaseHTTPRequestHandler):
+            @staticmethod
+            def _error_body_write(handler: BaseHTTPRequestHandler) -> None:
+                try:
+                    handler.send_response(500)
+                    handler.send_header("Content-Type", "text/plain")
+                    handler.end_headers()
+                    handler.wfile.write(b"error")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
             def do_GET(self) -> None:
                 try:
                     controller._handle(self)
                 except Exception:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"error")
+                    self._error_body_write(self)
 
             def do_POST(self) -> None:
                 try:
                     controller._handle_post(self)
                 except Exception:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/plain")
-                    self.end_headers()
-                    self.wfile.write(b"error")
+                    self._error_body_write(self)
 
             def do_OPTIONS(self) -> None:
                 try:
                     controller._handle_options(self)
-                except Exception:
-                    self.send_response(204)
-                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
             def log_message(self, format: str, *args) -> None:
                 return
@@ -381,6 +441,13 @@ class RecordController:
                 return
             _send_png(req, png, cors=True)
             return
+        if path == "/webcam/options":
+            try:
+                opts = list_webcam_options()
+            except Exception:
+                opts = []
+            _send_json(req, {"ok": "1", "options": opts}, cors=True)
+            return
         if path == "/serial/ports":
             ports = []
             try:
@@ -421,6 +488,7 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                 return
             p = _save_png(cfg.dataset_root, class_name, png)
+            self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
             _send_json(req, {"ok": "1", "class": class_name, "filename": p.name}, cors=True)
             return
         if path == "/live/open":
@@ -448,11 +516,14 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
                 return
             webcam_index_raw = (qs.get("webcam_index") or [None])[0]
+            webcam_id_raw = (qs.get("webcam_id") or [None])[0]
+            img_size_raw = (qs.get("img_size") or [None])[0]
             serial_port_raw = (qs.get("serial_port") or [None])[0]
             serial_baud_raw = (qs.get("serial_baud") or [None])[0]
             serial_sync_raw = (qs.get("serial_sync") or [None])[0]
             serial_frame_side_raw = (qs.get("serial_frame_side") or [None])[0]
             serial_channels_raw = (qs.get("serial_channels") or [None])[0]
+            direct_tensor_raw = (qs.get("direct_tensor_stream") or [None])[0]
             try:
                 if serial_sync_raw not in (None, ""):
                     parse_sync_header(serial_sync_raw)
@@ -467,11 +538,14 @@ class RecordController:
                 cfg = self.update_config(
                     session_id,
                     webcam_index=None if webcam_index_raw in (None, "") else int(float(webcam_index_raw)),
+                    webcam_id=None if webcam_id_raw in (None, "") else str(webcam_id_raw),
+                    img_size=None if img_size_raw in (None, "") else int(float(img_size_raw)),
                     serial_port=serial_port_raw,
                     serial_baud=None if serial_baud_raw in (None, "") else int(float(serial_baud_raw)),
                     serial_sync=None if serial_sync_raw is None else str(serial_sync_raw),
                     serial_frame_side=None if serial_frame_side_raw in (None, "") else int(float(serial_frame_side_raw)),
                     serial_channels=None if serial_channels_raw in (None, "") else int(float(serial_channels_raw)),
+                    direct_tensor_stream=None if direct_tensor_raw in (None, "") else direct_tensor_raw in ("1", "true", "True"),
                 )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
@@ -480,7 +554,10 @@ class RecordController:
                 req,
                 {
                     "ok": "1",
+                    "direct_tensor_stream": "1" if bool(getattr(cfg, "direct_tensor_stream", False)) else "0",
                     "webcam_index": str(int(cfg.webcam_index)),
+                    "webcam_id": str(cfg.webcam_id or ""),
+                    "img_size": str(int(cfg.img_size)),
                     "serial_port": str(cfg.serial_port),
                     "serial_baud": str(int(cfg.serial_baud)),
                     "serial_sync": str(cfg.serial_sync),
@@ -560,6 +637,7 @@ class RecordController:
                     "full_image_b64": str(pred.get("full_image_b64") or ""),
                     "processed_variant": str(pred.get("processed_variant") or ""),
                     "crop": pred.get("crop"),
+                    "model_source": str(pred.get("model_source") or "latest"),
                 },
                 cors=True,
             )
@@ -661,6 +739,7 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                 return
             p = _save_png(cfg.dataset_root, class_name, png)
+            self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
             _send_json(
                 req,
                 {
@@ -718,6 +797,68 @@ class RecordController:
             return
         raw = req.rfile.read(content_len)
         payload = json.loads(raw.decode("utf-8"))
+        if path == "/upload":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            image_b64 = str(payload.get("image_b64") or "").strip()
+            if not session_id or not class_name or not image_b64:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            try:
+                png = base64.b64decode(image_b64, validate=True)
+                img = Image.open(_bytes_io(png))
+                try:
+                    img = ImageOps.exif_transpose(img)
+                    img = img.convert("RGB" if img.mode not in {"L", "RGB"} else img.mode)
+                    img.load()
+                    max_side = 1280
+                    w, h = img.size
+                    if max(w, h) > max_side:
+                        scale = max_side / float(max(w, h))
+                        img = img.resize(
+                            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                            Image.LANCZOS,
+                        )
+                    png = _to_png_bytes(img)
+                    thumb_size = 96
+                    tw, th = img.size
+                    tscale = thumb_size / float(max(tw, th))
+                    thumb_w = max(1, int(round(tw * tscale)))
+                    thumb_h = max(1, int(round(th * tscale)))
+                    thumb_img = img.resize((thumb_w, thumb_h), Image.BILINEAR)
+                    try:
+                        thumb_png = _to_png_bytes(thumb_img)
+                        thumb_b64 = base64.b64encode(thumb_png).decode("ascii")
+                    finally:
+                        try:
+                            thumb_img.close()
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                p = _save_png(cfg.dataset_root, class_name, png)
+                self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(
+                req,
+                {
+                    "ok": "1",
+                    "class": class_name,
+                    "filename": p.name,
+                    "thumb_b64": thumb_b64,
+                },
+                cors=True,
+            )
+            return
         if path == "/train/start":
             session_id = str(payload.get("session") or "").strip()
             cfg = payload.get("cfg") or {}
@@ -739,6 +880,15 @@ class RecordController:
                 return
             try:
                 self._save_train_cfg(session_id=session_id, cfg=cfg)
+                # Keep the capture/preview image size in lockstep with the
+                # training "Image Size" setting — samples and their cache are
+                # stored at this size, never hardcoded 96.
+                try:
+                    size = int((cfg or {}).get("img_size") or 96)
+                    if 8 <= size <= 512:
+                        self.update_config(session_id, img_size=size)
+                except Exception:
+                    pass
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -795,6 +945,18 @@ class RecordController:
                     classes,
                     class_preprocess=normalize_class_preprocess_map(class_preprocess) if class_preprocess else None,
                 )
+                # Thresholds / ROI config changed — the processed cache must
+                # follow so previews and the next training use the new
+                # settings immediately.
+                try:
+                    self._rebuild_processed_cache(
+                        sess_cfg.dataset_root,
+                        class_preprocess=normalize_class_preprocess_map(class_preprocess) if class_preprocess else None,
+                        fast_mode=False,
+                        out_size=int(sess_cfg.img_size),
+                    )
+                except Exception:
+                    pass
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -1011,9 +1173,10 @@ class RecordController:
         if cfg.crop_box is not None:
             x1, y1, x2, y2 = cfg.crop_box
             img = img.crop((x1, y1, x2, y2))
-        img = img.resize((96, 96))
+        img = img.resize((int(cfg.img_size), int(cfg.img_size)))
         out_png = _to_png_bytes(img)
         p = _save_png(cfg.dataset_root, class_name, out_png)
+        self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
         _send_json(
             req,
             {
@@ -1698,11 +1861,20 @@ class RecordController:
         self._stop_live(session_id=session_id)
         with self._lock:
             self._active.pop(session_id, None)
+            # Full per-session teardown: stale live frames, cached
+            # interpreters and preview locks must not survive the reset
+            # (the workspace they point at is being wiped).
+            self._preview.pop(session_id, None)
+            self._preview_locks.pop(session_id, None)
+            self._train.pop(session_id, None)
+            self._live.pop(f"{session_id}:webcam", None)
+            self._live.pop(f"{session_id}:device", None)
         dataset_root = cfg.dataset_root
         workspace_root = dataset_root.parent
         classes_meta = self._classes_meta_path(dataset_root)
         processed_cache_dir = self._processed_cache_dir(dataset_root)
         latest = self._train_result_path(dataset_root)
+        deployed = workspace_root / "deployed.json"
         if dataset_root.exists():
             for p in list(dataset_root.iterdir()):
                 try:
@@ -1714,6 +1886,11 @@ class RecordController:
                     continue
         if latest.exists():
             latest.unlink(missing_ok=True)
+        # The deployed-model pin must die with the runs it points at —
+        # a dangling pin used to hard-fail every /preview/predict and
+        # freeze the preview on the old model.
+        if deployed.exists():
+            deployed.unlink(missing_ok=True)
         if classes_meta.exists():
             classes_meta.unlink(missing_ok=True)
         if processed_cache_dir.exists():
@@ -1824,6 +2001,25 @@ class RecordController:
 
     def _processed_preview_item_payload(self, path: Path) -> Dict[str, str]:
         return _preview_item_payload(path)
+
+    def _cache_one_sample(self, dataset_root: Path, class_name: str, sample_path: Path, img_size: int = 96) -> None:
+        """Process one newly saved sample into the processed cache so the
+        class-edit previews and the next training see it immediately."""
+        try:
+            class_cfg = self._class_preprocess_load(dataset_root).get(class_name)
+            config = class_cfg if isinstance(class_cfg, dict) else {"mode": "auto_by_label"}
+            out_png = self._preprocess_image_png(
+                sample_path.read_bytes(),
+                label_name=class_name,
+                class_config=config,
+                fast_mode=False,
+                out_size=int(img_size),
+            )
+            dst_dir = self._processed_cache_dir(dataset_root) / sanitize_class_name(class_name)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            (dst_dir / (sample_path.stem + ".png")).write_bytes(out_png)
+        except Exception:
+            pass
 
     def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False, fast_mode: bool = False, out_size: int = 96):
         class_cfg = class_config if isinstance(class_config, dict) else {}
@@ -1962,6 +2158,7 @@ class RecordController:
             class_config=class_config,
             sample_config=sample_config,
             return_crop=True,
+            out_size=int(cfg.img_size),
         )
         return {
             "image_b64": base64.b64encode(result["png"]).decode("ascii"),
@@ -2039,19 +2236,39 @@ class RecordController:
         if cfg is None:
             raise RuntimeError("missing config")
         latest = self._train_result_path(cfg.dataset_root)
-        # Preview must validate the DEPLOYED model (the one exported to the
-        # device) when a deployed.json stamp exists — otherwise every new
-        # training run silently advances the Preview model while the device
-        # keeps running the exported one.  Fall back to tm_train_latest for
-        # workspaces that never exported.
+        # Preview prefers the DEPLOYED model (the one exported to the
+        # device) when a deployed.json stamp exists — but ONLY while the
+        # stamp is valid.  A dangling pin (exported run wiped by project
+        # reset/open) or an unreadable meta used to hard-fail every
+        # /preview/predict and freeze the preview on the old model, so any
+        # invalid pin falls back to the latest training.
         deployed = cfg.dataset_root.parent / "deployed.json"
-        src = deployed if deployed.exists() else latest
+        src = None
+        meta: Dict[str, Any] = {}
+        if deployed.exists():
+            try:
+                dmeta = json.loads(deployed.read_text(encoding="utf-8"))
+                dpath = Path(str((dmeta or {}).get("tflite_path") or "")).expanduser()
+                if dpath.exists():
+                    src = deployed
+                    meta = dmeta if isinstance(dmeta, dict) else {}
+            except Exception:
+                src = None
+        if src is None:
+            src = latest
+            if src.exists():
+                try:
+                    meta = json.loads(src.read_text(encoding="utf-8"))
+                except Exception:
+                    raise RuntimeError("trained model meta is unreadable — retrain or re-export")
         if not src.exists():
             raise RuntimeError("missing trained model")
-        meta = json.loads(src.read_text(encoding="utf-8"))
+        if not meta:
+            raise RuntimeError("missing trained model meta — retrain or re-export")
         tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser()
         if not tflite_path.exists():
-            raise RuntimeError("missing .tflite file")
+            raise RuntimeError("missing .tflite file — retrain or re-export")
+        model_source = "deployed" if src == deployed else "latest"
         labels = meta.get("labels") if isinstance(meta, dict) else None
         if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
             labels = []
@@ -2069,6 +2286,7 @@ class RecordController:
         cur = {
             "tflite_path": str(tflite_path),
             "tflite_mtime": mtime,
+            "model_source": str(model_source),
             "labels": list(labels),
             "preprocess_mode": str(meta.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL) if isinstance(meta, dict) else PREPROCESS_MODE_AUTO_BY_LABEL,
             "crop_mode": str(meta.get("crop_mode") or CROP_MODE_CENTER) if isinstance(meta, dict) else CROP_MODE_CENTER,
@@ -2127,7 +2345,7 @@ class RecordController:
         if source == "device":
             with self._lock:
                 cfg = self._configs.get(session_id)
-            if cfg is not None and int(cfg.serial_channels or 1) == 1:
+            if cfg is not None and bool(getattr(cfg, "direct_tensor_stream", False)):
                 direct_feed = True
         if direct_feed:
             gray = np.asarray(img.convert("L"), dtype=np.uint8)
@@ -2393,6 +2611,7 @@ class RecordController:
             "top_label": top_label_out,
             "top_prob": float(top_prob_out),
             "crop": search_box,
+            "model_source": str(model.get("model_source") or "latest"),
             "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
             "crop_image_b64": base64.b64encode(crop_png).decode("ascii") if crop_png else "",
             "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
@@ -2493,7 +2712,7 @@ class RecordController:
     def _train_status_payload(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             cur = self._train.get(session_id) or {"running": "0", "done": "0", "progress": 0.0, "message": "", "error": "", "result_path": ""}
-            return {
+            payload = {
                 "ok": "1",
                 "running": str(cur.get("running") or "0"),
                 "done": str(cur.get("done") or "0"),
@@ -2501,7 +2720,24 @@ class RecordController:
                 "message": str(cur.get("message") or ""),
                 "error": str(cur.get("error") or ""),
                 "result_path": str(cur.get("result_path") or ""),
+                "class_accuracies": {},
+                "warnings": [],
             }
+        # Per-class accuracies + self-check warnings from the latest training
+        # meta — the SPA renders them in the training panel so weak classes
+        # are visible on the interface, not just in the logs.
+        try:
+            cfg = self._configs.get(session_id)
+            if cfg is not None:
+                latest = self._train_result_path(cfg.dataset_root)
+                if latest.exists():
+                    meta = json.loads(latest.read_text(encoding="utf-8"))
+                    if isinstance(meta, dict):
+                        payload["class_accuracies"] = meta.get("class_accuracies") or {}
+                        payload["warnings"] = list(meta.get("warnings") or [])
+        except Exception:
+            pass
+        return payload
 
     def _train_set(self, session_id: str, *, progress: Optional[float] = None, message: Optional[str] = None, error: Optional[str] = None, done: Optional[bool] = None, result_path: Optional[str] = None) -> None:
         with self._lock:
@@ -2556,9 +2792,9 @@ class RecordController:
                 seed=int(cfg_dict.get("seed") or 42),
                 optimizer=str(cfg_dict.get("optimizer") or "adam"),
                 learning_rate=float(cfg_dict.get("learning_rate") or 0.001),
-                conv1_filters=int(cfg_dict.get("conv1_filters") or 8),
-                conv2_filters=int(cfg_dict.get("conv2_filters") or 16),
-                dense_units=int(cfg_dict.get("dense_units") or 32),
+                conv1_filters=int(cfg_dict.get("conv1_filters") or 32),
+                conv2_filters=int(cfg_dict.get("conv2_filters") or 64),
+                dense_units=int(cfg_dict.get("dense_units") or 128),
                 representative_samples=int(cfg_dict.get("representative_samples") or 200),
                 preprocess_mode=str(cfg_dict.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL),
                 crop_mode=str(cfg_dict.get("crop_mode") or CROP_MODE_AUTO_SEARCH),
@@ -2627,6 +2863,8 @@ class RecordController:
                 "model_h_path": str(result.model_h_path),
                 "model_cpp_path": str(result.model_cpp_path),
                 "metrics": dict(result.metrics),
+                "class_accuracies": dict(result.class_accuracies) if result.class_accuracies else {},
+                "warnings": list(result.warnings) if result.warnings else [],
                 "img_size": int(cfg.img_size),
                 "color_mode": str(cfg.color_mode),
                 "preprocess_mode": str(cfg.preprocess_mode),
@@ -2636,8 +2874,25 @@ class RecordController:
                 "sample_preprocess": normalize_sample_preprocess_map(cfg.sample_preprocess),
                 "trained_dataset_dir": str(processed_dataset_dir),
             }
-            latest.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            self._train_set(session_id, progress=1.0, message="Done.", result_path=str(latest), done=True)
+            # Atomic write: a torn meta read by a concurrent /preview/predict
+            # used to 400 every prediction until the next training.
+            latest_tmp = latest.with_suffix(".json.tmp")
+            latest_tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            latest_tmp.replace(latest)
+            # Drop the cached preview interpreter AND the deployed-model pin
+            # so the very next predict loads the freshly trained model (the
+            # pin is re-stamped by the next export — that is its job, not
+            # to shadow every later training).
+            with self._lock:
+                self._preview.pop(session_id, None)
+            try:
+                (cfg.dataset_root.parent / "deployed.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            done_msg = "Done."
+            if result.warnings:
+                done_msg = "Done — WARNINGS: " + " | ".join(result.warnings)
+            self._train_set(session_id, progress=1.0, message=done_msg, result_path=str(latest), done=True)
         except Exception as e:
             self._train_set(session_id, error=str(e), done=True)
 
@@ -2864,7 +3119,7 @@ class RecordController:
                 xfer_s = frame_bytes * 10.0 / float(baud)
                 timeout = max(1.5, xfer_s * 2.5)
                 raw = reader.read_frame(timeout_s=timeout)
-                capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
+                capture_png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=int(cfg.serial_frame_side))
                 self._live_set(key, preview_png=capture_png, capture_png=capture_png, error="")
                 last_error = ""
             except Exception as e:
@@ -2886,15 +3141,11 @@ class RecordController:
         if not permission.allowed:
             self._live_set(key, error=permission.message or "Camera permission denied.")
             return
-        try:
-            import cv2
-        except Exception:
-            self._live_set(key, error="missing opencv-python")
-            return
-        cap, actual_index = _open_working_camera(int(cfg.webcam_index))
+        cap, actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
         if cap is None:
             self._live_set(key, error="Unable to open a readable webcam stream.")
             return
+        import cv2
         try:
             while self._live_running(key):
                 ok, frame = cap.read()
@@ -2916,7 +3167,7 @@ class RecordController:
                 if cfg.crop_box is not None:
                     x1, y1, x2, y2 = cfg.crop_box
                     img = img.crop((x1, y1, x2, y2))
-                img = img.resize((96, 96))
+                img = img.resize((int(cfg.img_size), int(cfg.img_size)))
                 self._live_set(key, preview_png=preview_png, capture_png=_to_png_bytes(img), error="")
                 time.sleep(0.06)
         finally:
@@ -2929,7 +3180,7 @@ class RecordController:
         if source == "device":
             return self.preview_serial_png(cfg.serial_port, int(cfg.serial_baud), str(cfg.serial_sync), frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
         if source == "webcam":
-            return self.preview_webcam_png(int(cfg.webcam_index))
+            return self.preview_webcam_png(int(cfg.webcam_index), webcam_id=cfg.webcam_id)
         return None
 
     def _capture_single(self, session_id: str, source: str) -> Optional[bytes]:
@@ -2944,7 +3195,7 @@ class RecordController:
                     raw = reader.read_frame()  # auto-scaled timeout (frame_size × baud)
                 finally:
                     reader.close()
-                return _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
+                return _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=int(cfg.serial_frame_side))
             except Exception:
                 return None
         if source == "webcam":
@@ -2955,7 +3206,7 @@ class RecordController:
                 import cv2
             except Exception:
                 return None
-            cap, _actual_index = _open_working_camera(int(cfg.webcam_index))
+            cap, _actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
             if cap is None:
                 return None
             ok, frame = cap.read()
@@ -2967,7 +3218,7 @@ class RecordController:
             if cfg.crop_box is not None:
                 x1, y1, x2, y2 = cfg.crop_box
                 img = img.crop((x1, y1, x2, y2))
-            img = img.resize((96, 96))
+            img = img.resize((int(cfg.img_size), int(cfg.img_size)))
             return _to_png_bytes(img)
         return None
 
@@ -2981,8 +3232,9 @@ class RecordController:
             reader.open()
             while self._is_recording(session_id):
                 raw = reader.read_frame()  # auto-scaled timeout (frame_size × 12 bits/byte / baud)
-                png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=96)
+                png = _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=int(cfg.serial_frame_side), out_side=int(cfg.serial_frame_side))
                 p = _save_png(cfg.dataset_root, class_name, png)
+                self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
                 with self._lock:
                     cur = self._active.get(session_id)
                     if cur is not None and cur.get("recording") == "1":
@@ -3014,7 +3266,7 @@ class RecordController:
                 self._active[session_id] = {"recording": "0", "error": "missing opencv-python"}
             return
 
-        cap = cv2.VideoCapture(int(cfg.webcam_index))
+        cap, _actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
         if not cap.isOpened():
             with self._lock:
                 self._active[session_id] = {"recording": "0", "error": "webcam open failed"}
@@ -3030,9 +3282,10 @@ class RecordController:
                 if cfg.crop_box is not None:
                     x1, y1, x2, y2 = cfg.crop_box
                     img = img.crop((x1, y1, x2, y2))
-                img = img.resize((96, 96))
+                img = img.resize((int(cfg.img_size), int(cfg.img_size)))
                 png = _to_png_bytes(img)
                 p = _save_png(cfg.dataset_root, class_name, png)
+                self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
                 with self._lock:
                     cur = self._active.get(session_id)
                     if cur is not None and cur.get("recording") == "1":
@@ -3118,26 +3371,97 @@ def _find_free_port(host: str) -> int:
         return int(s.getsockname()[1])
 
 
+
+
+def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
+    """Fresh camera list, enumerated at CALL time.
+
+    AVCaptureDevice order flips when virtual cameras (Iriun etc.) connect or
+    disconnect, so snapshots pair names with the wrong cv2 indices.  On
+    macOS each entry also carries the device uniqueID — capture by uniqueID
+    is stable, so consumers should prefer it over the positional index.
+    """
+    options: List[Dict[str, str]] = []
+    if sys.platform == "darwin":
+        try:
+            from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+
+            devices = list(AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo) or [])
+            for idx, dev in enumerate(devices[:max_count]):
+                name = str(dev.localizedName() or f"Camera {idx}")
+                options.append({"index": idx, "label": name, "unique_id": str(dev.uniqueID() or "")})
+        except Exception:
+            options = []
+            try:
+                import json as _json
+                proc = subprocess.run(
+                    ["system_profiler", "SPCameraDataType", "-json"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                if proc.returncode == 0:
+                    cameras = _json.loads(proc.stdout or "{}").get("SPCameraDataType", [])
+                    for idx, cam in enumerate(cameras[:max_count]):
+                        name = str(cam.get("_name") or cam.get("spcamera_model-id") or f"Camera {idx}")
+                        options.append({"index": idx, "label": name, "unique_id": str(cam.get("spcamera_unique-id") or "")})
+            except Exception:
+                pass
+    if not options:
+        for idx in range(max_count):
+            options.append({"index": idx, "label": f"Camera {idx}", "unique_id": ""})
+    return options
+
+
+def _resolve_webcam_index_from_unique_id(unique_id: Optional[str], max_count: int = 6) -> Optional[int]:
+    """Map a macOS AVCaptureDevice uniqueID to the CURRENT cv2 positional index.
+
+    cv2's AVFoundation backend enumerates the same device array, so the array
+    position IS the cv2 index at this moment.  Re-resolving at OPEN time (not
+    list time) is what keeps the name→index pairing correct when virtual
+    cameras (Iriun etc.) connect or disconnect.
+    """
+    if not unique_id or sys.platform != "darwin":
+        return None
+    try:
+        from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
+
+        devices = list(AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo) or [])
+        for idx, dev in enumerate(devices[:max_count]):
+            if str(dev.uniqueID() or "") == str(unique_id):
+                return idx
+    except Exception:
+        pass
+    return None
+
+
 def _send_json(req: BaseHTTPRequestHandler, obj: Dict[str, Any], status: int = 200, cors: bool = False) -> None:
     data = json.dumps(obj).encode("utf-8")
-    req.send_response(status)
-    if cors:
-        req.send_header("Access-Control-Allow-Origin", "*")
-    req.send_header("Content-Type", "application/json")
-    req.send_header("Content-Length", str(len(data)))
-    req.end_headers()
-    req.wfile.write(data)
+    try:
+        req.send_response(status)
+        if cors:
+            req.send_header("Access-Control-Allow-Origin", "*")
+        req.send_header("Content-Type", "application/json")
+        req.send_header("Content-Length", str(len(data)))
+        req.end_headers()
+        req.wfile.write(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        # Client disconnected mid-response (SPA aborts fetches with
+        # AbortController) — nothing to send to; ignore silently.
+        pass
 
 
 def _send_png(req: BaseHTTPRequestHandler, data: bytes, cors: bool = False, cache_control: str = "no-store, max-age=0") -> None:
-    req.send_response(200)
-    if cors:
-        req.send_header("Access-Control-Allow-Origin", "*")
-    req.send_header("Cache-Control", str(cache_control or "no-store, max-age=0"))
-    req.send_header("Content-Type", "image/png")
-    req.send_header("Content-Length", str(len(data)))
-    req.end_headers()
-    req.wfile.write(data)
+    try:
+        req.send_response(200)
+        if cors:
+            req.send_header("Access-Control-Allow-Origin", "*")
+        req.send_header("Cache-Control", str(cache_control or "no-store, max-age=0"))
+        req.send_header("Content-Type", "image/png")
+        req.send_header("Content-Length", str(len(data)))
+        req.end_headers()
+        req.wfile.write(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        # Client disconnected mid-response — ignore silently.
+        pass
 
 
 def _bytes_io(data: bytes):
@@ -3175,8 +3499,39 @@ def _preview_item_payload(path: Path) -> Dict[str, str]:
     }
 
 
-def _open_working_camera(preferred_index: int, max_probe_index: int = 3):
+def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, max_probe_index: int = 3):
     import cv2
+
+    if unique_id and sys.platform == "darwin":
+        # 1) macOS primary path: open by uniqueID directly.  Positional cv2
+        # indices drift when virtual cameras (Iriun, OBS, EpocCam) appear or
+        # disappear, so opening by ID is the only stable name->camera match.
+        try:
+            from mac_camera import open_macos_camera_by_unique_id
+
+            cap = open_macos_camera_by_unique_id(str(unique_id))
+        except Exception:
+            cap = None
+        if cap is not None:
+            resolved = _resolve_webcam_index_from_unique_id(unique_id)
+            return cap, int(resolved if resolved is not None else preferred_index)
+        # 2) ID path failed — do NOT silently fall back to probing every
+        # positional index on macOS.  Probing all 0..N cv2 indices is how we
+        # end up streaming from a virtual camera (e.g. Iriun showing
+        # "Please start Iris Webcam ..." text frames) when the user actually
+        # selected the built-in camera from the list.  Only retry the single
+        # resolved position that corresponds to this exact uniqueID.
+        resolved = _resolve_webcam_index_from_unique_id(unique_id)
+        if resolved is not None:
+            for _attempt in range(6):
+                cap = cv2.VideoCapture(int(resolved))
+                if cap.isOpened():
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        return cap, int(resolved)
+                cap.release()
+                time.sleep(0.3)
+        return None, None
 
     candidates = [int(preferred_index)] + [i for i in range(max_probe_index + 1) if i != int(preferred_index)]
     for idx in candidates:

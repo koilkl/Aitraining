@@ -14,6 +14,70 @@ import urllib.request
 import zipfile
 from html import escape as html_escape
 from pathlib import Path
+
+# ── Dev-mode hot reload of core modules ────────────────────────────────
+# Streamlit reruns only re-execute app.py — imported modules stay cached in
+# sys.modules, so code changes in trainer/record_controller/image_preprocess
+# etc. silently never take effect (the "parameters changed but nothing
+# happened" trap).  Module mtimes are tracked in a FILE (module-level
+# globals do not reliably survive streamlit reruns); when any core module
+# changes, all of them are dropped from sys.modules before the imports
+# below re-execute, and the cached RecordController is replaced (see the
+# guard after _get_record_controller — the old HTTP server is shut down).
+_HOT_MODULES = (
+    ("trainer", "trainer.py"),
+    ("record_controller", "record_controller.py"),
+    ("image_preprocess", "image_preprocess.py"),
+    ("serial_device", "serial_device.py"),
+    ("dataset_io", "dataset_io.py"),
+)
+
+
+def _hot_state_path() -> Path:
+    try:
+        env = os.environ.get("TFLITE_TRAINING_DATA_DIR")
+        base = Path(env).expanduser().resolve() if env else (
+            Path.home() / "Library" / "Application Support" / "TFLiteTraining"
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        return base / ".hot_reload_state.json"
+    except Exception:
+        return Path(tempfile.gettempdir()) / "tflite_training_hot_reload.json"
+
+
+def _hot_module_mtimes() -> Dict[str, float]:
+    base = Path(__file__).resolve().parent
+    out: Dict[str, float] = {}
+    for name, fname in _HOT_MODULES:
+        try:
+            out[name] = (base / fname).stat().st_mtime
+        except OSError:
+            pass
+    return out
+
+
+def _hot_reload_core_modules() -> bool:
+    current = _hot_module_mtimes()
+    state: Dict[str, float] = {}
+    sp = _hot_state_path()
+    try:
+        if sp.exists():
+            state = json.loads(sp.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    changed = bool(state) and [n for n, m in current.items() if state.get(n) != m]
+    try:
+        sp.write_text(json.dumps(current), encoding="utf-8")
+    except Exception:
+        pass
+    if changed:
+        # Drop every core module so the imports below bind fresh objects.
+        for name, _fname in _HOT_MODULES:
+            sys.modules.pop(name, None)
+    return bool(changed)
+
+
+_hot_reloaded_now = _hot_reload_core_modules()
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -299,7 +363,7 @@ def _init_session() -> None:
                 resumed_session_id = str(st.experimental_get_query_params().get("tm_session", [""])[0] or "")
             except Exception:
                 resumed_session_id = ""
-        st.session_state.session_id = resumed_session_id.strip() or uuid.uuid4().hex
+        st.session_state.session_id = resumed_session_id.strip() or _restore_last_session_id()
     if "imported" not in st.session_state:
         st.session_state.imported = None
     if "project_type" not in st.session_state:
@@ -364,6 +428,8 @@ def _init_session() -> None:
         st.session_state.tm_record_fps = 8.0
     if "tm_webcam_index" not in st.session_state:
         st.session_state.tm_webcam_index = 0
+    if "tm_webcam_id" not in st.session_state:
+        st.session_state.tm_webcam_id = ""
     if "tm_webcam_user_selected" not in st.session_state:
         st.session_state.tm_webcam_user_selected = False
     if "tm_record_crop_box" not in st.session_state:
@@ -388,6 +454,31 @@ def _init_session() -> None:
         st.session_state.tm_frontend_notice = ""
     if "tm_return_target" not in st.session_state:
         st.session_state.tm_return_target = "home"
+
+
+def _restore_last_session_id() -> str:
+    """Restore the last-used session id so app restarts keep the SAME
+    workspace (the trained model lives there — a fresh uuid on every
+    restart made it look like the model never updated)."""
+    try:
+        p = APP_DATA_DIR / "last_session_id.txt"
+        if p.exists():
+            sid = p.read_text(encoding="utf-8").strip()
+            if sid and len(sid) == 32 and (WORKSPACE_DIR / sid).exists():
+                return sid
+    except Exception:
+        pass
+    return uuid.uuid4().hex
+
+
+def _persist_session_id() -> None:
+    try:
+        sid = str(st.session_state.get("session_id") or "").strip()
+        if sid:
+            APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DATA_DIR / "last_session_id.txt").write_text(sid, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _session_workspace() -> Path:
@@ -436,6 +527,7 @@ def _reset_session_workspace() -> None:
     st.session_state.tm_open_source_kind = ""
     st.session_state.tm_frontend_notice = ""
     st.session_state.tm_webcam_index = 0
+    st.session_state.tm_webcam_id = ""
     st.session_state.tm_webcam_user_selected = False
 
 
@@ -1038,7 +1130,7 @@ def _render_new_project() -> None:
                 # #endregion
                 _begin_fresh_tm_session()
                 st.session_state.tm_return_target = "home"
-                controller = _get_record_controller()
+                controller = _ensure_fresh_record_controller()
                 controller.set_config(
                     st.session_state.session_id,
                     SessionConfig(
@@ -1049,6 +1141,8 @@ def _render_new_project() -> None:
                         serial_frame_side=int(st.session_state.tm_serial_frame_side),
                         serial_channels=int(st.session_state.tm_serial_channels),
                         webcam_index=int(st.session_state.tm_webcam_index),
+                        webcam_id=str(st.session_state.get("tm_webcam_id") or ""),
+                        img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96),
                         fps=float(st.session_state.tm_record_fps),
                         crop_box=st.session_state.tm_record_crop_box,
                     ),
@@ -1072,9 +1166,9 @@ def _render_new_project() -> None:
                         seed=int(getattr(prev_cfg, "seed", 42)),
                         optimizer=str(getattr(prev_cfg, "optimizer", "adam")),
                         learning_rate=float(train_cfg_state.get("learning_rate", getattr(prev_cfg, "learning_rate", 0.001))),
-                        conv1_filters=int(train_cfg_state.get("conv1_filters", getattr(prev_cfg, "conv1_filters", 8))),
-                        conv2_filters=int(train_cfg_state.get("conv2_filters", getattr(prev_cfg, "conv2_filters", 16))),
-                        dense_units=int(train_cfg_state.get("dense_units", getattr(prev_cfg, "dense_units", 32))),
+                        conv1_filters=int(train_cfg_state.get("conv1_filters", getattr(prev_cfg, "conv1_filters", 32))),
+                        conv2_filters=int(train_cfg_state.get("conv2_filters", getattr(prev_cfg, "conv2_filters", 64))),
+                        dense_units=int(train_cfg_state.get("dense_units", getattr(prev_cfg, "dense_units", 128))),
                         representative_samples=int(getattr(prev_cfg, "representative_samples", 200)),
                         preprocess_mode=str(train_cfg_state.get("preprocess_mode", getattr(prev_cfg, "preprocess_mode", "auto_by_label"))),
                         manual_roi=train_cfg_state.get("manual_roi", getattr(prev_cfg, "manual_roi", None)),
@@ -1119,11 +1213,15 @@ def _tm_train_recommendations(cfg: TrainConfig) -> Dict[str, Any]:
         "epochs": int(rec_kwargs["epochs"]),
         "learning_rate": float(rec_kwargs["learning_rate"]),
         "validation_split": float(rec_kwargs["validation_split"]),
+        "conv1_filters": int(rec_kwargs.get("conv1_filters", 32)),
+        "conv2_filters": int(rec_kwargs.get("conv2_filters", 64)),
+        "dense_units": int(rec_kwargs.get("dense_units", 128)),
         "reasons": {
             "batch": str(reasons[0]),
             "epochs": str(reasons[1]),
             "lr": str(reasons[2]),
             "val_split": str(reasons[3]),
+            "capacity": str(reasons[4]) if len(reasons) > 4 else "",
         },
     }
 
@@ -1141,6 +1239,10 @@ def _render_train_config(cfg: TrainConfig) -> TrainConfig:
     rec_epochs = min(int(rec_kwargs["epochs"]), 200)
     rec_lr = float(rec_kwargs["learning_rate"])
     rec_val_split = float(rec_kwargs["validation_split"])
+    rec_conv1 = int(rec_kwargs.get("conv1_filters", 32))
+    rec_conv2 = int(rec_kwargs.get("conv2_filters", 64))
+    rec_dense = int(rec_kwargs.get("dense_units", 128))
+    capacity_reason = str(reasons[4]) if len(reasons) > 4 else ""
 
     # Guard against saved values outside the widget ranges.
     cfg_batch = int(cfg.batch_size)
@@ -1171,6 +1273,8 @@ def _render_train_config(cfg: TrainConfig) -> TrainConfig:
         conv1_filters = st.selectbox("Conv1 filters", options=[4, 8, 16, 32], index=[4, 8, 16, 32].index(cfg.conv1_filters))
         conv2_filters = st.selectbox("Conv2 filters", options=[8, 16, 32, 64], index=[8, 16, 32, 64].index(cfg.conv2_filters))
         dense_units = st.selectbox("Dense units", options=[16, 32, 64, 128], index=[16, 32, 64, 128].index(cfg.dense_units))
+        if int(conv1_filters) != rec_conv1 or int(conv2_filters) != rec_conv2 or int(dense_units) != rec_dense:
+            st.caption(f"💡 Recommended: conv {rec_conv1}/{rec_conv2}, dense {rec_dense} — {capacity_reason}")
 
     if st.button("Use recommended settings", key="tm_use_recommended", use_container_width=True):
         st.session_state.train_cfg = TrainConfig(
@@ -1182,9 +1286,9 @@ def _render_train_config(cfg: TrainConfig) -> TrainConfig:
             seed=int(cfg.seed),
             optimizer=str(optimizer),
             learning_rate=rec_lr,
-            conv1_filters=int(conv1_filters),
-            conv2_filters=int(conv2_filters),
-            dense_units=int(dense_units),
+            conv1_filters=int(rec_conv1),
+            conv2_filters=int(rec_conv2),
+            dense_units=int(rec_dense),
             representative_samples=int(cfg.representative_samples),
             preprocess_mode=str(getattr(cfg, "preprocess_mode", "auto_by_label")),
             manual_roi=getattr(cfg, "manual_roi", None),
@@ -1318,31 +1422,15 @@ def _tm_render_shell_reflow_ping(reason: str = "image-project-mount") -> None:
 
 
 def _list_camera_options(max_count: int = 6) -> List[Dict[str, str]]:
-    options: List[Dict[str, str]] = []
-    if sys.platform == "darwin":
-        try:
-            from AVFoundation import AVCaptureDevice, AVMediaTypeVideo
-
-            devices = list(AVCaptureDevice.devicesWithMediaType_(AVMediaTypeVideo) or [])
-            for idx, dev in enumerate(devices[:max_count]):
-                name = str(dev.localizedName() or f"Camera {idx}")
-                options.append({"index": idx, "label": name})
-            #region debug-point E:camera-enumeration
-            _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera options enumerated via AVFoundation", {"platform": sys.platform, "options": options})
-            #endregion
-        except Exception:
-            options = []
-            #region debug-point E:camera-enumeration-failed
-            _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera enumeration via AVFoundation failed", {"platform": sys.platform})
-            #endregion
-    if not options:
-        for idx in range(max_count):
-            options.append({"index": idx, "label": f"Camera {idx}"})
-        #region debug-point E:camera-fallback
-        _dbg_capture_webcam_source("E", "pre-fix", "app.py:_list_camera_options", "[DEBUG] camera options fallback used", {"platform": sys.platform, "options": options})
-        #endregion
-    options = sorted(options, key=lambda item: (1 if _is_virtual_camera_label(str(item.get("label", ""))) else 0, int(item.get("index", 0))))
-    return options
+    # Fresh enumeration at call time (delegated to the shared helper so the
+    # HTTP /webcam/options route and the streamlit render use the same
+    # logic).  AVCaptureDevice order flips when virtual cameras connect or
+    # disconnect — never cache this list.
+    try:
+        from record_controller import list_webcam_options
+        return list_webcam_options(max_count=max_count)
+    except Exception:
+        return [{"index": i, "label": f"Camera {i}"} for i in range(max_count)]
 
 
 def _tm_sample_previews(classes: List[str], limit_per_class: Optional[int] = None) -> Dict[str, List[Dict[str, str]]]:
@@ -1406,6 +1494,19 @@ def _preferred_webcam_index(options: List[Dict[str, str]]) -> int:
         return 0
 
 
+def _load_persisted_webcam() -> Optional[Dict[str, Any]]:
+    """Last-used camera (uniqueID + index) persisted by the controller."""
+    try:
+        p = _tm_dataset_dir().parent / "webcam.json"
+        if p.exists():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw
+    except Exception:
+        pass
+    return None
+
+
 def _render_tm_old_frontend_html(
     *,
     port: int,
@@ -1424,6 +1525,7 @@ def _render_tm_old_frontend_html(
     current_serial_channels: int,
     webcam_options: List[Dict[str, str]],
     current_webcam_index: int,
+    current_webcam_id: str,
     sample_previews: Dict[str, List[Dict[str, str]]],
     initial_open_source_class: str,
     initial_open_source_kind: str,
@@ -1466,6 +1568,7 @@ def _render_tm_old_frontend_html(
         "preview_lum_thresh": int(st.session_state.get("tm_preview_lum_thresh") if st.session_state.get("tm_preview_lum_thresh") is not None else 100),
         "webcam_options": webcam_options,
         "current_webcam_index": int(current_webcam_index),
+        "current_webcam_id": str(current_webcam_id or ""),
         "sample_previews": sample_previews,
         "initial_open_source_class": str(initial_open_source_class or ""),
         "initial_open_source_kind": str(initial_open_source_kind or ""),
@@ -2316,7 +2419,7 @@ def _render_tm_old_frontend_html(
     .class-preprocess-thumb img {{
       width: 100%;
       aspect-ratio: 1 / 1;
-      object-fit: cover;
+      object-fit: contain;  /* preserve the original aspect ratio (letterbox) */
       border-radius: 8px;
       display: block;
       background: #eef3f9;
@@ -2663,7 +2766,7 @@ def _render_tm_old_frontend_html(
     .sample-thumb {{
       width: 100%;
       aspect-ratio: 1 / 1;
-      object-fit: cover;
+      object-fit: contain;  /* preserve the original aspect ratio (letterbox) */
       border-radius: 10px;
       background: #eef2f6;
       border: 1px solid rgba(0,0,0,0.06);
@@ -2984,6 +3087,7 @@ def _render_tm_old_frontend_html(
 
 <script>
 const STATE = {data};
+STATE.trainClassAccuracies = null;
 const baseUrl = `http://127.0.0.1:${{STATE.port}}`;
 if (window.__tmStageMark) window.__tmStageMark('script-start');
 function dbgEvent(hypothesisId, location, msg, data) {{
@@ -3262,6 +3366,8 @@ let holdNextToken = 0;
 const SAMPLE_PREVIEW_LIMIT = 12;
 const SAMPLE_STRIP_LIMIT = 3;
 const CLASS_PREPROCESS_WINDOW = 15;
+const UPLOAD_CONCURRENCY = 3;
+const UPLOAD_MAX_MB = 25;
 let sourceSwitchInFlight = false;
 let sourceSwitchClass = '';
 let sourceSwitchKind = '';
@@ -3271,10 +3377,12 @@ let sourceSettingsOpen = false;
 let previewIntervalMs = 80;
 let currentSerialPort = STATE.current_serial_port || '';
 let currentWebcamIndex = Number(STATE.current_webcam_index || 0);
+let currentWebcamUid = String(STATE.current_webcam_id || '');
 let currentSerialBaud = Number(STATE.current_serial_baud || 115200);
 let currentSerialSync = String(STATE.current_serial_sync || 'AA 55 AA');
 let currentSerialFrameSide = Number(STATE.current_serial_frame_side || 96);
 let currentSerialChannels = Number(STATE.current_serial_channels || 1);
+let directTensorStream = false;  // device streams the preprocessed tensor (mode gray)
 let previewInputOn = false;
 let previewSource = 'webcam';
 let previewPreprocessMode = 'auto_by_label';
@@ -4290,6 +4398,25 @@ function clearPreviewUploadState() {{
     return btoa(bin);
   }}
 async function pickPreviewUploadFile() {{
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_single_image_file) {{
+      try {{
+        const picked = await window.pywebview.api.pick_single_image_file();
+        if (picked && picked.b64) {{
+          previewUploadImageB64 = String(picked.b64 || '');
+          previewUploadImageSrc = `data:${{picked.mime || 'image/png'}};base64,${{picked.b64}}`;
+          previewUploadFilename = String(picked.name || 'upload');
+          previewSource = 'upload';
+          persistPreviewState();
+          renderPreviewSettings();
+          renderPreviewCard();
+          if (previewInputOn) await runPreviewUploadPrediction();
+          return true;
+        }}
+      }} catch (err) {{
+        toast(String(err && err.message ? err.message : err));
+      }}
+      return false;
+    }}
     return await new Promise((resolve) => {{
       const input = document.createElement('input');
       input.type = 'file';
@@ -4739,12 +4866,23 @@ async function captureSource() {{
     }}
   }}
 }}
-function toast(msg) {{
+function toast(msg, ms = 2400) {{
   const el = document.getElementById('toast');
   if (!msg) return;
   el.textContent = msg;
   el.style.display = 'block';
-  setTimeout(() => {{ el.style.display = 'none'; }}, 2400);
+  el._toastClearAt = Date.now() + Math.max(600, Number(ms || 0));
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => {{ el.style.display = 'none'; }}, Math.max(600, Number(ms || 0)));
+}}
+function bumpToastUntil(clearAt) {{
+  const el = document.getElementById('toast');
+  if (!el || !el.style.display || el.style.display === 'none') return;
+  const target = Math.max(Number(el._toastClearAt || 0), Number(clearAt || 0));
+  el._toastClearAt = target;
+  clearTimeout(toast._t);
+  const ms = Math.max(600, target - Date.now());
+  toast._t = setTimeout(() => {{ el.style.display = 'none'; }}, ms);
 }}
 function themeVar(name, fallback = '') {{
   try {{
@@ -4989,6 +5127,20 @@ function applyProjectState(state) {{
   previewInputOn = false;
   persistPreviewState();
   trainInFlight = false;
+  // Kill any in-flight train poll from the previous project and reset the
+  // train UI + preview pane so nothing stale survives the switch.
+  trainPollToken += 1;
+  showTrainProgress(false, 0, '');
+  const projPane = document.getElementById('previewPane');
+  if (projPane) {{ projPane.removeAttribute('data-ready'); }}
+  // Preview transforms/gates back to defaults; the model meta re-applies
+  // per-project settings on the next predict.
+  previewPreprocessMode = 'auto_by_label';
+  previewThreshUserModified = false;
+  previewOodSignPctMin = 0.3;
+  previewOodSignPctMax = 70.0;
+  previewOodMaxProbMin = 0.60;
+  previewOodEntropyRatioMax = 0.70;
   const cls = Array.isArray(s.classes) ? s.classes.slice() : [];
   STATE.classes = cls;
   const cnt = s.counts && typeof s.counts === 'object' ? s.counts : {{}};
@@ -5273,6 +5425,9 @@ async function startTrain() {{
       }}
       const p = Number(stData.progress || 0);
       const msg = String(stData.message || '');
+      if (stData.class_accuracies) {{
+        STATE.trainClassAccuracies = stData.class_accuracies;
+      }}
       showTrainProgress(true, p, msg);
       if (String(stData.done || '0') === '1') {{
         const err = String(stData.error || '');
@@ -5282,9 +5437,17 @@ async function startTrain() {{
         }} else {{
           STATE.export_enabled = true;
           renderTrainStatus();
+          // Force the preview pane to re-render (fresh static image / fresh
+          // predict loop) so the NEW model is visible immediately.
+          const trainedPane = document.getElementById('previewPane');
+          if (trainedPane) {{ trainedPane.removeAttribute('data-ready'); }}
           renderPreviewCard();
-          showTrainProgress(true, 1.0, 'Done.');
-          toast('Training complete.');
+          showTrainProgress(true, 1.0, msg || 'Done.');
+          if (msg && msg.indexOf('WARNINGS') >= 0) {{
+            showTrainWarningModal(msg);
+          }} else {{
+            toast('Training complete.');
+          }}
           const exportBtn = document.getElementById('exportBtn');
           if (exportBtn) exportBtn.disabled = false;
         }}
@@ -5318,33 +5481,97 @@ function setAction(action, params) {{
   }}
   navigateParent(u.toString());
 }}
-async function uploadFiles(className, files) {{
-  if (!files || files.length === 0) return;
-  let uploaded = 0;
-  for (const f of files) {{
-    const buf = await f.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    let bin = '';
-    for (let i=0; i<bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    const b64 = btoa(bin);
+async function fileToBase64(f) {{
+  const buf = await f.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {{
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }}
+  return btoa(bin);
+}}
+async function uploadOneFile(className, f) {{
+  const maxBytes = Number(UPLOAD_MAX_MB || 25) * 1024 * 1024;
+  if (Number(f.size || 0) > maxBytes) {{
+    return {{ ok: false, name: String(f.name || 'file'), error: `File too large (>${{UPLOAD_MAX_MB}}MB).` }};
+  }}
+  try {{
+    const b64 = await fileToBase64(f);
     const res = await fetch(`${{baseUrl}}/upload`, {{
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify({{session: STATE.session, class: className, image_b64: b64}})
+      body: JSON.stringify({{session: STATE.session, class: className, image_b64: b64, filename: String(f.name || '')}})
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (res.ok && data.ok === '1') {{
-      uploaded += 1;
-      if (data.image_b64) prependSamplePreview(className, {{src: `data:image/png;base64,${{data.image_b64}}`, filename: String(data.filename || '')}});
-      else prependSamplePreview(className, {{src: `data:image/*;base64,${{b64}}`, filename: String(data.filename || '')}});
-      incrementSampleCount(className, 1);
-      recomputeTrainEnabled();
+      const filename = String(data.filename || f.name || '');
+      const thumb = typeof data.thumb_b64 === 'string' && data.thumb_b64 ? String(data.thumb_b64) : '';
+      return {{
+        ok: true,
+        name: String(f.name || filename),
+        filename,
+        thumb_b64: thumb,
+      }};
     }}
+    const why = String(data && data.error ? data.error : '');
+    return {{ ok: false, name: String(f.name || 'file'), error: why || 'Upload rejected by server.' }};
+  }} catch (e) {{
+    return {{ ok: false, name: String(f.name || 'file'), error: String(e && e.message ? e.message : e) }};
   }}
+}}
+async function uploadFiles(className, files) {{
+  if (!files || files.length === 0) return;
+  const all = Array.from(files);
+  const total = all.length;
+  let uploaded = 0;
+  const failed = [];
+  let next = 0;
+  const progressUntil = Date.now() + 120000;
+  const report = (done) => {{
+    const msg = `Uploading ${{className}}: ${{done}}/${{total}}${{failed.length ? ` (failed ${{failed.length}})` : ''}}…`;
+    toast(msg, 20000);
+    bumpToastUntil(progressUntil);
+  }};
+  const worker = async () => {{
+    while (next < total) {{
+      const i = next++;
+      const f = all[i];
+      try {{
+        const r = await uploadOneFile(className, f);
+        if (r && r.ok) {{
+          uploaded += 1;
+          if (r.thumb_b64) {{
+            prependSamplePreview(className, {{src: `data:image/png;base64,${{r.thumb_b64}}`, filename: String(r.filename || r.name || '')}});
+          }}
+          incrementSampleCount(className, 1);
+          recomputeTrainEnabled();
+        }} else {{
+          const why = String(r && r.error ? r.error : '');
+          const fname = String(r && r.name ? r.name : 'file');
+          failed.push(why ? `${{fname}} (${{why}})` : fname);
+          toast(`Upload failed: ${{fname}}${{why ? ' — ' + why : ''}}`, 5000);
+        }}
+      }} catch (e) {{
+        const fname = String(f && f.name ? f.name : 'file');
+        failed.push(fname);
+        toast(`Upload failed: ${{fname}}`, 4000);
+      }} finally {{
+        report(next);
+      }}
+    }}
+  }};
+  report(0);
+  const workers = Math.max(1, Math.min(Number(UPLOAD_CONCURRENCY || 3), total));
+  const tasks = [];
+  for (let i = 0; i < workers; i += 1) tasks.push(worker());
+  await Promise.all(tasks);
   syncTrainUi();
   refreshTrainRec();
   if (openSourceClass === className) updateOpenSamplesPanel(className);
-  toast(uploaded > 0 ? `Uploaded ${{uploaded}} image(s).` : 'Upload failed.');
+  const lines = [`Uploaded ${{uploaded}}/${{total}} image(s) to ${{className}}.`];
+  if (failed.length) lines.push(`Failed ${{failed.length}}: ${{failed.slice(0, 8).join('; ')}}${{failed.length > 8 ? '; ...' : ''}}`);
+  toast(lines.join(' '), Math.max(4000, 2000 + Math.min(6000, failed.length * 600)));
 }}
 function cssSafe(name) {{
   return String(name).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -5481,10 +5708,11 @@ async function startHoldCapture() {{
           if (seq > holdSeq && nextData.image_b64) {{
             holdSeq = seq;
             try {{
-              const img = document.getElementById(`sourcePreview-${{cssSafe(holdRecordClass)}}`);
+              // Progress goes to the note only — NEVER overwrite the live
+              // camera view with the 96×96 processed sample (that made the
+              // view window show the tiny resized image during hold).
               const note = document.getElementById(`sourceNote-${{cssSafe(holdRecordClass)}}`);
-              if (img) img.src = `data:image/png;base64,${{nextData.image_b64}}`;
-              if (note) note.textContent = '';
+              if (note) note.textContent = `Captured: ${{String(nextData.count || '')}}`;
             }} catch (e) {{}}
             prependSamplePreview(holdRecordClass, {{
               src: `data:image/png;base64,${{nextData.image_b64}}`,
@@ -5580,15 +5808,16 @@ async function refreshSerialPorts(shouldRerender = true, targetSelectId = '') {{
     toast(String(err && err.message ? err.message : err));
   }}
 }}
-function buildWebcamOptions(selected) {{
+function buildWebcamOptions(selected, selectedUid) {{
   const cams = Array.isArray(STATE.webcam_options) ? STATE.webcam_options : [];
   dbgEvent('E', 'app.py:buildWebcamOptions', '[DEBUG] frontend webcam options', {{selected, cams}});
   const opts = ['<option value="">Select camera</option>'];
   for (const c of cams) {{
     const idx = Number(c.index);
     const label = String(c.label || `Camera ${{idx}}`);
-    const sel = idx === Number(selected) ? ' selected' : '';
-    opts.push(`<option value="${{idx}}"${{sel}}>${{label}}</option>`);
+    const uid = String(c.unique_id || '');
+    const sel = (uid && uid === selectedUid) || (!selectedUid && idx === Number(selected)) ? ' selected' : '';
+    opts.push(`<option value="${{idx}}" data-uid="${{uid}}"${{sel}}>${{label}}</option>`);
   }}
   return opts.join('');
 }}
@@ -5647,10 +5876,10 @@ function buildSourceSettingsMarkup(className) {{
       <div class="source-settings-grid">
         <label>
           Camera
-          <select id="sourceCamera-${{cssSafe(className)}}">${{buildWebcamOptions(currentWebcamIndex)}}</select>
+          <select id="sourceCamera-${{cssSafe(className)}}">${{buildWebcamOptions(currentWebcamIndex, currentWebcamUid)}}</select>
         </label>
         <label>
-          Preview Refresh
+          Preview Rate
           <select id="sourcePreviewRate-${{cssSafe(className)}}">
             <option value="60"${{Number(previewIntervalMs) === 60 ? ' selected' : ''}}>Fast</option>
             <option value="80"${{Number(previewIntervalMs) === 80 ? ' selected' : ''}}>Balanced</option>
@@ -5751,6 +5980,23 @@ async function changeSerialFrameSide(className, value) {{
     syncSourceActionButtons(className);
   }}
 }}
+async function changeDirectTensorStream(value) {{
+  directTensorStream = !!value;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&direct_tensor_stream=${{directTensorStream ? '1' : '0'}}`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update device stream mode.');
+    directTensorStream = String(data.direct_tensor_stream || '0') === '1';
+    if (openSourceClass && openSourceKind === 'device') {{
+      try {{
+        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=device`);
+      }} catch (e) {{}}
+      await ensureOpenSourceLive();
+    }}
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 async function changeSerialChannels(className, value) {{
   const nextCh = Number(value || currentSerialChannels || 1);
   currentSerialChannels = nextCh;
@@ -5801,8 +6047,11 @@ async function applySourceSettings(className) {{
       const camEl = document.getElementById(`sourceCamera-${{cssSafe(className)}}`);
       const rateEl = document.getElementById(`sourcePreviewRate-${{cssSafe(className)}}`);
       const nextCam = camEl ? camEl.value : String(currentWebcamIndex);
-      if (String(nextCam) !== String(currentWebcamIndex)) {{
-        await changeWebcamIndex(className, nextCam);
+      const nextUid = camEl && camEl.selectedOptions && camEl.selectedOptions[0] ? String(camEl.selectedOptions[0].dataset.uid || '') : '';
+      const indexChanged = String(nextCam) !== String(currentWebcamIndex);
+      const uidChanged = String(nextUid) !== String(currentWebcamUid || '');
+      if (indexChanged || uidChanged) {{
+        await changeWebcamIndex(className, nextCam, nextUid);
       }}
       previewIntervalMs = Number(rateEl ? rateEl.value : previewIntervalMs || 80);
       if (openSourceClass === className && openSourceKind === 'webcam') startPreviewLoop();
@@ -5847,7 +6096,21 @@ async function changeDevicePort(className, value) {{
     syncSourceActionButtons(className);
   }}
 }}
-async function changeWebcamIndex(className, value) {{
+async function refreshWebcamOptions() {{
+  try {{
+    const res = await fetch(`${{baseUrl}}/webcam/options`);
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1' || !Array.isArray(data.options)) return;
+    STATE.webcam_options = data.options;
+    const camSel = document.getElementById('previewCamera');
+    if (camSel) camSel.innerHTML = buildWebcamOptions(currentWebcamIndex, currentWebcamUid);
+    for (const cls of (Array.isArray(STATE.classes) ? STATE.classes : [])) {{
+      const sel = document.getElementById(`sourceCamera-${{cssSafe(cls)}}`);
+      if (sel) sel.innerHTML = buildWebcamOptions(currentWebcamIndex, currentWebcamUid);
+    }}
+  }} catch (e) {{}}
+}}
+async function changeWebcamIndex(className, value, uid) {{
   if (captureInFlight && openSourceClass === className) {{
     toast('Wait for the current capture to finish before switching camera.');
     syncSourceActionButtons(className);
@@ -5857,13 +6120,14 @@ async function changeWebcamIndex(className, value) {{
     await stopHoldCapture();
   }}
   currentWebcamIndex = Number(value || 0);
+  currentWebcamUid = String(uid || '');
   STATE.current_webcam_index = currentWebcamIndex;
   sourceSwitchInFlight = true;
   sourceSwitchClass = className;
   sourceSwitchKind = 'webcam';
   syncSourceActionButtons(className);
   try {{
-    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}`);
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}&webcam_id=${{encodeURIComponent(currentWebcamUid)}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update webcam.');
     if (openSourceClass === className && openSourceKind === 'webcam') {{
@@ -6048,6 +6312,10 @@ async function refreshPreviewPrediction(token) {{
   }} catch (err) {{
     if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
     if (note) note.textContent = String(err && err.message ? err.message : err);
+    // A failed predict must not leave the previous model's bars on screen
+    // (it reads as "the old model is still running").
+    const outHost = document.getElementById('previewOutput');
+    if (outHost) outHost.innerHTML = '';
   }} finally {{
     previewPredictInFlight = false;
     previewPredictController = null;
@@ -6077,11 +6345,12 @@ function updatePreviewRoiOverlay(crop, isManual) {{
   const overlay = document.getElementById('previewRoiOverlay');
   if (!overlay) return;
   const valid = Array.isArray(crop) && crop.length === 4;
-  // Green/blue box shows on the ORIGINAL frame when both toggles are OFF.
-  // ROI ON alone displays the jumping CROP image itself (the search box
-  // effect); Orig ON shows the thresholded view — a box there would be
-  // spatially misplaced.
-  const show = valid && !previewShowRoi && !previewShowRaw;
+  // Green/blue box shows whenever the ROI toggle is OFF — on the default
+  // frame AND on the Orig view (the Orig image keeps the full frame's
+  // aspect ratio, so the normalized box maps onto it exactly).  ROI ON
+  // alone displays the jumping CROP image itself (the search box effect)
+  // and the overlay is hidden there.
+  const show = valid && !previewShowRoi;
   if (!show) {{
     overlay.style.display = 'none';
     return;
@@ -6182,12 +6451,13 @@ function startPreviewPredictLoop() {{
     Math.max(50, Number(previewIntervalMs || 80))
   );
 }}
-async function setWebcamIndexGlobal(value) {{
+async function setWebcamIndexGlobal(value, uid) {{
   const next = Number(value || 0);
   currentWebcamIndex = next;
+  currentWebcamUid = String(uid || '');
   STATE.current_webcam_index = currentWebcamIndex;
   try {{
-    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}`);
+    const res = await fetch(`${{baseUrl}}/live/config?session=${{encodeURIComponent(STATE.session)}}&webcam_index=${{encodeURIComponent(currentWebcamIndex)}}&webcam_id=${{encodeURIComponent(currentWebcamUid)}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to update webcam.');
     if (openSourceKind === 'webcam') {{
@@ -6392,10 +6662,10 @@ function buildPreviewSettingsMarkup() {{
         ${{oodFields}}
         <label>
           Camera
-          <select id="previewCamera">${{buildWebcamOptions(currentWebcamIndex)}}</select>
+          <select id="previewCamera">${{buildWebcamOptions(currentWebcamIndex, currentWebcamUid)}}</select>
         </label>
         <label>
-          Preview Refresh
+          Preview Rate
           <select id="previewPreviewRate">
             <option value="60"${{Number(previewIntervalMs) === 60 ? ' selected' : ''}}>Fast</option>
             <option value="80"${{Number(previewIntervalMs) === 80 ? ' selected' : ''}}>Balanced</option>
@@ -6471,7 +6741,13 @@ function renderPreviewSettings() {{
       }} else if (previewSource === 'webcam') {{
         const camEl = document.getElementById('previewCamera');
         const rateEl = document.getElementById('previewPreviewRate');
-        if (camEl && String(camEl.value) !== String(currentWebcamIndex)) await setWebcamIndexGlobal(camEl.value);
+        const nextCam = camEl ? camEl.value : String(currentWebcamIndex);
+        const nextUid = camEl && camEl.selectedOptions && camEl.selectedOptions[0] ? String(camEl.selectedOptions[0].dataset.uid || '') : '';
+        const indexChanged = String(nextCam) !== String(currentWebcamIndex);
+        const uidChanged = String(nextUid) !== String(currentWebcamUid || '');
+        if (indexChanged || uidChanged) {{
+          await setWebcamIndexGlobal(nextCam, nextUid);
+        }}
         if (rateEl) previewIntervalMs = Number(rateEl.value || previewIntervalMs || 80);
       }}
       const oodSignMinEl = document.getElementById('previewOodSignPctMin');
@@ -6503,10 +6779,36 @@ function renderPreviewSettings() {{
     }}
   }};
 }}
+function showTrainWarningModal(text) {{
+  let m = document.getElementById('trainWarningModal');
+  if (!m) {{
+    m = document.createElement('div');
+    m.id = 'trainWarningModal';
+    m.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#fff;border:2px solid #c62828;border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,0.35);padding:20px 24px;max-width:560px;width:90%;z-index:10000;font-size:14px;line-height:1.7;color:#333;';
+    document.body.appendChild(m);
+  }}
+  const lines = String(text || '').split('|').map((l) => l.trim()).filter(Boolean);
+  m.innerHTML =
+    '<div style="font-weight:700;color:#c62828;margin-bottom:10px;font-size:15px;">Training Warnings</div>' +
+    lines.map((l) => '<div style="margin-bottom:6px;">' + String(l).replace(/</g, '&lt;') + '</div>').join('') +
+    '<button style="margin-top:12px;padding:8px 18px;border:0;border-radius:8px;background:#c62828;color:#fff;cursor:pointer;font-weight:600;" onclick="this.parentNode.remove()">Close</button>';
+}}
 function renderTrainStatus() {{
   const el = document.getElementById('trainStatus');
   if (!el) return;
   el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
+  const accs = STATE.trainClassAccuracies || null;
+  if (STATE.export_enabled && accs && Object.keys(accs).length > 0) {{
+    const parts = [];
+    for (const k of Object.keys(accs)) {{
+      const v = Number(accs[k]);
+      parts.push(`${{k}} ${{Math.round(v * 100)}}%`);
+    }}
+    el.textContent = 'Model Trained — ' + parts.join(', ');
+    el.style.color = parts.some((t) => Number(t.split(' ').pop().replace('%','')) < 80) ? '#c62828' : '#2e7d32';
+  }} else {{
+    el.style.color = '';
+  }}
 }}
 function bindPreviewThreshBar() {{
   const darkSlider = document.getElementById('previewDarkSlider');
@@ -6605,10 +6907,23 @@ function renderPreviewCard() {{
   roiToggle.checked = !!previewShowRoi;
   bindPreviewThreshBar();
   renderPreviewSettings();
+  const staticSrc = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
   if (!pane.dataset.ready) {{
-    const src = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
-    pane.innerHTML = src ? `<img id="previewImage" src="${{src}}" alt="Preview"/>` : '<div class="preview-empty">Turn on Input to preview live predictions.</div>';
+    pane.innerHTML = staticSrc
+      ? `<div class="preview-stage"><img id="previewImage" src="${{staticSrc}}" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`
+      : '<div class="preview-empty">Turn on Input to preview live predictions.</div>';
     pane.dataset.ready = '1';
+  }} else if (!previewInputOn) {{
+    // Input OFF: hold the last live frame on screen (closing Input should
+    // freeze the most recent prediction, not swap in an old sample image).
+    // The project's static sample image is only used when the pane was
+    // just (re)initialized — fresh load or project reopen — and has no
+    // image yet.
+    const img = document.getElementById('previewImage');
+    if (img && !img.getAttribute('src')) {{
+      if (staticSrc) img.src = staticSrc;
+    }}
+    updatePreviewRoiOverlay(null, false);
   }}
   bindLayoutImageObservers(pane);
   scheduleLayoutResync();
@@ -7423,7 +7738,39 @@ function render() {{
       sourceSettingsOpen = false;
       render();
     }};
-    if (uploadPick) uploadPick.onclick = () => {{
+    if (uploadPick) uploadPick.onclick = async () => {{
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_upload_files) {{
+        // Packaged app: the SPA <input type="file"> does not open a dialog
+        // inside pywebview on macOS — use the desktop shell's native picker.
+        try {{
+          const results = await window.pywebview.api.pick_upload_files(baseUrl, STATE.session, openSourceClass);
+          const total = Array.isArray(results) ? results.length : 0;
+          if (!total) return;
+          let uploaded = 0;
+          const failed = [];
+          for (const r of (results || [])) {{
+            const fname = String((r && r.filename) || 'file');
+            if (r && r.ok) {{
+              uploaded += 1;
+              const thumb = String((r && r.thumb_b64) || (r && r.image_b64) || '');
+              if (thumb) prependSamplePreview(openSourceClass, {{src: `data:image/png;base64,${{thumb}}`, filename: String(r.saved_filename || fname)}});
+              incrementSampleCount(openSourceClass, 1);
+            }} else {{
+              const why = String((r && r.error) || '');
+              failed.push(why ? `${{fname}} (${{why}})` : fname);
+              toast(`Upload failed: ${{fname}}${{why ? ' — ' + why : ''}}`, 5000);
+            }}
+          }}
+          recomputeTrainEnabled();
+          syncTrainUi();
+          const lines = [`Uploaded ${{uploaded}}/${{total}} sample(s) to ${{openSourceClass}}.`];
+          if (failed.length) lines.push(`Failed ${{failed.length}}: ${{failed.slice(0, 8).join('; ')}}${{failed.length > 8 ? '; ...' : ''}}`);
+          toast(lines.join(' '), Math.max(4000, 2000 + Math.min(8000, failed.length * 600)));
+        }} catch (e) {{
+          toast(String(e && e.message ? e.message : e), 6000);
+        }}
+        return;
+      }}
       const input = document.createElement('input');
       input.type = 'file';
       input.accept = 'image/*';
@@ -7522,7 +7869,7 @@ def _render_image_project() -> None:
     _dbg_open_project_layout("A", "pre-fix", "app.py:_render_image_project", "[DEBUG] render image project page", {"session": str(st.session_state.get("session_id", "")), "project_type": str(st.session_state.get("project_type", "")), "query": dict(st.query_params) if hasattr(st, "query_params") else {}, "workspace": str(_session_workspace())})
     # #endregion
     inject_teachable_style()
-    controller = _get_record_controller()
+    controller = _ensure_fresh_record_controller()
     webcam_options = _list_camera_options()
     preferred_webcam_index = _preferred_webcam_index(webcam_options)
     # ── Pull the SPA's AJAX-written live config BEFORE anything writes to
@@ -7541,15 +7888,30 @@ def _render_image_project() -> None:
         st.session_state.tm_serial_frame_side = int(_live_cfg.serial_frame_side)
         st.session_state.tm_serial_channels = int(_live_cfg.serial_channels)
         st.session_state.tm_webcam_index = int(_live_cfg.webcam_index)
+        st.session_state.tm_webcam_id = str(_live_cfg.webcam_id or "")
         st.session_state.tm_webcam_user_selected = True
     else:
-        # Fresh session (no controller config yet): no SPA choices exist,
-        # so fall back to the preferred non-virtual camera as before.
-        current_webcam_label = next((str(item.get("label", "")) for item in webcam_options if int(item.get("index", 0)) == int(st.session_state.tm_webcam_index)), "")
-        if (not st.session_state.get("tm_webcam_user_selected", False)) and webcam_options:
-            st.session_state.tm_webcam_index = int(preferred_webcam_index)
-        elif webcam_options and _is_virtual_camera_label(current_webcam_label):
-            st.session_state.tm_webcam_index = int(preferred_webcam_index)
+        # Fresh session (no controller config yet): restore the last-used
+        # camera from the workspace stamp (uniqueID → current index), and
+        # only fall back to the preferred non-virtual camera when nothing
+        # was ever chosen.  Auto-selecting "the first camera" here was the
+        # bug — for Iriun users that default is the wrong feed.
+        restored_index = None
+        persisted = _load_persisted_webcam()
+        if persisted and str(persisted.get("webcam_id") or ""):
+            from record_controller import _resolve_webcam_index_from_unique_id
+
+            restored_index = _resolve_webcam_index_from_unique_id(str(persisted["webcam_id"]))
+            if restored_index is not None:
+                st.session_state.tm_webcam_index = int(restored_index)
+                st.session_state.tm_webcam_id = str(persisted["webcam_id"])
+                st.session_state.tm_webcam_user_selected = True
+        if restored_index is None:
+            current_webcam_label = next((str(item.get("label", "")) for item in webcam_options if int(item.get("index", 0)) == int(st.session_state.tm_webcam_index)), "")
+            if (not st.session_state.get("tm_webcam_user_selected", False)) and webcam_options:
+                st.session_state.tm_webcam_index = int(preferred_webcam_index)
+            elif webcam_options and _is_virtual_camera_label(current_webcam_label):
+                st.session_state.tm_webcam_index = int(preferred_webcam_index)
     serial_ports = [
         {
             "device": p.device,
@@ -7570,6 +7932,8 @@ def _render_image_project() -> None:
             serial_frame_side=int(st.session_state.tm_serial_frame_side),
             serial_channels=int(st.session_state.tm_serial_channels),
             webcam_index=int(st.session_state.tm_webcam_index),
+            webcam_id=str(st.session_state.get("tm_webcam_id") or ""),
+            img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96),
             fps=float(st.session_state.tm_record_fps),
             crop_box=st.session_state.tm_record_crop_box,
         ),
@@ -7825,6 +8189,7 @@ def _render_image_project() -> None:
         current_serial_channels=int(st.session_state.tm_serial_channels),
         webcam_options=webcam_options,
         current_webcam_index=int(st.session_state.tm_webcam_index),
+        current_webcam_id=str(st.session_state.get("tm_webcam_id") or ""),
         sample_previews=sample_previews,
         initial_open_source_class=initial_open_source_class,
         initial_open_source_kind=initial_open_source_kind,
@@ -7851,7 +8216,7 @@ def _render_classified_import_page() -> None:
     top_left, top_right = st.columns([1, 5])
     with top_left:
         if st.button("← Back", key="tm_back_from_classified"):
-            _tm_teardown_controller_session(_get_record_controller(), str(st.session_state.get("session_id", "")))
+            _tm_teardown_controller_session(_ensure_fresh_record_controller(), str(st.session_state.get("session_id", "")))
             _reset_session_workspace()
             _tm_clear_query_params()
             st.rerun()
@@ -7947,6 +8312,31 @@ def _tm_dataset_dir() -> Path:
 def _get_record_controller() -> RecordController:
     c = RecordController()
     c.start()
+    try:
+        c._hot_mtime = _hot_module_mtimes().get("record_controller")
+    except Exception:
+        pass
+    return c
+
+
+# Hot-reload support: the cached controller instance must be replaced when
+# record_controller.py changed.  The instance itself carries the module
+# mtime it was built from, so this is a no-op on every normal rerun.
+def _ensure_fresh_record_controller() -> RecordController:
+    c = _get_record_controller()
+    want = _hot_module_mtimes().get("record_controller")
+    if want is None:
+        return c
+    if getattr(c, "_hot_mtime", None) == want:
+        return c
+    c._hot_mtime = want
+    try:
+        c.stop()  # shut down the old HTTP server (frees its port)
+    except Exception:
+        pass
+    _get_record_controller.clear()
+    c = _get_record_controller()
+    c._hot_mtime = want
     return c
 
 
@@ -7972,7 +8362,7 @@ def _img_to_png_bytes(img) -> bytes:
     return bio.getvalue()
 
 
-def _preprocess_image_to_96x96_gray(png_bytes: bytes, crop_box: Optional[Tuple[int, int, int, int]] = None) -> bytes:
+def _preprocess_image_to_96x96_gray(png_bytes: bytes, crop_box: Optional[Tuple[int, int, int, int]] = None, img_size: int = 96) -> bytes:
     import io
     from PIL import Image
 
@@ -7980,7 +8370,7 @@ def _preprocess_image_to_96x96_gray(png_bytes: bytes, crop_box: Optional[Tuple[i
     if crop_box is not None:
         x1, y1, x2, y2 = crop_box
         im = im.crop((x1, y1, x2, y2))
-    im = im.resize((96, 96))
+    im = im.resize((int(img_size), int(img_size)))
     out = io.BytesIO()
     im.save(out, format="PNG")
     return out.getvalue()
@@ -8051,7 +8441,7 @@ def _render_crop_ui() -> None:
             y1 = max(0, min(h - 1, y1))
             x2 = max(x1 + 1, min(w, x2))
             y2 = max(y1 + 1, min(h, y2))
-            out_png = _preprocess_image_to_96x96_gray(png_bytes, crop_box=(x1, y1, x2, y2))
+            out_png = _preprocess_image_to_96x96_gray(png_bytes, crop_box=(x1, y1, x2, y2), img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96))
             _save_sample_png(class_name, out_png)
             st.session_state.tm_pending_image = None
             st.session_state.tm_pending_class = None
@@ -8069,7 +8459,7 @@ def _render_tm_class_panel() -> None:
     if "tm_edit_class_idx" not in st.session_state:
         st.session_state.tm_edit_class_idx = -1
 
-    controller = _get_record_controller()
+    controller = _ensure_fresh_record_controller()
     controller.set_config(
         st.session_state.session_id,
         SessionConfig(
@@ -8080,6 +8470,8 @@ def _render_tm_class_panel() -> None:
             serial_frame_side=int(st.session_state.tm_serial_frame_side),
             serial_channels=int(st.session_state.tm_serial_channels),
             webcam_index=int(st.session_state.tm_webcam_index),
+            webcam_id=str(st.session_state.get("tm_webcam_id") or ""),
+            img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96),
             fps=float(st.session_state.tm_record_fps),
             crop_box=st.session_state.tm_record_crop_box,
         ),
@@ -8150,7 +8542,7 @@ def _render_tm_class_panel() -> None:
                         cam = st.camera_input("Webcam", key=f"tm_cam_{idx}", label_visibility="collapsed")
                         if cam is not None:
                             png = _img_to_png_bytes(cam.getvalue())
-                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None, img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96))
                             _save_sample_png(name, out_png)
                             st.rerun()
             with btn_b:
@@ -8165,7 +8557,7 @@ def _render_tm_class_panel() -> None:
                     if up:
                         for f in up:
                             png = _img_to_png_bytes(f.getvalue())
-                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None, img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96))
                             _save_sample_png(name, out_png)
                         st.rerun()
             with btn_c:
@@ -8185,7 +8577,7 @@ def _render_tm_class_panel() -> None:
                                 st.session_state.tm_pending_image = png
                                 st.session_state.tm_pending_class = name
                                 st.rerun()
-                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None)
+                            out_png = _preprocess_image_to_96x96_gray(png, crop_box=None, img_size=int(getattr(st.session_state.get("train_cfg"), "img_size", 96) or 96))
                             _save_sample_png(name, out_png)
                         st.rerun()
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -8442,6 +8834,7 @@ def _render_tm_preview_export_panel() -> None:
 
 
 def main() -> None:
+    _persist_session_id()
     st.set_page_config(page_title="TF Lite Training", layout="wide")
     _init_session()
 

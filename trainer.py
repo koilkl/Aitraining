@@ -32,9 +32,13 @@ class TrainConfig:
     seed: int = 42
     optimizer: str = "adam"
     learning_rate: float = 0.0016
-    conv1_filters: int = 16
-    conv2_filters: int = 32
-    dense_units: int = 64
+    # Larger defaults (32/64/128 conv, 128 dense) — the old 16/32/64
+    # architecture silently collapsed to a single class on small stroke-style
+    # datasets (END -> LEFT confusion, val_acc 1.0 while one class scored 30 %
+    # on its own training images).
+    conv1_filters: int = 32
+    conv2_filters: int = 64
+    dense_units: int = 128
     representative_samples: int = 200
     preprocess_mode: str = PREPROCESS_MODE_AUTO_BY_LABEL
     crop_mode: str = CROP_MODE_AUTO_SEARCH  # auto shadow-search box = model input (device BG_ENABLE_FOCUS_SEARCH=1)
@@ -56,6 +60,8 @@ class TrainResult:
     model_h_path: Path
     model_cpp_path: Path
     metrics: Dict[str, float]
+    class_accuracies: Optional[Dict[str, float]] = None
+    warnings: Optional[List[str]] = None
 
 
 def _channels(color_mode: str) -> int:
@@ -311,6 +317,72 @@ def convert_to_int8_tflite(model: tf.keras.Model, train_ds: tf.data.Dataset, cfg
     return converter.convert()
 
 
+def _keras_predict_fn(model: Any) -> Callable[[np.ndarray], np.ndarray]:
+    def fn(batch01: np.ndarray) -> np.ndarray:
+        return model.predict(batch01, verbose=0)
+
+    return fn
+
+
+def _tflite_predict_fn(tflite_bytes: bytes) -> Callable[[np.ndarray], np.ndarray]:
+    import tensorflow as tf
+
+    interp = tf.lite.Interpreter(model_content=tflite_bytes)
+    interp.allocate_tensors()
+    inp = interp.get_input_details()[0]
+    out = interp.get_output_details()[0]
+    qs, qz = inp["quantization"]
+    os_, oz = out["quantization"]
+
+    def fn(batch01: np.ndarray) -> np.ndarray:
+        outs = []
+        for arr01 in batch01:
+            arr2d = arr01[:, :, 0] if arr01.ndim == 3 else arr01
+            x = np.clip(np.round(arr2d / qs + qz), -128, 127).astype(np.int8)[None, :, :, None]
+            interp.set_tensor(inp["index"], x)
+            interp.invoke()
+            raw = interp.get_tensor(out["index"]).reshape(-1)
+            scores = (raw.astype(np.float32) - oz) * os_
+            if abs(float(scores.sum()) - 1.0) > 0.1:
+                scores = scores - scores.max()
+                e = np.exp(scores)
+                scores = e / e.sum()
+            outs.append(scores)
+        return np.stack(outs)
+
+    return fn
+
+
+def evaluate_class_accuracies(
+    predict_fn: Callable[[np.ndarray], np.ndarray],
+    dataset_dir: Path,
+    labels: List[str],
+) -> Dict[str, float]:
+    """Per-class accuracy on the processed dataset (normalize-only path).
+
+    This is the training self-check: a model that cannot even classify its
+    own training images has collapsed (single-class output) and must never
+    ship silently — callers surface the weak classes to the user.
+    """
+    from PIL import Image
+
+    accs: Dict[str, float] = {}
+    for label in labels:
+        cls_dir = Path(dataset_dir) / label
+        files = sorted([p for p in cls_dir.glob("*.png") if p.is_file()])
+        if not files:
+            continue
+        imgs = []
+        for p in files:
+            g = np.asarray(Image.open(p).convert("L"), dtype=np.uint8)
+            imgs.append(g.astype(np.float32) / 255.0)
+        x = np.stack(imgs)[..., None]
+        probs = predict_fn(x)
+        truth = labels.index(label)
+        accs[label] = float((np.argmax(probs, axis=1) == truth).mean())
+    return accs
+
+
 def export_tflite_c_sources(tflite_model: bytes, array_name: str) -> Tuple[str, str]:
     array_name = array_name.strip() or "g_model"
     header_guard = f"{array_name.upper()}_H"
@@ -413,6 +485,11 @@ def recommend_train_params(total_samples: int, cfg: TrainConfig) -> Tuple[Dict[s
         "epochs": suggested_epochs,
         "learning_rate": suggested_lr,
         "validation_split": suggested_val_split,
+        # Strong capacity: the old 16/32/64 + early-stopping regime silently
+        # collapsed to a single class on small stroke-style datasets.
+        "conv1_filters": 32,
+        "conv2_filters": 64,
+        "dense_units": 128,
     }
 
     reasons: List[str] = []
@@ -534,6 +611,33 @@ def train_and_export(
     tflite_path = run_dir / f"{model_base_name}.tflite"
     tflite_path.write_bytes(tflite_bytes)
 
+    # ── Training self-check: per-class accuracy on the training dataset ──
+    # Catches the silent single-class collapse (val_acc 1.0 while one class
+    # scores ~30 % on its own training images).  Compares float32 vs int8
+    # so quantization degradation is surfaced too.
+    warnings_out: List[str] = []
+    accs_f32: Dict[str, float] = {}
+    try:
+        accs_f32 = evaluate_class_accuracies(_keras_predict_fn(model), Path(dataset_dir), labels)
+        accs_i8 = evaluate_class_accuracies(_tflite_predict_fn(tflite_bytes), Path(dataset_dir), labels)
+        for label in labels:
+            a32 = accs_f32.get(label)
+            a8 = accs_i8.get(label)
+            if a32 is not None and a32 < 0.80:
+                warnings_out.append(
+                    f"class '{label}' self-check accuracy {a32:.0%} (< 80%) — add more/varied samples for this class"
+                )
+            if a32 is not None and a8 is not None and a8 < a32 - 0.10:
+                warnings_out.append(
+                    f"class '{label}' int8 accuracy {a8:.0%} vs float32 {a32:.0%} — quantization degradation"
+                )
+    except Exception as e:
+        warnings_out.append(f"self-check failed: {e}")
+    if warnings_out:
+        print("[trainer] SELF-CHECK WARNINGS:")
+        for w in warnings_out:
+            print("  -", w)
+
     if progress is not None:
         progress(0.96, "Exporting sources...")
     source_code, header_code = export_tflite_c_sources(tflite_bytes, array_name=array_name)
@@ -559,6 +663,8 @@ def train_and_export(
         model_h_path=model_h_path,
         model_cpp_path=model_cpp_path,
         metrics={"val_loss": float(loss), "val_accuracy": float(acc)},
+        class_accuracies=accs_f32,
+        warnings=warnings_out,
     )
 
 

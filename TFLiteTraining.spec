@@ -47,6 +47,15 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 if sys.platform == 'darwin':
     tmp_ret = collect_all('pywebview')
     datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    # Camera names in the packaged app: AVFoundation (pyobjc) provides the
+    # device list; without bundling these the app falls back to unnamed
+    # "Camera 0/1" labels.
+    for _pkg in ('AVFoundation', 'objc'):
+        try:
+            tmp_ret = collect_all(_pkg)
+            datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+        except Exception:
+            pass
 
 
 a = Analysis(

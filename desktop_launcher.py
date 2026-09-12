@@ -263,6 +263,101 @@ class _ShellApi:
         _maybe_native_resize_nudge(self.window, reason=reason)
         return True
 
+    def pick_upload_files(self, base_url: str, session: str, class_name: str) -> list:
+        """Native file picker for the SPA upload button.
+
+        The SPA's <input type="file"> does not reliably open a dialog inside
+        pywebview on macOS, so the SPA calls this JS API instead: open the
+        native open-file dialog, read the chosen images, and POST them to
+        the local controller's /upload endpoint.
+
+        Returns a list of per-file results:
+          {"filename": str, "ok": bool, "error": str, "image_b64": str, "thumb_b64": str}
+        so the SPA can show a detailed summary instead of a single success toast.
+        """
+        import base64 as _b64
+        import pathlib as _pl
+
+        results = []
+        try:
+            import webview as _webview
+
+            paths = _webview.create_file_dialog(
+                _webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)",),
+            )
+            if not paths:
+                return results
+            base_url = str(base_url or "").strip()
+            session = str(session or "").strip()
+            class_name = str(class_name or "").strip()
+            if not base_url or not session or not class_name:
+                return results
+            endpoint = f"{base_url}/upload"
+            for p in paths:
+                fpath = _pl.Path(str(p))
+                fname = fpath.name
+                try:
+                    data = fpath.read_bytes()
+                except Exception as e:
+                    results.append({"filename": fname, "ok": False, "error": f"read failed: {e}"})
+                    continue
+                payload = {
+                    "session": session,
+                    "class": class_name,
+                    "image_b64": _b64.b64encode(data).decode("ascii"),
+                    "filename": fname,
+                }
+                try:
+                    req = urllib.request.Request(
+                        endpoint,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        body = json.loads(resp.read().decode("utf-8") or "{}")
+                    ok = str(body.get("ok") or "0") == "1"
+                    err = "" if ok else str(body.get("error") or "upload failed")
+                    thumb = str(body.get("thumb_b64") or "")
+                except Exception as e:
+                    ok = False
+                    err = f"network: {e}"
+                    thumb = ""
+                results.append({
+                    "filename": fname,
+                    "ok": bool(ok),
+                    "error": str(err or ""),
+                    "image_b64": "",
+                    "thumb_b64": thumb if ok else "",
+                })
+        except Exception as e:
+            results.append({"filename": "", "ok": False, "error": f"picker failed: {e}"})
+        return results
+
+    def pick_single_image_file(self) -> dict:
+        """Native single-image picker for the preview Upload-File source."""
+        import base64 as _b64
+        import pathlib as _pl
+        import mimetypes as _mt
+
+        try:
+            import webview as _webview
+
+            paths = _webview.create_file_dialog(
+                _webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)",),
+            )
+            if not paths:
+                return {}
+            fpath = _pl.Path(str(paths[0]))
+            data = fpath.read_bytes()
+            mime = _mt.guess_type(fpath.name)[0] or "image/png"
+            return {"name": fpath.name, "mime": mime, "b64": _b64.b64encode(data).decode("ascii")}
+        except Exception:
+            return {}
+
 
 def _startup_window_logic(window: "webview.Window") -> None:
     _schedule_window_layout_refresh(window, reason="startup")
