@@ -46,7 +46,7 @@ Goal: students should not need to install Python. Double-click to launch.
     - `Full Frame`: disable extra ROI cropping for that class
 - Preview / Export:
       - The right `Preview` panel runs preview inference after training
-      - Toggle `Input` to start/stop live predictions; toggle `ROI` to show the auto search-box CROP image (jumps with the detection — the same auto crop the class-edit page shows); toggle `Orig` for the thresholded full-frame view (enable both for the cropped + filtered view)
+      - Toggle `Input` to start/stop live predictions; toggle `ROI` to show the auto search-box CROP image (jumps with the detection — the same auto crop the class-edit page shows); with `ROI` off a green box overlays the auto search box on the live frame (green = auto shadow-search, blue = manual ROI); toggle `Orig` for the thresholded full-frame view (enable both for the cropped + filtered view)
       - The prediction bars show per-class confidence; the button under them toggles between percentage (`Show Score`) and raw 0–1 score (`Show %`)
       - The slider bar under the preview image provides live `Dark Thresh` and `Lum Thresh` controls — adjust them to tune sign detection while watching the ROI view
       - Live predictions use the same crop the model was trained on — the auto search box (default `crop_mode="auto_search"`, device `BG_ENABLE_FOCUS_SEARCH=1`) or the legacy center-60 % crop — matching the device firmware

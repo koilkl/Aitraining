@@ -273,9 +273,6 @@ def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") 
     def _run_once(delay_s: float) -> None:
         def _inner() -> None:
             try:
-                # #region debug-point C:evaluate-layout-refresh-js
-                _debug_post("C", "desktop_launcher.py:_schedule_window_layout_refresh", "[DEBUG] shell evaluate_js layout refresh", {"reason": str(reason or ""), "delay_s": float(delay_s)})
-                # #endregion
                 window.evaluate_js(_LAYOUT_REFRESH_JS)
             except Exception:
                 pass
@@ -305,26 +302,14 @@ def _maybe_native_resize_nudge(window: "webview.Window", reason: str = "") -> bo
     width = int(getattr(window, "width", 0) or 0)
     height = int(getattr(window, "height", 0) or 0)
     if not callable(resize_fn) or width < 300 or height < 300:
-        # #region debug-point C:native-resize-nudge-skip
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge skipped", {"reason": reason_s, "width": width, "height": height, "has_resize": bool(callable(resize_fn))})
-        # #endregion
         return False
     try:
         _LAST_NATIVE_NUDGE_AT = now
-        # #region debug-point C:native-resize-nudge
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge start", {"reason": reason_s, "width": width, "height": height})
-        # #endregion
         resize_fn(width + 1, height + 1)
         time.sleep(0.03)
         resize_fn(width, height)
-        # #region debug-point C:native-resize-nudge-done
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge done", {"reason": reason_s, "width": width, "height": height})
-        # #endregion
         return True
     except Exception as e:
-        # #region debug-point C:native-resize-nudge-error
-        _debug_post("C", "desktop_launcher.py:_maybe_native_resize_nudge", "[DEBUG] native resize nudge failed", {"reason": reason_s, "error": str(e)})
-        # #endregion
         return False
 
 
@@ -374,7 +359,6 @@ _SPLASH_HTML = """<!doctype html>
   <div class="sub">Loading…</div>
 </body>
 </html>"""
-
 
 def _startup_window_logic(window: "webview.Window") -> None:
     # Layout refresh machinery removed: it caused a deadlock while dragging the

@@ -385,6 +385,14 @@ def _estimate_sign_center_and_side(
             if weighted_sum <= 0.0:
                 continue
 
+            # Background rejection: components touching >= 2 borders of the
+            # search region are the desk/surface, not the sign (the sign
+            # lives on bright paper and never spans the frame edges).
+            touch_count = int(min_x <= _SIGN_BORDER_TOUCH_PX) + int(min_y <= _SIGN_BORDER_TOUCH_PX) \
+                + int(max_x >= w - 1 - _SIGN_BORDER_TOUCH_PX) + int(max_y >= h - 1 - _SIGN_BORDER_TOUCH_PX)
+            if touch_count >= 2:
+                continue
+
             span_w = int(max_x - min_x + 1)
             span_h = int(max_y - min_y + 1)
             aspect = float(span_w) / float(max(1, span_h))
@@ -415,11 +423,18 @@ def _estimate_sign_center_and_side(
     # Support bbox = the DARK-MASK connected component seeded at the peak
     # (NOT the score-based support mask): flat dark sign interiors have ~0
     # edge weight, so the score support ring only covers border fragments
-    # and the crop misses large flat signs.  The score mask remains the
-    # fallback when no dark component contains the peak.
+    # and the crop misses large flat signs.  A dark component touching >= 2
+    # borders is background (desk/surface) — reject it.  The score mask is
+    # the next fallback; the best local bbox is the last.
     support_bbox = None
     if dark_mask is not None:
         support_bbox = _connected_bbox_from_seed(dark_mask, best_peak[0], best_peak[1])
+        if support_bbox is not None:
+            s_x1, s_y1, s_x2, s_y2 = support_bbox
+            s_touch = int(s_x1 <= _SIGN_BORDER_TOUCH_PX) + int(s_y1 <= _SIGN_BORDER_TOUCH_PX) \
+                + int(s_x2 >= search_w - 1 - _SIGN_BORDER_TOUCH_PX) + int(s_y2 >= search_h - 1 - _SIGN_BORDER_TOUCH_PX)
+            if s_touch >= 2:
+                support_bbox = None
     if support_bbox is None:
         support_mask = score_map >= (peak_value * _SIGN_SUPPORT_PEAK_RATIO)
         support_bbox = _connected_bbox_from_seed(support_mask, best_peak[0], best_peak[1])
@@ -522,6 +537,73 @@ def _focus_bbox(gray: np.ndarray) -> Tuple[int, int, int, int]:
     crop_left = max(0, min(w - side, int(round(cx - side * 0.5))))
     crop_top = max(0, min(h - side, int(round(cy - side * 0.5))))
     return int(crop_left), int(crop_top), int(crop_left + side), int(crop_top + side)
+
+
+def _focus_bbox_adaptive(gray_raw: np.ndarray) -> Tuple[int, int, int, int]:
+    """Auto search box with exposure-adaptive band selection.
+
+    The sign's absolute gray shifts with camera framing (auto-exposure:
+    paper-filled frames render ink dark, desk-dominated frames render ink
+    mid-gray), so a single fixed (dark, lum) mask cannot serve both.  This
+    wrapper picks candidate gray bands from the smoothed histogram
+    (valleys between peaks), runs the classic _focus_bbox per band, and
+    keeps the box whose surroundings are bright paper (the sign sits ON
+    the paper; the desk's ring is dark).  Falls back to the classic search
+    on the whole frame when no band produces a paper-surrounded box.
+
+    Mirrored bit-for-bit by find_search_box_adaptive() in
+    TFLite/image_provider.cpp — keep both in lockstep.
+    """
+    h, w = gray_raw.shape
+    left, top, right, bottom = _sign_search_window(h, w)
+    region = gray_raw[top:bottom, left:right].astype(np.int64)
+    hist = np.bincount(region.reshape(-1), minlength=256).astype(np.float64)
+    smooth = np.convolve(hist, np.ones(11) / 11.0, mode="same")
+    total = int(region.size)
+    peaks: List[int] = [
+        i for i in range(2, 254)
+        if smooth[i] >= smooth[i - 1] and smooth[i] > smooth[i + 1] and smooth[i] >= 0.03 * total / 8
+    ]
+    if len(peaks) < 2:
+        peaks = [int(np.percentile(region, 15)), int(np.percentile(region, 85))]
+    bands: List[Tuple[int, int]] = []
+    for a, b in zip(peaks, peaks[1:]):
+        lo = a + int(np.argmin(smooth[a : b + 1]))
+        bands.append((int(lo), int(b)))
+    if peaks:
+        v1 = peaks[0] + int(np.argmin(smooth[: peaks[0] + 1])) if peaks[0] > 0 else 0
+        bands.append((0, int(v1) if v1 > 0 else 100))
+
+    def _ring_bright_frac(box: Tuple[int, int, int, int]) -> float:
+        x1, y1, x2, y2 = box
+        pad = 4
+        ry1, ry2 = max(0, y1 - pad), min(h, y2 + pad)
+        rx1, rx2 = max(0, x1 - pad), min(w, x2 + pad)
+        ring = gray_raw[ry1:ry2, rx1:rx2].astype(np.int64).copy()
+        ring[max(0, y1 - ry1):min(y2 - ry1, ring.shape[0]),
+             max(0, x1 - rx1):min(x2 - rx1, ring.shape[1])] = -1
+        m = ring >= 0
+        if int(m.sum()) == 0:
+            return 0.0
+        return float(((ring >= 180) & m).sum()) / float(int(m.sum()))
+
+    best: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+    for lo, hi in bands:
+        if hi - lo < 10:
+            continue
+        band_gray = gray_raw.copy()
+        band_gray[~((gray_raw > lo) & (gray_raw < hi))] = 255
+        box = _focus_bbox(band_gray)
+        ring = _ring_bright_frac(box)
+        if ring < 0.35:
+            continue  # box not surrounded by paper — background/desk
+        score = ring * float(box[2] - box[0])
+        if best is None or score > best[0]:
+            best = (score, box)
+    if best is not None:
+        return best[1]
+    # Last resort: the classic single-pass search (legacy behaviour).
+    return _focus_bbox(gray_raw)
 
 
 def _render_crop(crop: np.ndarray, out_size: int, color_mode: str, preserve_aspect: bool) -> np.ndarray:
@@ -809,6 +891,10 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Simple dark/lum mask: keep only mid-brightness pixels (the sign).
     # Too dark (below dark_thresh) → shadow/noise → white.
     # Too bright (above lum_thresh) → paper/background → white.
+    # The mask drives the PREVIEWS and the sign_pct OOD stat only — the
+    # model-input crop below uses the raw G channel with the exposure-
+    # adaptive band search (_focus_bbox_adaptive), so it keeps working when
+    # auto-exposure shifts the ink's absolute gray with framing.
     is_sign = (gray > bg_dark_thresh) & (gray < bg_lum_thresh)
     sign_pct = is_sign.mean() * 100
     too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
@@ -827,8 +913,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         # Fast: simple center crop (for batch cache rebuild)
         x1, y1, x2, y2 = _center_bbox(h_orig, w_orig, frac=0.60)
     else:
-        # Live: _focus_bbox dark-object + edge detection in center window
-        x1, y1, x2, y2 = _focus_bbox(gray)
+        # Live: exposure-adaptive band search on the RAW G channel
+        x1, y1, x2, y2 = _focus_bbox_adaptive(np.asarray(src[:, :, 1], dtype=np.uint8))
 
     # Save normalized crop box for ROI overlay display
     crop_norm = (x1 / w_orig, y1 / h_orig, x2 / w_orig, y2 / h_orig)
@@ -847,11 +933,14 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
         pass
 
     # Full-frame thresholded preview (mask applied, NO crop) — for the Orig view.
+    # Keep the frame's aspect ratio (fit inside out_size): the ROI overlay
+    # draws the search box with normalized coordinates of the ORIGINAL frame,
+    # and a squashed square here would misplace the box on the Orig view.
     full_preview = None
     try:
         fp_arr = gray.copy()  # gray is already masked: non-sign → 255
         fp_img = Image.fromarray(fp_arr, mode="L")
-        fp_img = fp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+        fp_img.thumbnail((int(out_size), int(out_size)), Image.BILINEAR)
         full_preview = np.expand_dims(np.asarray(fp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
     except Exception:
         pass
