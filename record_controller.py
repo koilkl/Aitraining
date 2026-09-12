@@ -706,6 +706,45 @@ class RecordController:
             return
         raw = req.rfile.read(content_len)
         payload = json.loads(raw.decode("utf-8"))
+        if path == "/upload":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            image_b64 = str(payload.get("image_b64") or "").strip()
+            if not session_id or not class_name or not image_b64:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            try:
+                png = base64.b64decode(image_b64, validate=True)
+                # Students drop in grayscale / RGB / RGBA / palette files —
+                # normalise to a PNG the training cache accepts.
+                img = Image.open(_bytes_io(png))
+                try:
+                    png = _to_png_bytes(img.convert("RGB" if img.mode not in {"L", "RGB"} else img.mode))
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                p = _save_png(cfg.dataset_root, class_name, png)
+                self._cache_one_sample(cfg.dataset_root, class_name, p)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(
+                req,
+                {
+                    "ok": "1",
+                    "class": class_name,
+                    "filename": p.name,
+                    "image_b64": base64.b64encode(png).decode("ascii"),
+                },
+                cors=True,
+            )
+            return
         if path == "/train/start":
             session_id = str(payload.get("session") or "").strip()
             cfg = payload.get("cfg") or {}
