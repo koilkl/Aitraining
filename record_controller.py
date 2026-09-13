@@ -872,6 +872,17 @@ class RecordController:
             self._stop_live(session_id=session_id, source=source if source else None, wait=True, timeout_s=2.0)
             _send_json(req, {"ok": "1"}, cors=True)
             return
+        if path == "/shutdown":
+            # Graceful app-close path: release cameras/serial/server AFTER the
+            # response is flushed (release_all_resources stops the HTTP
+            # server, so it must not run before the client gets its answer).
+            _send_json(req, {"ok": "1"}, cors=True)
+            try:
+                req.wfile.flush()
+            except Exception:
+                pass
+            self.release_all_resources()
+            return
         _send_json(req, {"ok": "0", "error": "not found"}, status=404)
 
     def _handle_options(self, req: BaseHTTPRequestHandler) -> None:
@@ -3070,6 +3081,44 @@ class RecordController:
 
     def _live_key(self, session_id: str, source: str) -> str:
         return f"{session_id}:{source}"
+
+    def release_all_resources(self) -> None:
+        """Graceful app-shutdown release.  Idempotent — hot-reload and atexit
+        may call this more than once.
+
+        Stops every live worker (their finally blocks release the camera /
+        serial handles), stops any active record thread, releases every
+        AVCaptureSession registered with the mac_camera bridge, and shuts
+        the HTTP server down.  Called from the app-level atexit hook and
+        the /shutdown endpoint.
+        """
+        with self._lock:
+            keys = list(self._live.keys())
+            record_sids = list(self._record_threads.keys())
+        for key in keys:
+            try:
+                session_id, source = key.rsplit(":", 1)
+            except Exception:
+                continue
+            try:
+                self._stop_live(session_id=session_id, source=source, wait=True, timeout_s=1.5)
+            except Exception:
+                continue
+        for sid in record_sids:
+            try:
+                self._stop_record(sid, wait=True, timeout_s=1.5)
+            except Exception:
+                continue
+        try:
+            from mac_camera import shutdown_all_caps
+
+            shutdown_all_caps(wait_s=0.2)
+        except Exception:
+            pass
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def _stop_live(self, session_id: str, source: Optional[str] = None, *, wait: bool = False, timeout_s: float = 2.0) -> None:
         threads: List[threading.Thread] = []
