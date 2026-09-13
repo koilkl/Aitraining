@@ -16,6 +16,48 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+
+def _ensure_bundle_sys_path() -> None:
+    """Make sibling .py files importable when RecordController runs inside a
+    PyInstaller one-folder / one-file bundle on macOS.
+
+    Streamlit launches us via subprocess from a different cwd. Tf the bundle
+    is built with datas=(('mac_camera.py', '.'), ...), the helper file ends up
+    next to this script in the frozen app root but NOT on sys.path. We add
+    the obvious candidate directories once during import so
+    ``from mac_camera import ...`` succeeds without students editing anything.
+    """
+    roots: List[Path] = []
+    try:
+        this_file = Path(__file__).resolve()
+        if this_file.exists():
+            roots.append(this_file.parent)
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            roots.append(Path(str(meipass)))
+        except Exception:
+            pass
+    try:
+        roots.append(Path.cwd())
+    except Exception:
+        pass
+    for root in roots:
+        if not isinstance(root, Path):
+            continue
+        try:
+            root_str = str(root)
+        except Exception:
+            continue
+        if root_str and root_str not in sys.path:
+            sys.path.insert(0, root_str)
+
+
+_ensure_bundle_sys_path()
+del _ensure_bundle_sys_path
+
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -57,9 +99,12 @@ class SessionConfig:
     # full crop pipeline like the training data did.  Direct-feeding a raw
     # frame into a crop-trained model was the "model always wrong" bug.
     direct_tensor_stream: bool = False
-    # macOS AVCaptureDevice uniqueID of the selected camera.  Resolved to the
-    # current cv2 index at OPEN time so the name→index pairing stays correct
-    # when virtual cameras (Iriun etc.) connect or disconnect.
+    # macOS AVCaptureDevice uniqueID of the selected camera.  On macOS this
+    # is AUTHORITATIVE: the camera is opened by uniqueID (mac_camera bridge),
+    # never by positional index — cv2's positional order is NOT the
+    # AVFoundation array order (cv2 sorts by uniqueID), so index-based opens
+    # silently select the wrong device whenever virtual cameras (Iriun etc.)
+    # are installed.  webcam_index is only a UI hint / non-macOS fallback.
     webcam_id: Optional[str] = None
     # Training image size (the "Image Size" hyperparameter).  Captured /
     # uploaded samples and their processed-cache previews are stored at this
@@ -171,6 +216,16 @@ def _generate_model_resolver_h(tflite_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
+# Live-worker liveness contract (see _live_running / _get_live_preview):
+# - LIVE_IDLE_S: a worker that NO consumer has polled for this long is
+#   reaped (releases the camera; never while a hold capture is active).
+#   last_touch is written by consumers only — NOT by the producer.
+# - LIVE_STALE_S: frames older than this are treated as stale; /live/frame
+#   then revives a DEAD producer instead of serving the last frame forever.
+LIVE_IDLE_S = 15.0
+LIVE_STALE_S = 1.5
+
+
 class RecordController:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -178,6 +233,7 @@ class RecordController:
         self._active: Dict[str, Dict[str, Any]] = {}
         self._live: Dict[str, Dict[str, Any]] = {}
         self._live_threads: Dict[str, threading.Thread] = {}
+        self._live_stops: Dict[str, threading.Event] = {}
         self._record_threads: Dict[str, threading.Thread] = {}
         self._record_conds: Dict[str, threading.Condition] = {}
         self._train: Dict[str, Dict[str, Any]] = {}
@@ -210,6 +266,38 @@ class RecordController:
                 pass
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
+        # Live workers hold AVCaptureSessions whose sample-buffer callbacks
+        # run on libdispatch threads; if those sessions are still streaming
+        # when the interpreter starts finalizing, the callback's GIL acquire
+        # calls pthread_exit() on a dispatch-owned thread and macOS kills the
+        # process ("BUG IN CLIENT OF LIBPTHREAD").  Release them here, while
+        # the interpreter is fully alive.
+        try:
+            self._stop_live_all()
+        except Exception:
+            pass
+
+    def _stop_live_all(self) -> None:
+        """Stop every live worker of every session, then release every open
+        AVCaptureSession held by the macOS camera bridge (hot-reload /
+        shutdown safety)."""
+        with self._lock:
+            keys = list(self._live.keys())
+        for key in keys:
+            try:
+                session_id, source = str(key).split(":", 1)
+            except Exception:
+                continue
+            try:
+                self._stop_live(session_id=session_id, source=source, wait=True, timeout_s=1.0)
+            except Exception:
+                continue
+        try:
+            from mac_camera import shutdown_all_caps
+
+            shutdown_all_caps()
+        except Exception:
+            pass
 
     def start(self) -> None:
         with self._lock:
@@ -269,11 +357,27 @@ class RecordController:
         with self._lock:
             return dict(self._active.get(session_id, {}))
 
-    def preview_webcam_png(self, webcam_index: int, webcam_id: Optional[str] = None) -> Optional[bytes]:
-        permission = ensure_camera_access(webcam_index=int(webcam_index))
+    def preview_webcam_png(self, webcam_index: int, webcam_id: Optional[str] = None, session_id: Optional[str] = None) -> Optional[bytes]:
+        uid = str(webcam_id or "").strip()
+        # Fast path: when the session's live worker already owns the selected
+        # camera, serve its newest preview frame instead of opening a SECOND
+        # capture session (macOS allows a single consumer per camera).
+        if session_id and uid:
+            with self._lock:
+                state = self._live.get(self._live_key(session_id, "webcam"))
+                if state is not None and state.get("running"):
+                    actual = state.get("actual") or {}
+                    if str(actual.get("unique_id") or "") == uid:
+                        data = state.get("preview_png")
+                        if isinstance(data, (bytes, bytearray)):
+                            return bytes(data)
+        permission = ensure_camera_access(webcam_index=int(webcam_index or 0), probe_open=False, unique_id=uid)
         if not permission.allowed:
             return None
-        cap, _actual = _open_working_camera(int(webcam_index), unique_id=webcam_id)
+        try:
+            cap, _actual = _open_working_camera(int(webcam_index or 0), unique_id=uid)
+        except Exception:
+            return None
         if cap is None or not cap.isOpened():
             return None
         ok, frame = cap.read()
@@ -550,6 +654,9 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
+            with self._lock:
+                wc_state = self._live.get(self._live_key(session_id, "webcam"))
+            wc_actual = dict((wc_state or {}).get("actual") or {})
             _send_json(
                 req,
                 {
@@ -557,6 +664,8 @@ class RecordController:
                     "direct_tensor_stream": "1" if bool(getattr(cfg, "direct_tensor_stream", False)) else "0",
                     "webcam_index": str(int(cfg.webcam_index)),
                     "webcam_id": str(cfg.webcam_id or ""),
+                    "webcam_actual_backend": str(wc_actual.get("backend") or ""),
+                    "webcam_actual_uid": str(wc_actual.get("unique_id") or ""),
                     "img_size": str(int(cfg.img_size)),
                     "serial_port": str(cfg.serial_port),
                     "serial_baud": str(int(cfg.serial_baud)),
@@ -573,7 +682,12 @@ class RecordController:
             png = self._get_live_preview(session_id=session_id, source=source)
             if png is None:
                 err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
-                _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
+                # starting=1 tells the SPA the producer is (re)starting and a
+                # frame will follow — it keeps the last good frame on screen
+                # instead of blanking, so transient stalls never read as a
+                # frozen/black view.
+                starting = "1" if self._is_live_starting(session_id=session_id, source=source) else "0"
+                _send_json(req, {"ok": "0", "error": err, "starting": starting}, status=404, cors=True)
                 return
             _send_png(req, png, cors=True)
             return
@@ -598,14 +712,20 @@ class RecordController:
                 return
             try:
                 self._ensure_live(session_id=session_id, source=source)
-                png = self._get_live_preview(session_id=session_id, source=source)
-                if png is None:
+                preview_png = self._get_live_preview(session_id=session_id, source=source)
+                if preview_png is None:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
                     return
+                # Predict using the 96x96 capture_png when possible — this is
+                # byte-for-byte the same file the /start (hold capture) worker
+                # saves on disk, so the user sees a distribution exactly equal
+                # to what their downstream MCU classifier will ingest.
+                capture_png = self._get_live_capture(session_id=session_id, source=source)
+                predict_png = capture_png if capture_png else preview_png
                 pred = self._preview_predict(
                     session_id=session_id,
-                    png=png,
+                    png=predict_png,
                     preprocess_mode=preprocess_mode,
                     bg_dark_thresh=bg_dark_thresh,
                     bg_lum_thresh=bg_lum_thresh,
@@ -631,7 +751,7 @@ class RecordController:
                     "sign_pct": float(pred.get("sign_pct") or 0.0),
                     "max_prob": float(pred.get("max_prob") or 0.0),
                     "entropy_ratio": float(pred.get("entropy_ratio") or 0.0),
-                    "image_b64": base64.b64encode(png).decode("ascii"),
+                    "image_b64": base64.b64encode(preview_png).decode("ascii"),
                     "processed_image_b64": str(pred.get("processed_image_b64") or ""),
                     "crop_image_b64": str(pred.get("crop_image_b64") or ""),
                     "full_image_b64": str(pred.get("full_image_b64") or ""),
@@ -728,11 +848,16 @@ class RecordController:
             if not session_id or not source or not class_name:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
+            # Single capture consumes the live worker's capture_png cache —
+            # NEVER opens a second camera/serial reader (macOS allows one
+            # consumer per camera; the serial reader is single-consumer).
+            # Wait briefly for a FRESH frame so a click can never save an
+            # arbitrarily old one.
             self._ensure_live(session_id=session_id, source=source)
-            png = self._get_live_capture(session_id=session_id, source=source)
+            png = self._get_live_capture_fresh(session_id=session_id, source=source, timeout_s=0.4)
             if png is None:
                 err = self._get_live_error(session_id=session_id, source=source) or "capture unavailable"
-                _send_json(req, {"ok": "0", "error": err}, status=400, cors=True)
+                _send_json(req, {"ok": "0", "error": err}, status=409, cors=True)
                 return
             cfg = self._configs.get(session_id)
             if cfg is None:
@@ -1358,10 +1483,11 @@ class RecordController:
 
     def _start_record(self, session_id: str, source: str, class_name: str) -> None:
         self._stop_record(session_id=session_id, wait=True, timeout_s=2.5)
-        # Stop the live preview but DON'T block the HTTP request here — the
-        # record worker waits for the live reader to release the port before
-        # opening its own (otherwise /start hangs and hold-release feels late).
-        self._stop_live(session_id=session_id, source=source)
+        # BOTH sources keep the live worker running during hold capture.
+        # The record thread consumes the live worker's capture_png cache —
+        # it never opens a second camera / serial reader.  Stopping the
+        # device live reader here used to blind the class-panel view for
+        # the whole hold (and the webcam worker starved by the same rule).
         with self._lock:
             cfg = self._configs.get(session_id)
             if cfg is None:
@@ -1437,6 +1563,9 @@ class RecordController:
             for key in list(self._live_threads):
                 if key.startswith(prefix):
                     self._live_threads.pop(key, None)
+            for key in list(self._live_stops):
+                if key.startswith(prefix):
+                    self._live_stops.pop(key, None)
 
     def _wait_next_record(self, session_id: str, since: int, timeout_s: float = 10.0) -> Dict[str, Any]:
         cond = self._record_conds.get(session_id)
@@ -2897,20 +3026,30 @@ class RecordController:
             self._train_set(session_id, error=str(e), done=True)
 
     def _record_worker(self, session_id: str, source: str, class_name: str, live_thread: Optional[threading.Thread] = None) -> None:
-        # Wait (bounded) for the live reader to release the serial port so the
-        # record reader doesn't fight it — but never block the hold-release.
+        # Single-owner rule for BOTH sources: the live worker holds the
+        # camera / serial reader; the record thread consumes its capture_png
+        # cache and never opens a second device handle.  The old fallback
+        # opened a 2nd cv2.VideoCapture / SerialFrameReader while the live
+        # worker was streaming — on macOS that blinds the shared camera and
+        # on serial it corrupts the frame stream (the hold-freeze bug).
         try:
-            if live_thread is not None and live_thread.is_alive():
-                live_thread.join(timeout=2.0)
             cfg = self._configs.get(session_id)
             if cfg is None:
                 return
             interval = 1.0 / max(1.0, float(cfg.fps))
             if source == "device":
-                self._record_serial(session_id, cfg, class_name, interval)
+                self._record_device_from_live(session_id, cfg, class_name, interval)
                 return
             if source == "webcam":
-                self._record_webcam(session_id, cfg, class_name, interval)
+                try:
+                    self._ensure_live(session_id, "webcam")
+                except Exception:
+                    self._fail_record(session_id, "Camera live preview is unavailable.")
+                    return
+                if not self._wait_live_capture(session_id, "webcam", timeout_s=2.0):
+                    self._fail_record(session_id, "Camera is not producing frames. Check permission or whether it is in use.")
+                    return
+                self._record_webcam_from_live(session_id, cfg, class_name, interval)
                 return
         except Exception as e:
             with self._lock:
@@ -2949,6 +3088,9 @@ class RecordController:
                 state = self._live.get(key)
                 if state is not None:
                     state["running"] = False
+                stop_evt = self._live_stops.get(key)
+                if stop_evt is not None:
+                    stop_evt.set()
                 thread = self._live_threads.get(key)
                 if thread is not None:
                     threads.append(thread)
@@ -2983,31 +3125,82 @@ class RecordController:
                         self._live.pop(stale_key, None)
                 except Exception:
                     continue
-            for other_key, state in list(self._live.items()):
-                if other_key.startswith(f"{session_id}:") and other_key != key:
-                    state["running"] = False
             cur = self._live.get(key)
-            if cur is not None and cur.get("running"):
-                cur["last_touch"] = now
-                cur["cfg"] = cfg
+            thread = self._live_threads.get(key)
+            if thread is not None and thread.is_alive():
+                # The worker is alive (possibly shutting down after a
+                # /live/close) — never spawn a second worker for the same
+                # device handle; the next poll will respawn once it exits.
+                if cur is not None:
+                    cur["last_touch"] = now
+                    cur["cfg"] = cfg
                 return
+            gen = 1
+            if cur is not None:
+                try:
+                    gen = int(cur.get("gen") or 0) + 1
+                except Exception:
+                    gen = 1
             state = {
                 "running": True,
+                "gen": gen,
                 "last_touch": now,
+                "_publish_ts": 0.0,
+                "_preview_ts": 0.0,
+                "_capture_ts": 0.0,
                 "source": source,
                 "cfg": cfg,
                 "preview_png": None,
                 "capture_png": None,
                 "error": "",
+                "actual": None,
             }
             self._live[key] = state
-        t = threading.Thread(target=self._live_worker, args=(key, session_id, source), daemon=True)
+            stop_evt = threading.Event()
+            self._live_stops[key] = stop_evt
+        t = threading.Thread(target=self._live_worker, args=(key, session_id, source, gen, stop_evt), daemon=True)
         with self._lock:
             self._live_threads[key] = t
         t.start()
 
-    def _get_live_preview(self, session_id: str, source: str) -> Optional[bytes]:
+    def _get_live_preview(self, session_id: str, source: str, autostart: bool = True) -> Optional[bytes]:
         key = self._live_key(session_id, source)
+        with self._lock:
+            state = self._live.get(key)
+            if state is not None:
+                running = bool(state.get("running"))
+                ts = float(state.get("_preview_ts") or 0.0)
+            else:
+                running = False
+                ts = 0.0
+        needs_revival = False
+        if state is None or not running or ts <= 0.0:
+            needs_revival = True
+        elif time.time() - ts > LIVE_STALE_S:
+            # Frames went stale — revive, but only when the producer thread
+            # is actually dead.  A live-but-blocked worker (e.g. a serial
+            # read_frame in flight) cannot be respawned without double-owning
+            # the device, so /live/frame keeps answering "starting" until it
+            # publishes again or exits.
+            with self._lock:
+                thread = self._live_threads.get(key)
+            if thread is None or not thread.is_alive():
+                needs_revival = True
+        if needs_revival and autostart:
+            try:
+                self._ensure_live(session_id, source)
+            except Exception:
+                pass
+            # Give the fresh worker a short window to publish its first frame.
+            deadline = time.time() + 0.4
+            while time.time() < deadline:
+                with self._lock:
+                    state = self._live.get(key)
+                    if state is not None:
+                        data = state.get("preview_png")
+                        if isinstance(data, (bytes, bytearray)):
+                            return bytes(data)
+                time.sleep(0.01)
         with self._lock:
             state = self._live.get(key)
             if state is None:
@@ -3015,6 +3208,38 @@ class RecordController:
             state["last_touch"] = time.time()
             data = state.get("preview_png")
             return bytes(data) if isinstance(data, (bytes, bytearray)) else None
+
+    def _is_live_starting(self, session_id: str, source: str) -> bool:
+        """True when the producer has no frame yet (worker warming up, just
+        (re)spawned, or waiting for a device) — the SPA keeps the last good
+        frame on screen instead of blanking."""
+        key = self._live_key(session_id, source)
+        with self._lock:
+            state = self._live.get(key)
+            if state is None:
+                return True
+            if not state.get("running"):
+                return True
+            return state.get("preview_png") is None
+
+    def _get_live_capture_fresh(self, session_id: str, source: str, timeout_s: float = 0.4) -> Optional[bytes]:
+        """capture_png from the live cache, but only when it is FRESH
+        (published within the last 2 s) — a click must never save a stale or
+        arbitrarily old frame."""
+        key = self._live_key(session_id, source)
+        deadline = time.time() + float(timeout_s)
+        while True:
+            with self._lock:
+                state = self._live.get(key)
+                if state is not None:
+                    data = state.get("capture_png")
+                    ts = float(state.get("_capture_ts") or 0.0)
+                    if isinstance(data, (bytes, bytearray)) and ts > 0.0 and (time.time() - ts) <= 2.0:
+                        state["last_touch"] = time.time()  # consumer heartbeat
+                        return bytes(data)
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.01)
 
     def _get_live_capture(self, session_id: str, source: str) -> Optional[bytes]:
         key = self._live_key(session_id, source)
@@ -3035,57 +3260,86 @@ class RecordController:
             state["last_touch"] = time.time()
             return str(state.get("error") or "")
 
-    def _live_running(self, key: str) -> bool:
+    def _live_running(self, key: str, gen: Optional[int] = None) -> bool:
         with self._lock:
             state = self._live.get(key)
             if state is None:
                 return False
+            if gen is not None and int(state.get("gen") or 0) != int(gen):
+                # A successor worker owns this key now — never touch its state.
+                return False
             if not state.get("running"):
                 return False
-            if time.time() - float(state.get("last_touch") or 0.0) > 8.0:
-                state["running"] = False
-                return False
+            # Consumer-idle lease: a worker that NO consumer (class-panel
+            # poll, preview visual/predict, capture read) has touched for
+            # LIVE_IDLE_S is reaped — this is what releases the camera when
+            # the user closes the webcam view or toggles Input off and no
+            # other view still uses the source.  Revival on demand makes
+            # this safe: the next /live/frame poll respawns the worker.
+            # Never reaped while a hold capture is active for this session
+            # (the record thread consumes the capture cache directly).
+            now = time.time()
+            if now - float(state.get("last_touch") or 0.0) > LIVE_IDLE_S:
+                session_id = key.rsplit(":", 1)[0]
+                active = self._active.get(session_id) or {}
+                if active.get("recording") != "1":
+                    state["running"] = False
+                    return False
             return True
 
-    def _live_set(self, key: str, *, preview_png: Optional[bytes] = None, capture_png: Optional[bytes] = None, error: Optional[str] = None) -> None:
+    def _live_set(self, key: str, *, preview_png: Optional[bytes] = None, capture_png: Optional[bytes] = None, error: Optional[str] = None, actual: Optional[Dict[str, Any]] = None) -> None:
+        now = time.time()
         with self._lock:
             state = self._live.get(key)
             if state is None:
                 return
+            # NOTE: last_touch is deliberately NOT written here.  It tracks
+            # CONSUMER activity (HTTP /live/frame + capture reads), and the
+            # idle lease in _live_running releases the camera when every
+            # view of it is gone (view closed / Input toggled off).  The
+            # producer writes _publish_ts, used by staleness checks.
             if preview_png is not None:
                 state["preview_png"] = preview_png
+                state["_preview_ts"] = now
+                state["_publish_ts"] = now
             if capture_png is not None:
                 state["capture_png"] = capture_png
+                state["_capture_ts"] = now
+                state["_publish_ts"] = now
             if error is not None:
                 state["error"] = error
+            if actual is not None:
+                state["actual"] = actual
 
-    def _live_worker(self, key: str, session_id: str, source: str) -> None:
+    def _live_worker(self, key: str, session_id: str, source: str, gen: int, stop_evt: threading.Event) -> None:
         cfg = self._configs.get(session_id)
         if cfg is None:
             return
         try:
             if source == "webcam":
-                self._live_webcam(key, session_id, cfg)
+                self._live_webcam(key, session_id, cfg, gen, stop_evt)
             elif source == "device":
-                self._live_serial(key, session_id, cfg)
+                self._live_serial(key, session_id, cfg, gen, stop_evt)
         finally:
             with self._lock:
                 state = self._live.get(key)
-                if state is not None:
+                if state is not None and int(state.get("gen") or 0) == int(gen):
+                    # Only the owning generation may mark its state dead —
+                    # a lagging predecessor must not kill its successor.
                     state["running"] = False
                     state["last_touch"] = time.time()
                 thread = self._live_threads.get(key)
                 if thread is threading.current_thread():
                     self._live_threads.pop(key, None)
 
-    def _live_serial(self, key: str, session_id: str, cfg: SessionConfig) -> None:
+    def _live_serial(self, key: str, session_id: str, cfg: SessionConfig, gen: int, stop_evt: threading.Event) -> None:
         if not cfg.serial_port:
             self._live_set(key, error="Serial port is not configured.")
             return
         last_error = ""
         reader = None
         reader_sig = None
-        while self._live_running(key):
+        while not stop_evt.is_set() and self._live_running(key, gen):
             # Re-read the live config every iteration so setting changes
             # (baud / frame side / port / channels) take effect immediately.
             fresh = self._configs.get(session_id)
@@ -3136,42 +3390,121 @@ class RecordController:
             except Exception:
                 pass
 
-    def _live_webcam(self, key: str, session_id: str, cfg: SessionConfig) -> None:
-        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
-        if not permission.allowed:
-            self._live_set(key, error=permission.message or "Camera permission denied.")
-            return
-        cap, actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
-        if cap is None:
-            self._live_set(key, error="Unable to open a readable webcam stream.")
-            return
+    def _live_webcam(self, key: str, session_id: str, cfg: SessionConfig, gen: int, stop_evt: threading.Event) -> None:
         import cv2
+
+        cap = None
+        cam_sig = None
+        last_error = ""
+        read_failures = 0
+        ever_framed = False
         try:
-            while self._live_running(key):
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    time.sleep(0.08)
-                    continue
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                preview_frame = frame
+            while not stop_evt.is_set() and self._live_running(key, gen):
                 try:
-                    h, w = frame.shape[:2]
-                    max_w = 360
-                    if w > max_w and h > 0:
-                        scaled_h = max(1, int(h * (max_w / float(w))))
-                        preview_frame = cv2.resize(frame, (max_w, scaled_h), interpolation=cv2.INTER_AREA)
-                except Exception:
+                    fresh = self._configs.get(session_id)
+                    if fresh is not None:
+                        cfg = fresh
+                    uid = str(cfg.webcam_id or "").strip()
+                    # Key the open on the uniqueID alone — virtual-camera
+                    # connect/disconnect drifts positional indices and must
+                    # not force a spurious reopen of the (correct) device.
+                    current_sig = uid if uid else f"idx:{int(cfg.webcam_index)}"
+                    if cam_sig is None or current_sig != cam_sig:
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = None
+                        cam_sig = None
+                        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index or 0), probe_open=False, unique_id=uid)
+                        if not permission.allowed:
+                            last_error = permission.message or "Camera permission denied."
+                            self._live_set(key, error=last_error)
+                            time.sleep(0.3)
+                            continue
+                        new_cap, info = _open_working_camera(int(cfg.webcam_index or 0), unique_id=uid)
+                        if new_cap is None or not new_cap.isOpened():
+                            info_error = str(getattr(info, "error", "") or "") if info is not None else ""
+                            last_error = info_error or f"Unable to open webcam (index={cfg.webcam_index}, id={uid[:12] if uid else ''}…). Check settings."
+                            self._live_set(key, error=last_error, actual=_camera_open_info_dict(info))
+                            time.sleep(0.3)
+                            continue
+                        cap = new_cap
+                        cam_sig = current_sig
+                        read_failures = 0
+                        last_error = ""
+                        self._live_set(key, actual=_camera_open_info_dict(info), error="")
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        read_failures += 1
+                        # Only reopen after the stream was KNOWN GOOD — a
+                        # camera whose first frame takes >0.8 s (cold start)
+                        # must not be torn down by the blind-stream detector.
+                        if ever_framed and read_failures >= 10:
+                            # The stream went blind (e.g. another process took
+                            # the camera) — report it and force a reopen
+                            # instead of serving stale frames silently.
+                            last_error = "Camera stopped producing frames; reopening..."
+                            self._live_set(key, error=last_error)
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = None
+                            cam_sig = None
+                            read_failures = 0
+                            ever_framed = False
+                            time.sleep(0.1)
+                        else:
+                            time.sleep(0.08)
+                        continue
+                    read_failures = 0
+                    ever_framed = True
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     preview_frame = frame
-                preview_png = _to_png_bytes(Image.fromarray(preview_frame))
-                img = Image.fromarray(frame).convert("RGB")
-                if cfg.crop_box is not None:
-                    x1, y1, x2, y2 = cfg.crop_box
-                    img = img.crop((x1, y1, x2, y2))
-                img = img.resize((int(cfg.img_size), int(cfg.img_size)))
-                self._live_set(key, preview_png=preview_png, capture_png=_to_png_bytes(img), error="")
-                time.sleep(0.06)
+                    try:
+                        h, w = frame.shape[:2]
+                        max_w = 360
+                        if w > max_w and h > 0:
+                            scaled_h = max(1, int(h * (max_w / float(w))))
+                            preview_frame = cv2.resize(frame, (max_w, scaled_h), interpolation=cv2.INTER_AREA)
+                    except Exception:
+                        preview_frame = frame
+                    preview_png = _to_png_bytes(Image.fromarray(preview_frame))
+                    img = Image.fromarray(frame).convert("RGB")
+                    if cfg.crop_box is not None:
+                        x1, y1, x2, y2 = cfg.crop_box
+                        img = img.crop((x1, y1, x2, y2))
+                    img = img.resize((int(cfg.img_size), int(cfg.img_size)))
+                    self._live_set(key, preview_png=preview_png, capture_png=_to_png_bytes(img), error="")
+                    time.sleep(0.06)
+                except Exception as e:
+                    # The live thread must NEVER die: an exception here used
+                    # to kill the worker while the cached preview_png kept
+                    # being served with HTTP 200 forever — a silently frozen
+                    # view.  Publish the error, release the capture and keep
+                    # polling instead.
+                    msg = str(e) or "webcam error"
+                    if msg != last_error:
+                        self._live_set(key, error=msg[:220])
+                        last_error = msg
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                    cam_sig = None
+                    read_failures = 0
+                    ever_framed = False
+                    time.sleep(0.3)
         finally:
-            cap.release()
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
     def _preview_frame(self, session_id: str, source: str) -> Optional[bytes]:
         cfg = self._configs.get(session_id)
@@ -3180,7 +3513,7 @@ class RecordController:
         if source == "device":
             return self.preview_serial_png(cfg.serial_port, int(cfg.serial_baud), str(cfg.serial_sync), frame_side=int(cfg.serial_frame_side), channels=int(cfg.serial_channels))
         if source == "webcam":
-            return self.preview_webcam_png(int(cfg.webcam_index), webcam_id=cfg.webcam_id)
+            return self.preview_webcam_png(int(cfg.webcam_index), webcam_id=cfg.webcam_id, session_id=session_id)
         return None
 
     def _capture_single(self, session_id: str, source: str) -> Optional[bytes]:
@@ -3199,14 +3532,17 @@ class RecordController:
             except Exception:
                 return None
         if source == "webcam":
-            permission = ensure_camera_access(webcam_index=int(cfg.webcam_index), probe_open=False)
+            permission = ensure_camera_access(webcam_index=int(cfg.webcam_index or 0), probe_open=False, unique_id=str(cfg.webcam_id or ""))
             if not permission.allowed:
                 return None
             try:
                 import cv2
             except Exception:
                 return None
-            cap, _actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
+            try:
+                cap, _actual_index = _open_working_camera(int(cfg.webcam_index or 0), unique_id=cfg.webcam_id)
+            except Exception:
+                return None
             if cap is None:
                 return None
             ok, frame = cap.read()
@@ -3254,7 +3590,10 @@ class RecordController:
                 pass
 
     def _record_webcam(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
-        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index))
+        # Legacy direct-open record path — normal hold capture now consumes
+        # the live worker's capture_png cache (_record_webcam_from_live) so a
+        # second camera open can never blind the shared AVCaptureSession.
+        permission = ensure_camera_access(webcam_index=int(cfg.webcam_index or 0), probe_open=False, unique_id=str(cfg.webcam_id or ""))
         if not permission.allowed:
             with self._lock:
                 self._active[session_id] = {"recording": "0", "error": permission.message}
@@ -3266,10 +3605,11 @@ class RecordController:
                 self._active[session_id] = {"recording": "0", "error": "missing opencv-python"}
             return
 
-        cap, _actual_index = _open_working_camera(int(cfg.webcam_index), unique_id=cfg.webcam_id)
-        if not cap.isOpened():
+        cap, info = _open_working_camera(int(cfg.webcam_index or 0), unique_id=cfg.webcam_id)
+        if cap is None or not cap.isOpened():
+            info_error = str(getattr(info, "error", "") or "") if info is not None else ""
             with self._lock:
-                self._active[session_id] = {"recording": "0", "error": "webcam open failed"}
+                self._active[session_id] = {"recording": "0", "error": info_error or "webcam open failed"}
             return
         try:
             while self._is_recording(session_id):
@@ -3299,7 +3639,125 @@ class RecordController:
                         cond.notify_all()
                 time.sleep(interval)
         finally:
-            cap.release()
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def _record_webcam_from_live(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
+        """Save capture samples by consuming the 96x96 capture_png cache
+        produced by the running _live_webcam worker.
+
+        This is the fast / happy path: it avoids opening a 2nd capture
+        object against the same macOS AVCaptureSession (which would fail
+        for most built-in cameras), keeps preview/live running concurrently,
+        and guarantees the saved samples byte-for-byte match what Preview
+        inference consumes (via the same capture_png cache).
+        """
+        self._record_from_live(session_id, cfg, class_name, interval, self._live_key(session_id, "webcam"), "Camera")
+
+    def _record_device_from_live(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float) -> None:
+        """Hold-capture for the serial device via the live worker's capture_png
+        cache — the live reader keeps feeding the class-panel view WHILE the
+        hold saves samples (the old design stopped the live reader for the
+        whole hold, freezing the view)."""
+        try:
+            self._ensure_live(session_id, "device")
+        except Exception:
+            self._fail_record(session_id, "Device live preview is unavailable.")
+            return
+        if not self._wait_live_capture(session_id, "device", timeout_s=2.0):
+            self._fail_record(session_id, "Device is not producing frames. Check the serial port and baudrate.")
+            return
+        self._record_from_live(session_id, cfg, class_name, interval, self._live_key(session_id, "device"), "Device")
+
+    def _record_from_live(self, session_id: str, cfg: SessionConfig, class_name: str, interval: float, key: str, source_label: str) -> None:
+        """Shared live-cache consumer for hold capture (webcam + device).
+
+        Consumes only NEW frames (capture_png watermark) and aborts the hold
+        with a visible error when the producer stalls — the hold poll loop
+        surfaces ``active.error`` as a toast.  No fallback ever opens a
+        second device handle.
+        """
+        last_saved_seen_ts: float = 0.0
+        last_frame_at = time.time()
+        while self._is_recording(session_id):
+            now = time.time()
+            capture_png: Optional[bytes] = None
+            with self._lock:
+                state = self._live.get(key)
+                if state is None or not state.get("running"):
+                    stale = True
+                else:
+                    raw_bytes = state.get("capture_png")
+                    seen_ts = float(state.get("_capture_ts") or 0.0)
+                    if isinstance(raw_bytes, (bytes, bytearray)) and seen_ts > last_saved_seen_ts:
+                        capture_png = bytes(raw_bytes)
+                        last_saved_seen_ts = seen_ts
+                        last_frame_at = now
+                        stale = False
+                    else:
+                        stale = True
+            if capture_png is None:
+                if now - last_frame_at > 2.0:
+                    self._fail_record(session_id, f"{source_label} stopped producing frames during capture. Check the connection and try again.")
+                    return
+                time.sleep(max(0.015, float(interval) * 0.35))
+                continue
+            p = _save_png(cfg.dataset_root, class_name, capture_png)
+            self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size))
+            with self._lock:
+                cur = self._active.get(session_id)
+                if cur is not None and cur.get("recording") == "1":
+                    cur["seq"] = int(cur.get("seq") or 0) + 1
+                    cur["count"] = int(cur.get("count") or 0) + 1
+                    cur["filename"] = str(p.name)
+                    try:
+                        cur["image_b64"] = base64.b64encode(capture_png).decode("ascii")
+                    except Exception:
+                        cur["image_b64"] = ""
+            cond = self._record_conds.get(session_id)
+            if cond is not None:
+                with cond:
+                    cond.notify_all()
+            next_deadline = time.time() + float(interval)
+            sleep_s = next_deadline - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+    def _fail_record(self, session_id: str, message: str) -> None:
+        """Abort an active hold capture with a user-visible error."""
+        with self._lock:
+            cur = self._active.get(session_id)
+            if cur is not None:
+                cur["recording"] = "0"
+                cur["error"] = str(message)[:220]
+        cond = self._record_conds.get(session_id)
+        if cond is not None:
+            with cond:
+                cond.notify_all()
+
+    def _wait_live_capture(self, session_id: str, source: str, timeout_s: float = 2.0) -> bool:
+        """Wait until the live worker has published a FRESH capture frame
+        (age ≤ 2 s).  Respawns the worker if it died while waiting."""
+        key = self._live_key(session_id, source)
+        deadline = time.time() + float(timeout_s)
+        while time.time() < deadline:
+            with self._lock:
+                state = self._live.get(key)
+                running = bool(state.get("running")) if state is not None else False
+                ts = float(state.get("_capture_ts") or 0.0) if state is not None else 0.0
+                if state is not None:
+                    state["last_touch"] = time.time()  # consumer heartbeat
+            if ts > 0.0 and (time.time() - ts) <= 2.0:
+                return True
+            if not running:
+                try:
+                    self._ensure_live(session_id, source)
+                except Exception:
+                    return False
+            time.sleep(0.02)
+        return False
 
     def _class_state_payload(self, dataset_root: Path, class_name: str, limit: Optional[int] = None) -> Dict[str, Any]:
         class_dir = dataset_root / sanitize_class_name(class_name)
@@ -3379,7 +3837,13 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
     AVCaptureDevice order flips when virtual cameras (Iriun etc.) connect or
     disconnect, so snapshots pair names with the wrong cv2 indices.  On
     macOS each entry also carries the device uniqueID — capture by uniqueID
-    is stable, so consumers should prefer it over the positional index.
+    is stable, so consumers MUST prefer it over the positional index.
+
+    WARNING: this array order is NOT cv2's positional index order — OpenCV's
+    AVFoundation backend re-sorts the same device list by uniqueID.  Passing
+    the index from this list to cv2.VideoCapture can silently open a
+    DIFFERENT camera (e.g. Iriun at index 0 while this list shows the
+    built-in first).  Always open by unique_id on macOS.
     """
     options: List[Dict[str, str]] = []
     if sys.platform == "darwin":
@@ -3412,12 +3876,13 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
 
 
 def _resolve_webcam_index_from_unique_id(unique_id: Optional[str], max_count: int = 6) -> Optional[int]:
-    """Map a macOS AVCaptureDevice uniqueID to the CURRENT cv2 positional index.
+    """Map a macOS AVCaptureDevice uniqueID to its position in the CURRENT
+    AVFoundation enumeration — for dropdown preselection ONLY.
 
-    cv2's AVFoundation backend enumerates the same device array, so the array
-    position IS the cv2 index at this moment.  Re-resolving at OPEN time (not
-    list time) is what keeps the name→index pairing correct when virtual
-    cameras (Iriun etc.) connect or disconnect.
+    WARNING: this is NOT a cv2 positional index.  cv2's AVFoundation backend
+    re-sorts the device array by uniqueID, so passing this number to
+    cv2.VideoCapture can open a different camera.  The camera itself is
+    opened by uniqueID (mac_camera bridge); the index is purely a UI hint.
     """
     if not unique_id or sys.platform != "darwin":
         return None
@@ -3499,52 +3964,134 @@ def _preview_item_payload(path: Path) -> Dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class CameraOpenInfo:
+    """How (and which) camera _open_working_camera actually opened."""
+    backend: str  # "unique_id" (mac_camera bridge) | "cv2_index" | "failed"
+    index: int
+    unique_id: str
+    label: str
+    error: str
+
+
+def _camera_open_info_dict(info: Optional[CameraOpenInfo]) -> Dict[str, Any]:
+    if info is None:
+        return {}
+    return {
+        "backend": str(info.backend or ""),
+        "index": int(info.index or 0),
+        "unique_id": str(info.unique_id or ""),
+        "label": str(info.label or ""),
+        "error": str(info.error or ""),
+    }
+
+
+_bridge_opener = None
+_bridge_opener_checked = False
+_bridge_opener_lock = threading.Lock()
+
+
+def _get_macos_bridge_opener():
+    """Lazily import the AVCaptureSession bridge (never at module import).
+
+    mac_camera.py registers an ObjC class on first use; importing it here
+    (not at the top of record_controller) keeps processes that never open a
+    camera free of that cost, and a broken bridge degrades to None instead
+    of breaking ``import record_controller``.
+    """
+    global _bridge_opener, _bridge_opener_checked
+    with _bridge_opener_lock:
+        if not _bridge_opener_checked:
+            _bridge_opener_checked = True
+            try:
+                from mac_camera import open_macos_camera_by_unique_id as _opener
+                _bridge_opener = _opener
+            except Exception:
+                _bridge_opener = None
+        return _bridge_opener
+
+
+def _uid_for_webcam_index(camera_index: int, max_count: int = 6) -> str:
+    """Best-effort uniqueID for a positional index from a FRESH enumeration.
+
+    Legacy rescue only: old persisted state stored an index without a
+    uniqueID.  All new selections carry the uniqueID end-to-end from the
+    dropdown, so this is a safety net, not a primary path."""
+    try:
+        for item in list_webcam_options(max_count=max_count):
+            try:
+                if int(item.get("index", -1)) == int(camera_index):
+                    uid = str(item.get("unique_id") or "")
+                    if uid:
+                        return uid
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
 def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, max_probe_index: int = 3):
+    """Open the SELECTED camera, never "some camera that opens".
+
+    Resolution order on macOS: (a) unique_id present → open EXACTLY that
+    AVCaptureDevice via the mac_camera bridge; on failure return (None, info)
+    with NO positional substitution — silently opening the wrong device is
+    worse than a visible error (the live worker retries and surfaces the
+    message).  (b) no unique_id → derive one from a fresh enumeration (legacy
+    state rescue); if the bridge is unavailable, degrade to the positional
+    probe.  Non-macOS: positional probe as before.
+
+    Never raises; the second tuple element is a CameraOpenInfo (all existing
+    call sites discard it, so the shape change is safe).
+    """
     import cv2
 
-    if unique_id and sys.platform == "darwin":
-        # 1) macOS primary path: open by uniqueID directly.  Positional cv2
-        # indices drift when virtual cameras (Iriun, OBS, EpocCam) appear or
-        # disappear, so opening by ID is the only stable name->camera match.
+    idx = int(preferred_index or 0)
+    uid = str(unique_id or "").strip()
+    if sys.platform == "darwin" and uid:
+        opener = _get_macos_bridge_opener()
+        if opener is None:
+            return None, CameraOpenInfo("failed", idx, uid, "", "macOS camera bridge unavailable (mac_camera.py missing from the bundle).")
         try:
-            from mac_camera import open_macos_camera_by_unique_id
-
-            cap = open_macos_camera_by_unique_id(str(unique_id))
+            cap = opener(uid)
+        except Exception as e:
+            return None, CameraOpenInfo("failed", idx, uid, "", str(e)[:220])
+        if cap is not None and cap.isOpened():
+            return cap, CameraOpenInfo("unique_id", idx, uid, "", "")
+        return None, CameraOpenInfo("failed", idx, uid, "", f"Selected camera (ID {uid[:12]}…) is not connected or cannot be opened.")
+    if sys.platform == "darwin" and not uid:
+        derived = _uid_for_webcam_index(idx)
+        if derived:
+            opener = _get_macos_bridge_opener()
+            if opener is not None:
+                try:
+                    cap = opener(derived)
+                except Exception as e:
+                    return None, CameraOpenInfo("failed", idx, derived, "", str(e)[:220])
+                if cap is not None and cap.isOpened():
+                    return cap, CameraOpenInfo("unique_id", idx, derived, "", "")
+    candidates = [idx] + [i for i in range(max_probe_index + 1) if i != idx]
+    for i in candidates:
+        try:
+            cap = cv2.VideoCapture(int(i))
         except Exception:
-            cap = None
-        if cap is not None:
-            resolved = _resolve_webcam_index_from_unique_id(unique_id)
-            return cap, int(resolved if resolved is not None else preferred_index)
-        # 2) ID path failed — do NOT silently fall back to probing every
-        # positional index on macOS.  Probing all 0..N cv2 indices is how we
-        # end up streaming from a virtual camera (e.g. Iriun showing
-        # "Please start Iris Webcam ..." text frames) when the user actually
-        # selected the built-in camera from the list.  Only retry the single
-        # resolved position that corresponds to this exact uniqueID.
-        resolved = _resolve_webcam_index_from_unique_id(unique_id)
-        if resolved is not None:
-            for _attempt in range(6):
-                cap = cv2.VideoCapture(int(resolved))
-                if cap.isOpened():
-                    ok, frame = cap.read()
-                    if ok and frame is not None:
-                        return cap, int(resolved)
-                cap.release()
-                time.sleep(0.3)
-        return None, None
-
-    candidates = [int(preferred_index)] + [i for i in range(max_probe_index + 1) if i != int(preferred_index)]
-    for idx in candidates:
-        cap = cv2.VideoCapture(int(idx))
+            continue
         opened = bool(cap.isOpened())
         ok = False
         frame = None
         if opened:
-            ok, frame = cap.read()
+            try:
+                ok, frame = cap.read()
+            except Exception:
+                ok = False
         if opened and ok and frame is not None:
-            return cap, int(idx)
-        cap.release()
-    return None, None
+            return cap, CameraOpenInfo("cv2_index", int(i), "", "", "")
+        try:
+            cap.release()
+        except Exception:
+            pass
+    return None, CameraOpenInfo("failed", idx, uid, "", "No camera opened at any probed index.")
 
 
 def _raw96_to_png(

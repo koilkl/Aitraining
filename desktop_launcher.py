@@ -272,11 +272,12 @@ class _ShellApi:
         the local controller's /upload endpoint.
 
         Returns a list of per-file results:
-          {"filename": str, "ok": bool, "error": str, "image_b64": str, "thumb_b64": str}
+          {"filename": str, "saved_filename": str, "ok": bool, "error": str, "thumb_b64": str}
         so the SPA can show a detailed summary instead of a single success toast.
         """
         import base64 as _b64
         import pathlib as _pl
+        import urllib.error as _ue
 
         results = []
         try:
@@ -293,15 +294,17 @@ class _ShellApi:
             session = str(session or "").strip()
             class_name = str(class_name or "").strip()
             if not base_url or not session or not class_name:
+                results.append({"filename": "", "saved_filename": "", "ok": False, "error": "missing upload context (reload page)", "thumb_b64": ""})
                 return results
             endpoint = f"{base_url}/upload"
             for p in paths:
                 fpath = _pl.Path(str(p))
                 fname = fpath.name
+                saved = ""
                 try:
                     data = fpath.read_bytes()
                 except Exception as e:
-                    results.append({"filename": fname, "ok": False, "error": f"read failed: {e}"})
+                    results.append({"filename": fname, "saved_filename": "", "ok": False, "error": f"read failed: {e}", "thumb_b64": ""})
                     continue
                 payload = {
                     "session": session,
@@ -309,30 +312,49 @@ class _ShellApi:
                     "image_b64": _b64.b64encode(data).decode("ascii"),
                     "filename": fname,
                 }
+                ok = False
+                err = ""
+                thumb = ""
                 try:
                     req = urllib.request.Request(
                         endpoint,
                         data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
+                        headers={"Content-Type": "application/json", "Accept": "application/json"},
                     )
                     with urllib.request.urlopen(req, timeout=45) as resp:
-                        body = json.loads(resp.read().decode("utf-8") or "{}")
+                        raw = resp.read()
+                        body = json.loads(raw.decode("utf-8") or "{}")
                     ok = str(body.get("ok") or "0") == "1"
-                    err = "" if ok else str(body.get("error") or "upload failed")
+                    err = "" if ok else str(body.get("error") or "upload rejected")
                     thumb = str(body.get("thumb_b64") or "")
+                    saved = str(body.get("filename") or "")
+                except _ue.HTTPError as he:
+                    err_body = ""
+                    try:
+                        raw = he.read()
+                        err_body = json.loads(raw.decode("utf-8") or "{}").get("error", "")
+                    except Exception:
+                        err_body = ""
+                    ok = False
+                    err = f"server HTTP {he.code}: {err_body or he.reason}"
+                    thumb = ""
+                except _ue.URLError as ue:
+                    ok = False
+                    err = f"network unreachable: {ue.reason}"
+                    thumb = ""
                 except Exception as e:
                     ok = False
-                    err = f"network: {e}"
+                    err = f"upload failed: {e}"
                     thumb = ""
                 results.append({
                     "filename": fname,
+                    "saved_filename": saved,
                     "ok": bool(ok),
                     "error": str(err or ""),
-                    "image_b64": "",
                     "thumb_b64": thumb if ok else "",
                 })
         except Exception as e:
-            results.append({"filename": "", "ok": False, "error": f"picker failed: {e}"})
+            results.append({"filename": "", "saved_filename": "", "ok": False, "error": f"picker failed: {e}", "thumb_b64": ""})
         return results
 
     def pick_single_image_file(self) -> dict:
