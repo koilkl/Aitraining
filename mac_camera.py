@@ -89,18 +89,17 @@ def shutdown_all_caps(wait_s: float = 0.15) -> int:
 
 
 def _atexit_shutdown() -> None:
-    # Runs during interpreter finalization (any thread may have registered
-    # it; callbacks run on the main thread).  Stop the sessions so no NEW
-    # frames are dispatched, then — if any capture was actually open — exit
-    # HARD.  A frame block queued just before detach must never reach the
-    # GIL while the runtime is finalizing (that is the SIGKILL crash);
-    # os._exit skips the rest of finalization entirely, so it never can.
-    n = shutdown_all_caps(wait_s=0.0)
-    if n > 0:
-        try:
-            os._exit(0)
-        except Exception:
-            pass
+    # Runs during interpreter shutdown (before finalization, main thread).
+    # Stop the sessions so no NEW frames are dispatched, then give the
+    # dispatch queue a short window to drain any sample-buffer block that
+    # was queued just before detach — the drain is what prevents the
+    # pthread_exit() crash once finalization begins.  We must NOT os._exit
+    # here: exiting hard skips every OTHER atexit handler (HTTP server
+    # stop, live-worker/serial cleanup in record_controller), which is what
+    # leaked resources after closing the app.  The launcher-side SIGTERM
+    # handler (desktop_launcher) covers the one path that bypasses atexit
+    # entirely.
+    shutdown_all_caps(wait_s=0.25)
 
 
 def _load_backend() -> Optional[dict]:

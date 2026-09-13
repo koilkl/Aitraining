@@ -158,6 +158,27 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
         log_file = (Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log").resolve()
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.touch(exist_ok=True)
+    import signal as _signal
+
+    def _on_terminate_signal(signum, frame):
+        # Window closed → the launcher calls proc.terminate() → SIGTERM.
+        # The default handler would kill this process WITHOUT running
+        # atexit, so the camera bridge would never release its
+        # AVCaptureSessions (camera stays claimed, pthread trap on
+        # finalization).  Release them here while the interpreter is fully
+        # alive, then exit normally so every other atexit handler
+        # (controller / server / serial cleanup) runs too.
+        try:
+            import mac_camera
+
+            mac_camera.shutdown_all_caps(wait_s=0.2)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _on_terminate_signal)
+    _signal.signal(_signal.SIGINT, _on_terminate_signal)
+
     with log_file.open("a", encoding="utf-8") as f:
         try:
             import resource
@@ -439,8 +460,19 @@ def main() -> None:
 
 def _shutdown_and_exit(proc: multiprocessing.Process) -> None:
     if proc.is_alive():
+        # SIGTERM → the child's handler releases the camera sessions and
+        # exits gracefully (its atexit handlers run).
         proc.terminate()
         proc.join(timeout=5)
+    if proc.is_alive():
+        # The child ignored/hung on SIGTERM (e.g. blocked in a camera read).
+        # SIGKILL it so it can never outlive the window and keep the camera
+        # claimed — the OS reclaims the capture hardware on process death.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        proc.join(timeout=3)
     os._exit(0)
 
 

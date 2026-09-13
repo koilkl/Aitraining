@@ -8965,6 +8965,28 @@ def _get_record_controller() -> RecordController:
         c._hot_mtime = _hot_module_mtimes().get("record_controller")
     except Exception:
         pass
+    if not getattr(c, "_exit_hooked", False):
+        c._exit_hooked = True
+        import atexit as _atexit_mod
+
+        def _release_controller_at_exit() -> None:
+            # App-close cleanup: stop live workers (their finally blocks
+            # release the camera / serial handles), release every bridge
+            # AVCaptureSession, and shut the HTTP server down.  Hot-reload
+            # creates a second instance whose handler is also registered —
+            # release_all_resources is idempotent, so both firing is safe.
+            try:
+                c.release_all_resources()
+            except Exception:
+                pass
+            try:
+                from mac_camera import shutdown_all_caps as _shutdown_caps
+
+                _shutdown_caps(wait_s=0.2)
+            except Exception:
+                pass
+
+        _atexit_mod.register(_release_controller_at_exit)
     return c
 
 
