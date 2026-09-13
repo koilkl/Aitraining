@@ -325,6 +325,122 @@ class _ShellApi:
         # still calls this from requestShellLayoutRefresh; just acknowledge it.
         return False
 
+    def pick_upload_files(self, base_url: str, session: str, class_name: str) -> list:
+        """Native file picker for the SPA upload button.
+
+        The SPA's <input type="file"> does not reliably open a dialog inside
+        pywebview on macOS, so the SPA calls this JS API instead: open the
+        native open-file dialog, read the chosen images, and POST them to
+        the local controller's /upload endpoint.
+
+        Returns a list of per-file results:
+          {"filename": str, "saved_filename": str, "ok": bool, "error": str, "thumb_b64": str}
+        so the SPA can show a detailed summary instead of a single success toast.
+        """
+        import base64 as _b64
+        import pathlib as _pl
+        import urllib.error as _ue
+
+        results = []
+        try:
+            import webview as _webview
+
+            paths = _webview.create_file_dialog(
+                _webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)",),
+            )
+            if not paths:
+                return results
+            base_url = str(base_url or "").strip()
+            session = str(session or "").strip()
+            class_name = str(class_name or "").strip()
+            if not base_url or not session or not class_name:
+                results.append({"filename": "", "saved_filename": "", "ok": False, "error": "missing upload context (reload page)", "thumb_b64": ""})
+                return results
+            endpoint = f"{base_url}/upload"
+            for p in paths:
+                fpath = _pl.Path(str(p))
+                fname = fpath.name
+                saved = ""
+                try:
+                    data = fpath.read_bytes()
+                except Exception as e:
+                    results.append({"filename": fname, "saved_filename": "", "ok": False, "error": f"read failed: {e}", "thumb_b64": ""})
+                    continue
+                payload = {
+                    "session": session,
+                    "class": class_name,
+                    "image_b64": _b64.b64encode(data).decode("ascii"),
+                    "filename": fname,
+                }
+                ok = False
+                err = ""
+                thumb = ""
+                try:
+                    req = urllib.request.Request(
+                        endpoint,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        raw = resp.read()
+                        body = json.loads(raw.decode("utf-8") or "{}")
+                    ok = str(body.get("ok") or "0") == "1"
+                    err = "" if ok else str(body.get("error") or "upload rejected")
+                    thumb = str(body.get("thumb_b64") or "")
+                    saved = str(body.get("filename") or "")
+                except _ue.HTTPError as he:
+                    err_body = ""
+                    try:
+                        raw = he.read()
+                        err_body = json.loads(raw.decode("utf-8") or "{}").get("error", "")
+                    except Exception:
+                        err_body = ""
+                    ok = False
+                    err = f"server HTTP {he.code}: {err_body or he.reason}"
+                    thumb = ""
+                except _ue.URLError as ue:
+                    ok = False
+                    err = f"network unreachable: {ue.reason}"
+                    thumb = ""
+                except Exception as e:
+                    ok = False
+                    err = f"upload failed: {e}"
+                    thumb = ""
+                results.append({
+                    "filename": fname,
+                    "saved_filename": saved,
+                    "ok": bool(ok),
+                    "error": str(err or ""),
+                    "thumb_b64": thumb if ok else "",
+                })
+        except Exception as e:
+            results.append({"filename": "", "saved_filename": "", "ok": False, "error": f"picker failed: {e}", "thumb_b64": ""})
+        return results
+
+    def pick_single_image_file(self) -> dict:
+        """Native single-image picker for the preview Upload-File source."""
+        import base64 as _b64
+        import pathlib as _pl
+        import mimetypes as _mt
+
+        try:
+            import webview as _webview
+
+            paths = _webview.create_file_dialog(
+                _webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)",),
+            )
+            if not paths:
+                return {}
+            fpath = _pl.Path(str(paths[0]))
+            data = fpath.read_bytes()
+            mime = _mt.guess_type(fpath.name)[0] or "image/png"
+            return {"name": fpath.name, "mime": mime, "b64": _b64.b64encode(data).decode("ascii")}
+        except Exception:
+            return {}
 
 _SPLASH_HTML = """<!doctype html>
 <html>
@@ -412,9 +528,16 @@ def main() -> None:
 
         shell_api = _ShellApi()
         _startup_log("creating window")
-        # No js_api: the JS-bridge generation (generate_js_object) held the GIL
-        # and deadlocked against the WebView2 resource-request callback.
-        window = webview.create_window("TF Lite Training", url, width=1200, height=800)
+        if sys.platform == "darwin":
+            # macOS: expose the native file-picker JS API (the SPA's
+            # <input type="file"> does not reliably open inside pywebview
+            # there).
+            window = webview.create_window("TF Lite Training", url, width=1200, height=800, js_api=shell_api)
+        else:
+            # Windows: NO js_api — the JS-bridge generation (generate_js_object)
+            # held the GIL and deadlocked against the WebView2 resource-request
+            # callback.  The SPA falls back to the browser file input.
+            window = webview.create_window("TF Lite Training", url, width=1200, height=800)
         shell_api.bind(window)
         # No resize/layout handlers: evaluate_js during a window drag deadlocks
         # the WebView2 UI thread. The iframe height is handled by the SPA's own

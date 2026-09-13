@@ -989,7 +989,7 @@ def _render_camera_permission_card() -> None:
         )
     with right:
         if st.button("Request", key="tm_request_camera_access", use_container_width=True):
-            result = ensure_camera_access(int(st.session_state.tm_webcam_index))
+            result = ensure_camera_access(int(st.session_state.tm_webcam_index or 0), probe_open=False, unique_id=str(st.session_state.get("tm_webcam_id") or ""))
             st.session_state.tm_camera_permission_status = result.status
             st.session_state.tm_camera_permission_note = result.message
             st.rerun()
@@ -1395,9 +1395,30 @@ def _list_camera_options(max_count: int = 6) -> List[Dict[str, str]]:
     # disconnect — never cache this list.
     try:
         from record_controller import list_webcam_options
-        return list_webcam_options(max_count=max_count)
+        result = list_webcam_options(max_count=max_count)
+        # Normalise: every entry must carry a unique_id key (even if empty)
+        # so the frontend <option data-uid=""> render never gets
+        # `undefined` → empty string, and Apply never sends an undefined
+        # uid to /live/config.  A missing `unique_id` key on any entry
+        # cascades to the UI showing the correct label but opening the
+        # wrong camera (silent positional fallback).
+        for item in result:
+            if "unique_id" not in item:
+                item["unique_id"] = str(
+                    item.get("uid") or item.get("id") or ""
+                )
+        return result
     except Exception:
-        return [{"index": i, "label": f"Camera {i}"} for i in range(max_count)]
+        # Last-resort fallback: produce entries with empty unique_id and
+        # generic labels.  In this degraded mode the camera open falls
+        # back to positional index, which on macOS with Iriun/OBS installed
+        # will prefer the virtual feed.  The unique_id key is still present
+        # (albeit empty) so the frontend's JS property access does not
+        # yield `undefined`.
+        return [
+            {"index": i, "label": f"Camera {i}", "unique_id": ""}
+            for i in range(max_count)
+        ]
 
 
 def _tm_sample_previews(classes: List[str], limit_per_class: Optional[int] = None) -> Dict[str, List[Dict[str, str]]]:
@@ -1447,18 +1468,38 @@ def _is_virtual_camera_label(label: str) -> bool:
     return any(m in s for m in markers)
 
 
-def _preferred_webcam_index(options: List[Dict[str, str]]) -> int:
+def _preferred_webcam(options: List[Dict[str, str]]) -> Tuple[int, str]:
+    """Return (preferred_index, preferred_unique_id) tuple.
+
+    Always returns the unique_id alongside the index so callers do not need
+    to do a second lookup.  The previous helper returned only the index and
+    every call site had to re-derive the id (or forgot it and fell back to
+    positional index 0 which opened Iriun/OBS instead of the built-in
+    camera on macOS).
+    """
     for item in options:
         label = str(item.get("label", ""))
         if not _is_virtual_camera_label(label):
             try:
-                return int(item.get("index", 0))
+                idx = int(item.get("index", 0))
+                uid = str(item.get("unique_id") or item.get("uid") or item.get("id") or "")
+                return idx, uid
             except Exception:
                 continue
-    try:
-        return int(options[0].get("index", 0)) if options else 0
-    except Exception:
-        return 0
+    if options:
+        try:
+            idx = int(options[0].get("index", 0))
+            uid = str(options[0].get("unique_id") or options[0].get("uid") or options[0].get("id") or "")
+            return idx, uid
+        except Exception:
+            return 0, ""
+    return 0, ""
+
+
+# Backwards-compatible alias — a few call sites were already written to
+# consume just the index; kept so nothing breaks if we missed one.
+def _preferred_webcam_index(options: List[Dict[str, str]]) -> int:
+    return _preferred_webcam(options)[0]
 
 
 def _load_persisted_webcam() -> Optional[Dict[str, Any]]:
@@ -1555,8 +1596,8 @@ def _render_tm_old_frontend_html(
         },
         "train_rec": _tm_train_recommendations(train_cfg),
     }
-    debug_server_url = "http://127.0.0.1:7777/event"
-    debug_session_id = "capture-webcam-source"
+    debug_server_url = None
+    debug_session_id = None
     try:
         for env_path in (Path(".dbg/open-project-layout.env"), Path(".dbg/open-project-page-stuck.env"), Path(".dbg/packaged-webcam-bounce.env"), Path(".dbg/capture-webcam-source.env")):
             if env_path.exists():
@@ -1637,10 +1678,9 @@ def _render_tm_old_frontend_html(
       position: relative;
       background: var(--bg);
       border-radius: 12px;
-      padding: 80px 18px 92px 18px;
+      padding: 72px 16px 92px 16px;
       min-height: 620px;
-      overflow-x: clip;
-      overflow-y: clip;
+      overflow: visible;
     }}
     .topnav {{
       position: absolute;
@@ -2161,9 +2201,11 @@ def _render_tm_old_frontend_html(
     }}
     .flow {{
       position: absolute;
-      inset: 0;
+      top: 0;
+      left: 0;
       width: 100%;
-      height: 100%;
+      height: 0;
+      overflow: visible;
       z-index: 1;
       pointer-events: none;
     }}
@@ -3062,7 +3104,7 @@ let debugEventDisabled = false;
 function dbgEvent(hypothesisId, location, msg, data) {{
   if (!DEBUG_ENABLED || debugEventDisabled) return;
   try {{
-    fetch(STATE.debug_server_url || 'http://127.0.0.1:7777/event', {{
+    fetch(url, {{
       method: 'POST',
       headers: {{'Content-Type':'application/json'}},
       body: JSON.stringify({{
@@ -3237,6 +3279,7 @@ function syncFrameHeight() {{
   sendStreamlitMessage('streamlit:setFrameHeight', {{height: targetHeight}});
 }}
 function queueFrameHeightSync() {{
+function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;
   if (frameHeightRaf) {{
     try {{ cancelAnimationFrame(frameHeightRaf); }} catch (e) {{}}
@@ -3327,7 +3370,26 @@ dbgEvent('B', 'app.py:initialOpenSource', '[DEBUG] initial open source from payl
   openSourceKind,
 }});
 // #endregion
-let previewTimer = null;
+// Class-panel source live loop: updates sourcePreview-${{className}} <img> from /live/frame.
+let sourceLiveTimer = null;
+// Class-panel source preview uses its own blob URL so it does NOT get
+// revoked when the Preview-card visual loop updates `previewBlobUrl`.
+// Previously the two loops shared one `previewBlobUrl` and each side
+// called `clearPreviewBlob()` → `URL.revokeObjectURL(previewBlobUrl)` for
+// the other loop's active <img src>, so pressing Hold froze the class
+// panel camera view on every single frame refresh.
+let classSourceBlobUrl = '';
+let classSourceRequestInFlight = false;
+let classSourceAbortController = null;
+let classSourceInFlightAt = 0;
+// Preview-card visual-only loop: updates the Preview pane's <img> WITHOUT running
+// inference — used so the preview stays "live" even when we pause the prediction
+// timer during hold-to-capture to save CPU.
+let previewVisualTimer = null;
+let previewVisualToken = 0;
+let previewVisualInFlight = false;
+// Preview prediction loop: runs /preview/predict inference, updates bars & roi/crop toggles.
+let previewPredictTimer = null;
 let previewBlobUrl = '';
 let previewRequestInFlight = false;
 let previewFrameController = null;
@@ -3336,6 +3398,7 @@ let holdRecording = false;
 let holdRecordClass = '';
 let holdRecordSource = '';
 let holdResumePreviewPredict = false;
+let holdResumePreviewVisual = false;
 let holdPreviewSourceBeforeCapture = 'webcam';
 let holdSyncTimer = null;
 let holdPollController = null;
@@ -3377,10 +3440,11 @@ let previewOodEntropyRatioMax = 0.70;
 let previewUploadImageSrc = '';
 let previewUploadImageB64 = '';
 let previewUploadFilename = '';
-let previewPredictTimer = null;
 let previewPredictInFlight = false;
 let previewPredictController = null;
 let previewPredictToken = 0;
+let previewLastPredictData = null;
+let previewLastStaticImageSrc = '';
 let previewSettingsOpen = false;
 let classPreprocessOpen = false;
 let classPreprocessClass = '';
@@ -4633,21 +4697,101 @@ function reloadParent() {{
   }} catch (e) {{}}
   window.location.reload();
 }}
-function stopPreviewLoop() {{
-  if (previewFrameController) {{
-    try {{ previewFrameController.abort(); }} catch (e) {{}}
-    previewFrameController = null;
+// -------- Class panel source live loop (sourcePreview-${{className}} <img>) --------
+// ⚠️ Uses its own blob URL + abort controller to stay independent from the
+// Preview-card visual/predict loops.  Previously they shared `previewBlobUrl`
+// and `previewFrameController`, so Hold-to-Capture (which touches the
+// Preview loop timers on purpose) would cancel or revoke the class panel's
+// active fetch mid-flight and make the camera view appear frozen.
+function stopSourceLiveLoop() {{
+  if (classSourceAbortController) {{
+    try {{ classSourceAbortController.abort(); }} catch (e) {{}}
+    classSourceAbortController = null;
   }}
-  previewRequestInFlight = false;
-  if (previewTimer) {{
-    clearInterval(previewTimer);
-    previewTimer = null;
+  classSourceRequestInFlight = false;
+  classSourceInFlightAt = 0;
+  if (sourceLiveTimer) {{
+    clearInterval(sourceLiveTimer);
+    sourceLiveTimer = null;
   }}
 }}
-function startPreviewLoop() {{
-  stopPreviewLoop();
+function startSourceLiveLoop() {{
+  stopSourceLiveLoop();
   refreshPreviewImage();
-  previewTimer = window.setInterval(refreshPreviewImage, Math.max(40, Number(previewIntervalMs || 80)));
+  sourceLiveTimer = window.setInterval(refreshPreviewImage, Math.max(40, Number(previewIntervalMs || 80)));
+}}
+// Legacy aliases — kept so call sites we haven't yet switched keep compiling;
+// prefer the explicit names above.
+const stopPreviewLoop = stopSourceLiveLoop;
+const startPreviewLoop = startSourceLiveLoop;
+
+// -------- Preview-card visual-only loop (updates <img> WITHOUT inference) --------
+function stopPreviewVisualLoop() {{
+  previewVisualToken += 1;
+  previewVisualInFlight = false;
+  if (previewVisualTimer) {{
+    clearInterval(previewVisualTimer);
+    previewVisualTimer = null;
+  }}
+}}
+async function refreshPreviewVisualFrame(token) {{
+  // Visual refresh drives the Preview pane only while Input is ON but the
+  // predict timer is paused (hold-to-capture / single capture).  With
+  // Input OFF the pane must NOT stream — previously the visual loop ran
+  // regardless of Input, so the camera opened and the pane showed live
+  // frames without the user toggling Input (the "preview already opened"
+  // bug).
+  if (previewSource === 'upload') return;
+  if (previewSource !== 'webcam' && previewSource !== 'device') return;
+  // The visual loop drives the pane ONLY while Input is ON but the predict
+  // timer is paused (hold-to-capture / single capture).  With Input OFF the
+  // pane must stay on the last prediction or the empty state — running the
+  // visual loop then opened the camera and streamed live frames without the
+  // user toggling Input (the "preview already opened" bug).  When the
+  // predict loop runs it owns the pane (processed crop/roi image); two
+  // writers to the same <img> flickered between raw and processed frames.
+  if (!previewInputOn) return;
+  if (previewPredictTimer) return;
+  if (previewVisualInFlight) return;
+  if (token !== previewVisualToken) return;
+  const sess = String(STATE.session || '').trim();
+  if (!sess) return;
+  // The pane's real image element — a nonexistent 'previewPaneImg' id here
+  // made this whole loop dead code, so the pane froze whenever inference
+  // was paused (the "Preview freezes during Hold" half of the bug).
+  const paneImg = document.getElementById('previewImage');
+  if (!paneImg || !paneImg.closest('#previewPane')) return;
+  previewVisualInFlight = true;
+  try {{
+    const res = await fetch(`${{baseUrl}}/live/frame?session=${{encodeURIComponent(sess)}}&source=${{encodeURIComponent(previewSource)}}&_ts=${{Date.now()}}`);
+    if (!res.ok || token !== previewVisualToken) return;
+    const blob = await res.blob();
+    if (token !== previewVisualToken) return;
+    if (previewPredictTimer) return;  // predict resumed mid-fetch
+    if (previewBlobUrl) try {{ URL.revokeObjectURL(previewBlobUrl); }} catch (e) {{}}
+    previewBlobUrl = URL.createObjectURL(blob);
+    paneImg.src = previewBlobUrl;
+  }} catch (e) {{
+    // Visual refresh is best-effort — if the backend is busy saving samples
+    // we don't want to spam errors.
+  }} finally {{
+    previewVisualInFlight = false;
+  }}
+}}
+function startPreviewVisualLoop() {{
+  stopPreviewVisualLoop();
+  if (previewSource === 'upload') return;
+  if (previewSource !== 'webcam' && previewSource !== 'device') return;
+  // Never tick with Input OFF — the pane must not show live frames (or
+  // open the camera) unless the user toggled Input ON.
+  if (!previewInputOn) return;
+  previewVisualToken += 1;
+  const token = previewVisualToken;
+  refreshPreviewVisualFrame(token);
+  previewVisualTimer = window.setInterval(
+    () => refreshPreviewVisualFrame(token),
+    Math.max(40, Number(previewIntervalMs || 80))
+  );
 }}
 function stopHoldSyncLoop() {{
   holdNextToken += 1;
@@ -4661,10 +4805,16 @@ function stopHoldSyncLoop() {{
   }}
 }}
 function clearPreviewBlob() {{
-  if (previewBlobUrl) {{
-    try {{ URL.revokeObjectURL(previewBlobUrl); }} catch (e) {{}}
-    previewBlobUrl = '';
-  }}
+  if (!previewBlobUrl) return;
+  // Never revoke a URL the pane <img> is still displaying — the visual
+  // loop replaces it on the next tick, so a revoked-while-shown blob used
+  // to blank the pane until then.
+  try {{
+    const paneImg = document.getElementById('previewImage');
+    if (paneImg && paneImg.getAttribute('src') === previewBlobUrl) return;
+  }} catch (e) {{}}
+  try {{ URL.revokeObjectURL(previewBlobUrl); }} catch (e) {{}}
+  previewBlobUrl = '';
 }}
 function syncSourceActionButtons(className) {{
   if (!className) return;
@@ -4710,24 +4860,58 @@ async function closeSourcePanel(shouldRender = true) {{
 }}
 function refreshPreviewImage() {{
   if (!openSourceKind || !openSourceClass || openSourceKind === 'upload') return;
-  if (previewRequestInFlight) return;
+  if (classSourceRequestInFlight) {{
+    if (classSourceAbortController && classSourceInFlightAt && (Date.now() - classSourceInFlightAt) > 1500) {{
+      try {{ classSourceAbortController.abort(); }} catch (e) {{}}
+      classSourceAbortController = null;
+      classSourceRequestInFlight = false;
+      classSourceInFlightAt = 0;
+    }} else {{
+      return;
+    }}
+  }}
+  const sess = String(STATE.session || '').trim();
+  if (!sess) return;
   const img = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
   const note = document.getElementById(`sourceNote-${{cssSafe(openSourceClass)}}`);
   if (!img || !note) return;
-  const url = `${{baseUrl}}/live/frame?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&_ts=${{Date.now()}}`;
-  previewRequestInFlight = true;
-  previewFrameController = new AbortController();
-  fetch(url, {{ signal: previewFrameController.signal }}).then(async (res) => {{
+  const url = `${{baseUrl}}/live/frame?session=${{encodeURIComponent(sess)}}&source=${{encodeURIComponent(openSourceKind)}}&_ts=${{Date.now()}}`;
+  classSourceRequestInFlight = true;
+  classSourceAbortController = new AbortController();
+  classSourceInFlightAt = Date.now();
+  const ourUrl = url;
+  const ourController = classSourceAbortController;
+  const abortTimer = window.setTimeout(() => {{
+    if (ourController === classSourceAbortController) {{
+      try {{ ourController.abort(); }} catch (e) {{}}
+    }}
+  }}, 1500);
+  fetch(ourUrl, {{ signal: classSourceAbortController.signal }}).then(async (res) => {{
+    if (ourController !== classSourceAbortController) return;
     if (!res.ok) {{
       let msg = '';
+      let starting = false;
       try {{
         const data = await res.json();
         msg = String(data && data.error ? data.error : '');
+        starting = String(data && data.starting ? data.starting : '0') === '1';
       }} catch (e) {{}}
       if (!msg) {{
         msg = openSourceKind === 'device'
           ? 'Unable to read from serial device. Check serial port and baudrate.'
           : 'Unable to open webcam. Check permission or whether the camera is in use.';
+      }}
+      if (starting) {{
+        // The producer is (re)starting — KEEP the last good frame on screen
+        // (never blank it) and retry on the next tick.  This is the H4
+        // self-recovery path: a transient stall reads as a still image for
+        // ≤1 tick, never as a permanent freeze.
+        if (img.getAttribute('src')) {{
+          note.textContent = '';
+          return;
+        }}
+        note.textContent = msg || 'Preview starting...';
+        return;
       }}
       throw new Error(msg);
     }}
@@ -4741,18 +4925,42 @@ function refreshPreviewImage() {{
       throw new Error(msg);
     }}
     const blob = await res.blob();
-    clearPreviewBlob();
-    previewBlobUrl = URL.createObjectURL(blob);
-    img.src = previewBlobUrl;
+    if (ourController !== classSourceAbortController) return;
+    // Revoke ONLY the class-panel source blob URL — do not touch
+    // `previewBlobUrl` (used by the Preview card visual/predict loops;
+    // sharing one URL caused the source preview to lose its img src every
+    // single frame during hold capture, making the camera view appear
+    // completely frozen).
+    if (classSourceBlobUrl) {{
+      try {{ URL.revokeObjectURL(classSourceBlobUrl); }} catch (e) {{}}
+      classSourceBlobUrl = '';
+    }}
+    classSourceBlobUrl = URL.createObjectURL(blob);
+    img.src = classSourceBlobUrl;
     note.textContent = '';
   }}).catch((err) => {{
+    if (ourController !== classSourceAbortController) return;
     if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
-    clearPreviewBlob();
+    if (classSourceBlobUrl) {{
+      try {{ URL.revokeObjectURL(classSourceBlobUrl); }} catch (e) {{}}
+      classSourceBlobUrl = '';
+    }}
     img.removeAttribute('src');
     note.textContent = String(err && err.message ? err.message : err);
   }}).finally(() => {{
-    previewRequestInFlight = false;
-    previewFrameController = null;
+    try {{ clearTimeout(abortTimer); }} catch (e) {{}}
+    if (ourController === classSourceAbortController) {{
+      classSourceRequestInFlight = false;
+      classSourceAbortController = null;
+      classSourceInFlightAt = 0;
+    }} else {{
+      // Our request got superseded — still clear the in-flight flag if
+      // we were the last owner (bounded to keep flags consistent).
+      if (classSourceRequestInFlight && !classSourceAbortController) {{
+        classSourceRequestInFlight = false;
+        classSourceInFlightAt = 0;
+      }}
+    }}
   }});
 }}
 async function openSourcePanel(kind, className) {{
@@ -4783,17 +4991,23 @@ async function openSourcePanel(kind, className) {{
     startPreviewLoop();
   }}
 }}
-async function ensureOpenSourceLive() {{
+async function ensureOpenSourceLive(opts = {{}}) {{
   // #region debug-point B:ensure-open-source-live
-  dbgEvent('B', 'app.py:ensureOpenSourceLive', '[DEBUG] ensureOpenSourceLive enter', {{openSourceClass, openSourceKind}});
+  dbgEvent('B', 'app.py:ensureOpenSourceLive', '[DEBUG] ensureOpenSourceLive enter', {{openSourceClass, openSourceKind, session: String(STATE.session || '')}});
   // #endregion
   if (!openSourceKind || !openSourceClass) return;
   if (openSourceKind !== 'webcam' && openSourceKind !== 'device') return;
+  const sess = String(STATE.session || '').trim();
+  if (!sess) {{
+    if (!opts.silent) toast('Workspace still initializing — try again in 1-2 seconds.', 3500);
+    return;
+  }}
   try {{
-    const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&frame_side=${{encodeURIComponent(String(currentSerialFrameSide || 96))}}&channels=${{encodeURIComponent(String(currentSerialChannels || 1))}}`);
+    const res = await fetch(`${{baseUrl}}/live/open?session=${{encodeURIComponent(sess)}}&source=${{encodeURIComponent(openSourceKind)}}&frame_side=${{encodeURIComponent(String(currentSerialFrameSide || 96))}}&channels=${{encodeURIComponent(String(currentSerialChannels || 1))}}`);
     if (!res.ok) {{
       const data = await res.json().catch(() => ({{ok:'0'}}));
-      toast(String(data && data.error ? data.error : 'Unable to open live preview.'));
+      const msg = String(data && data.error ? data.error : 'Unable to open live preview.');
+      if (!opts.silentFail) toast(msg);
     }}
   }} catch (e) {{}}
   startPreviewLoop();
@@ -4813,10 +5027,10 @@ async function captureSource() {{
   try {{
     if (shouldResumePreviewPredict) {{
       stopPreviewPredictLoop();
-      try {{
-        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSourceBeforeCapture)}}`);
-      }} catch (e) {{}}
-      await new Promise((r) => setTimeout(r, 120));
+      // NOTE: no /live/close here for ANY source — the backend single
+      // capture now consumes the live worker's capture cache (device
+      // included), and closing the shared worker used to freeze the
+      // class-panel camera view until Preview Input was toggled off/on.
     }}
     const res = await fetch(url);
     const data = await res.json().catch(() => ({{ok:'0', error:'capture failed'}}));
@@ -5640,20 +5854,32 @@ async function startHoldCapture() {{
   try {{
     holdResumePreviewPredict = !!previewInputOn;
     holdPreviewSourceBeforeCapture = String(previewSource || 'webcam');
+    // Pause prediction (TFLite + preprocess CPU) during hold capture so
+    // PNG saves + ROI focus don't contend.  VISUAL UPDATE LOOP and class
+    // panel source loop are LEFT RUNNING — this is the exact fix for
+    // "preview pane freezes the moment hold starts".
     if (holdResumePreviewPredict) {{
       stopPreviewPredictLoop();
-      try {{
-        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(holdPreviewSourceBeforeCapture)}}`);
-      }} catch (e) {{}}
-      await new Promise((r) => setTimeout(r, 120));
     }}
-    if (openSourceKind === 'webcam' || openSourceKind === 'device') {{
-      stopPreviewLoop();
-      clearPreviewBlob();
-      try {{
-        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}`);
-      }} catch (e) {{}}
-      await new Promise((r) => setTimeout(r, 120));
+    // Make sure the Preview visual loop stays alive for the webcam path even
+    // if the user turned Input on a split-second before pressing Hold (in
+    // which case startPreviewPredictLoop() may not have fired yet).
+    holdResumePreviewVisual = false;
+    if (openSourceKind === 'webcam' && previewInputOn && previewSource === 'webcam') {{
+      if (!previewVisualTimer) {{
+        startPreviewVisualLoop();
+        holdResumePreviewVisual = true;
+      }}
+    }}
+    // BOTH sources keep EVERYTHING running during hold.  NO close, NO stop,
+    // NO restart.  The backend record thread now consumes the live worker's
+    // capture cache (device included — the serial reader stays single), so
+    // the class-panel /live/frame loop, the Preview visual loop and the
+    // backend live thread all keep going.  Previously the device path
+    // stopped the class loop + /live/closed the worker for the whole hold —
+    // the class-panel view froze on press every single time.
+    if (!sourceLiveTimer) {{
+      startSourceLiveLoop();
     }}
     const res = await fetch(`${{baseUrl}}/start?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(openSourceKind)}}&class=${{encodeURIComponent(openSourceClass)}}`);
     const data = await res.json().catch(() => ({{ok:'0'}}));
@@ -5736,12 +5962,20 @@ async function stopHoldCapture() {{
   }} catch (e) {{}}
   await syncClassState(className);
   if (openSourceClass === className) updateOpenSamplesPanel(className);
+  // Restore the class-panel live loop FIRST and UNCONDITIONALLY — the old
+  // `else if` skipped it whenever Preview Input was ON (only the predict
+  // loop resumed), so the class view stayed frozen after a hold.
+  if (openSourceClass === className && openSourceKind === sourceKind && (sourceKind === 'webcam' || sourceKind === 'device')) {{
+    await ensureOpenSourceLive();
+  }}
   if (shouldResumePreviewPredict && previewInputOn) {{
     previewSource = previewSourceBeforeCapture;
     startPreviewPredictLoop();
-  }} else if (openSourceClass === className && openSourceKind === sourceKind && (sourceKind === 'webcam' || sourceKind === 'device')) {{
-    await ensureOpenSourceLive();
   }}
+  if (holdResumePreviewVisual && !previewVisualTimer) {{
+    startPreviewVisualLoop();
+  }}
+  holdResumePreviewVisual = false;
   toast('Hold capture stopped.');
 }}
 function buildDeviceOptions(selected) {{
@@ -6245,38 +6479,13 @@ async function refreshPreviewPrediction(token) {{
   if (token !== previewPredictToken) return;
   previewPredictInFlight = true;
   previewPredictController = new AbortController();
-  const pane = document.getElementById('previewPane');
   const note = document.getElementById('previewNote');
-  const imgId = 'previewImage';
   try {{
     const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(previewThreshUserModified ? String(previewDarkThresh ?? '') : '')}}&bg_lum=${{encodeURIComponent(previewThreshUserModified ? String(previewLumThresh ?? '') : '')}}&ood_sign_min=${{encodeURIComponent(String(previewOodSignPctMin ?? 0.3))}}&ood_sign_max=${{encodeURIComponent(String(previewOodSignPctMax ?? 70.0))}}&ood_max_prob=${{encodeURIComponent(String(previewOodMaxProbMin ?? 0.60))}}&ood_entropy_max=${{encodeURIComponent(String(previewOodEntropyRatioMax ?? 0.70))}}&_ts=${{Date.now()}}`, {{ signal: previewPredictController.signal }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
-    const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
-    const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
-    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
-    // Each button is an independent state; they stack:
-    //   Orig ON  = apply processed filter (no crop change)
-    //   ROI  ON  = the auto search-box CROP image (jumps with detection)
-    //   both ON  = cropped AND filtered (processed_image_b64, no box)
-    let src = rawSrc;
-    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
-    else if (previewShowRaw) src = fullSrc || rawSrc;
-    else if (previewShowRoi) src = cropSrc || rawSrc;
-    if (pane) {{
-      if (!pane.dataset.ready) {{
-        pane.innerHTML = `<div class="preview-stage"><img id="${{imgId}}" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`;
-        pane.dataset.ready = '1';
-      }}
-      const img = document.getElementById(imgId);
-      if (img && src) img.src = src;
-      updatePreviewRoiOverlay(Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null, previewPreprocessMode === 'manual_roi');
-    }}
-    if (openSourceClass && openSourceKind === previewSource) {{
-      const sImg = document.getElementById(`sourcePreview-${{cssSafe(openSourceClass)}}`);
-      if (sImg && src) sImg.src = src;
-    }}
+    previewLastPredictData = data;
+    applyPreviewSrcToPane(data);
     renderOutputBars(data.labels || [], data.probs || []);
     if (note) {{
       const top = data.top_label ? `${{String(data.top_label)}}` : '';
@@ -6290,8 +6499,6 @@ async function refreshPreviewPrediction(token) {{
   }} catch (err) {{
     if (err && (err.name === 'AbortError' || String(err).includes('aborted'))) return;
     if (note) note.textContent = String(err && err.message ? err.message : err);
-    // A failed predict must not leave the previous model's bars on screen
-    // (it reads as "the old model is still running").
     const outHost = document.getElementById('previewOutput');
     if (outHost) outHost.innerHTML = '';
   }} finally {{
@@ -6379,22 +6586,10 @@ async function runPreviewUploadPrediction() {{
     }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
-    const rawSrc = data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : previewUploadImageSrc;
-    const roiSrc = data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
-    const cropSrc = data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
-    const fullSrc = data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
-    // Each button is an independent state; they stack:
-    //   Orig ON  = apply processed filter (no crop change)
-    //   ROI  ON  = the auto search-box CROP image (jumps with detection)
-    //   both ON  = cropped AND filtered (processed_image_b64, no box)
-    let src = rawSrc;
-    if (previewShowRaw && previewShowRoi) src = roiSrc || fullSrc || rawSrc;
-    else if (previewShowRaw) src = fullSrc || rawSrc;
-    else if (previewShowRoi) src = cropSrc || rawSrc;
-    if (pane) {{
-      pane.innerHTML = src ? `<div class="preview-stage"><img id="previewImage" src="${{src}}" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>` : '<div class="preview-empty">Choose an upload image in settings.</div>';
-      pane.dataset.ready = '1';
-      updatePreviewRoiOverlay(Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null, previewPreprocessMode === 'manual_roi');
+    previewLastPredictData = data;
+    applyPreviewSrcToPane(data);
+    if (pane && !pane.dataset.ready) {{
+      pane.innerHTML = '<div class="preview-empty">Choose an upload image in settings.</div>';
     }}
     renderOutputBars(data.labels || [], data.probs || []);
     if (note) {{
@@ -6418,10 +6613,18 @@ function startPreviewPredictLoop() {{
   stopPreviewPredictLoop();
   previewPredictToken += 1;
   const token = previewPredictToken;
-  stopPreviewLoop();
+  // Never kill the class-panel source live loop from here — these are two
+  // independent views now.  The only shared thing is the backend live thread.
   if (previewSource === 'upload') {{
     runPreviewUploadPrediction();
     return;
+  }}
+  if (previewSource === 'webcam' || previewSource === 'device') {{
+    // Keep the visual timer armed so the pane stays live whenever the
+    // predict timer is paused (hold-to-capture / single capture).  While
+    // the predict timer runs, the visual loop yields to it (gate inside
+    // refreshPreviewVisualFrame).
+    if (!previewVisualTimer) startPreviewVisualLoop();
   }}
   refreshPreviewPrediction(token);
   previewPredictTimer = window.setInterval(
@@ -6741,21 +6944,58 @@ function renderPreviewSettings() {{
       previewDarkThresh = Number(darkEl ? darkEl.value : (previewDarkThresh ?? 0));
       previewLumThresh = Number(lumEl ? lumEl.value : (previewLumThresh ?? 100));
       persistPreviewState();
+      const needsAutoPick = previewSource === 'upload' && !previewUploadFilename;
+      if (previewSource === 'upload' && previewUploadFilename) {{
+        previewInputOn = true;
+      }}
       previewSettingsOpen = false;
       renderPreviewSettings();
-      if (previewInputOn) {{
-        if (previewPredictTimer) stopPreviewPredictLoop();
-        startPreviewPredictLoop();
-      }} else if (previewSource !== 'upload') {{
-        startPreviewLoop();
+      renderPreviewCard();
+      if (previewSource === 'upload') {{
+        if (needsAutoPick) {{
+          try {{
+            const picked = await pickPreviewUploadFile();
+            if (picked) {{
+              previewInputOn = true;
+              const inputToggle = document.getElementById('previewInputToggle');
+              if (inputToggle) inputToggle.checked = true;
+              renderPreviewCard();
+              persistPreviewState();
+            }} else {{
+              previewInputOn = false;
+              const inputToggle = document.getElementById('previewInputToggle');
+              if (inputToggle) inputToggle.checked = false;
+              const note = document.getElementById('previewNote');
+              if (note) note.textContent = 'Pick a test image in Preview settings (⚙️) → Upload File.';
+              renderPreviewCard();
+            }}
+          }} catch (e) {{
+            toast(String(e && e.message ? e.message : e), 5000);
+          }}
+        }} else {{
+          const inputToggle = document.getElementById('previewInputToggle');
+          if (inputToggle) inputToggle.checked = true;
+          runPreviewUploadPrediction();
+        }}
       }} else {{
-        const note = document.getElementById('previewNote');
-        if (note) note.textContent = previewUploadFilename ? `Upload ready: ${{previewUploadFilename}}` : 'Choose an image in settings to test upload preview.';
+        if (previewInputOn) {{
+          if (previewPredictTimer) stopPreviewPredictLoop();
+          startPreviewPredictLoop();
+        }} else {{
+          // Preview settings Apply with Input OFF + webcam/device source:
+          // no live Preview pane — the visual loop must not run (it opened
+          // the camera without the user toggling Input).  The class-panel
+          // source loop is independent and only ticks when a class source
+          // is actually open (guarded inside refreshPreviewImage).
+          if (previewVisualTimer) stopPreviewVisualLoop();
+          startPreviewLoop();
+        }}
       }}
     }} catch (err) {{
       toast(String(err && err.message ? err.message : err));
     }}
   }};
+  scheduleLayoutResync();
 }}
 function showTrainWarningModal(text) {{
   let m = document.getElementById('trainWarningModal');
@@ -6833,6 +7073,28 @@ function bindPreviewThreshBar() {{
   lumSlider.value = String((previewLumThresh ?? 100));
   lumNum.value = String((previewLumThresh ?? 100));
 }}
+// Set a checkbox's .checked WITHOUT firing any registered onchange /
+// addEventListener('change') handler.  This is required for every "sync
+// widget to memory-state" assignment during renderPreviewCard /
+// bindPreviewControls: if we naively write `el.checked = X` while an
+// onchange is already attached, the browser fires the change event, which
+// (in our handlers) calls persistPreviewState() and triggers a Streamlit
+// rerun MID-RENDER.  That Streamlit rerun aborts the in-flight render()
+// before class panels get drawn — the exact symptom in the screenshot.
+function setCheckedSilent(el, value) {{
+  if (!el) return;
+  value = !!value;
+  if (el.checked === value) return;
+  const cachedChange = el.onchange;
+  const cachedHandlers = Object.prototype.hasOwnProperty.call(el, '_stHandlers') ? el._stHandlers : null;
+  el.onchange = null;
+  // removeEventListener cache not stored on el in this codebase — onchange
+  // only via .onchange property, so the above is sufficient.
+  try {{ el.checked = value; }} finally {{
+    el.onchange = cachedChange;
+    if (cachedHandlers !== null) el._stHandlers = cachedHandlers;
+  }}
+}}
 function renderPreviewCard() {{
   const pane = document.getElementById('previewPane');
   const note = document.getElementById('previewNote');
@@ -6840,11 +7102,12 @@ function renderPreviewCard() {{
   const toggle = document.getElementById('previewInputToggle');
   const rawToggle = document.getElementById('previewRawToggle');
   if (rawToggle) {{
-    rawToggle.checked = !!previewShowRaw;
-    rawToggle.onchange = () => {{
-      previewShowRaw = !!rawToggle.checked;
-      persistPreviewState();
-    }};
+    setCheckedSilent(rawToggle, !!previewShowRaw);
+    // IMPORTANT: do NOT reassign rawToggle.onchange here.  The change
+    // handler (with proper defer to avoid mid-render Streamlit reruns) is
+    // registered ONCE in bindPreviewControls() via dataset.bound='1'.
+    // Overwriting it here would turn the deferral off and cause class
+    // panels to render blank (the exact screenshot bug).
   }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settingsBtn = document.getElementById('previewSettingsToggle');
@@ -6858,9 +7121,9 @@ function renderPreviewCard() {{
     pane.innerHTML = '<div class="preview-empty">Train a model on the left to enable preview.</div>';
     output.innerHTML = '';
     note.textContent = 'You must train a model on the left before you can preview it here.';
-    toggle.checked = false;
+    setCheckedSilent(toggle, false);
     toggle.disabled = true;
-    roiToggle.checked = false;
+    setCheckedSilent(roiToggle, false);
     roiToggle.disabled = true;
     settingsBtn.disabled = true;
     const bar = document.getElementById('previewThreshBar');
@@ -6881,8 +7144,8 @@ function renderPreviewCard() {{
     btn.disabled = false;
     btn.classList.toggle('active', active);
   }});
-  toggle.checked = !!previewInputOn;
-  roiToggle.checked = !!previewShowRoi;
+  setCheckedSilent(toggle, !!previewInputOn);
+  setCheckedSilent(roiToggle, !!previewShowRoi);
   bindPreviewThreshBar();
   renderPreviewSettings();
   const staticSrc = previewSource === 'upload' ? previewUploadImageSrc : latestPreviewImage();
@@ -6913,60 +7176,160 @@ function renderPreviewCard() {{
     note.textContent = previewSource === 'upload'
       ? (previewUploadFilename ? `Upload ready: ${{previewUploadFilename}}` : 'Choose an image in settings to test upload preview.')
       : 'Model ready. Turn on Input to preview it here.';
+    // Webcam/Device path on Input OFF: the Preview pane stays on the last
+    // prediction / empty state — the visual loop must NOT run here (it
+    // opened the camera and streamed live frames without the user toggling
+    // Input).  The class-panel source loop (startPreviewLoop alias) is
+    // independent and only ticks when a class source is actually open
+    // (guarded inside refreshPreviewImage).
+    if (previewVisualTimer) stopPreviewVisualLoop();
     if (openSourceClass && (openSourceKind === 'webcam' || openSourceKind === 'device')) startPreviewLoop();
   }}
+}}
+function refreshStaticPreviewFromDom() {{
+  const img = document.getElementById('previewImage');
+  if (img && img.getAttribute('src')) previewLastStaticImageSrc = img.getAttribute('src');
+}}
+function applyPreviewSrcToPane(data) {{
+  const pane = document.getElementById('previewPane');
+  if (!pane) return;
+  const hasData = !!data;
+  const rawFromData = hasData && data.image_b64 ? `data:image/png;base64,${{data.image_b64}}` : '';
+  const roiFromData = hasData && data.processed_image_b64 ? `data:image/png;base64,${{data.processed_image_b64}}` : '';
+  const cropFromData = hasData && data.crop_image_b64 ? `data:image/png;base64,${{data.crop_image_b64}}` : '';
+  const fullFromData = hasData && data.full_image_b64 ? `data:image/png;base64,${{data.full_image_b64}}` : '';
+  const uploadedSrc = previewSource === 'upload' ? previewUploadImageSrc : '';
+  const rawSrc = rawFromData || uploadedSrc || previewLastStaticImageSrc || '';
+  const roiSrc = roiFromData || fullFromData || rawSrc;
+  const cropSrc = cropFromData || rawSrc;
+  const fullSrc = fullFromData || rawSrc;
+  let src = rawSrc;
+  if (previewShowRaw && previewShowRoi) src = roiSrc;
+  else if (previewShowRaw) src = fullSrc;
+  else if (previewShowRoi) src = cropSrc;
+  if (!pane.dataset.ready) {{
+    pane.innerHTML = `<div class="preview-stage"><img id="previewImage" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`;
+    pane.dataset.ready = '1';
+  }}
+  const img = document.getElementById('previewImage');
+  if (img && src) {{
+    img.src = src;
+    previewLastStaticImageSrc = src;
+  }}
+  const cropRect = hasData && Array.isArray(data.crop) && data.crop.length === 4 ? data.crop : null;
+  updatePreviewRoiOverlay(cropRect, previewPreprocessMode === 'manual_roi');
+  return src;
+}}
+function rerenderPreviewPaneFromCache() {{
+  refreshStaticPreviewFromDom();
+  applyPreviewSrcToPane(previewLastPredictData || null);
 }}
 function bindPreviewControls() {{
   const toggle = document.getElementById('previewInputToggle');
   const rawToggle = document.getElementById('previewRawToggle');
-  if (rawToggle) {{
-    rawToggle.checked = !!previewShowRaw;
-    rawToggle.onchange = () => {{
-      previewShowRaw = !!rawToggle.checked;
-      persistPreviewState();
-    }};
-  }}
   const roiToggle = document.getElementById('previewRoiToggle');
   const settings = document.getElementById('previewSettingsToggle');
   const modeTabs = Array.from(document.querySelectorAll('[data-preview-mode]'));
   if (!toggle || !roiToggle || !settings) return;
-  if (toggle.dataset.bound === '1') return;
-  toggle.dataset.bound = '1';
-  roiToggle.dataset.bound = '1';
-  toggle.onchange = async () => {{
-    previewInputOn = !!toggle.checked;
-    persistPreviewState();
-    if (!previewInputOn && (previewSource === 'webcam' || previewSource === 'device')) {{
-      stopPreviewPredictLoop();
-      try {{
-        await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}`);
-      }} catch (e) {{}}
-    }}
-    renderPreviewCard();
-  }};
-  roiToggle.onchange = () => {{
+  setCheckedSilent(rawToggle, !!previewShowRaw);
+  setCheckedSilent(roiToggle, !!previewShowRoi);
+  setCheckedSilent(toggle, !!previewInputOn);
+  // Bind each control independently so renderPreviewCard() can be re-run
+  // after a view toggle without dropping change handlers.
+  const onViewToggleChanged = () => {{
+    // First sync variables from the real DOM state — if the user just clicked
+    // this toggle, .checked is up-to-date; if the call came from persist, the
+    // values equal anyway (no-op).
+    if (rawToggle) previewShowRaw = !!rawToggle.checked;
     previewShowRoi = !!roiToggle.checked;
-    persistPreviewState();
-    if (previewInputOn) {{
-      if (previewPredictTimer) stopPreviewPredictLoop();
-      startPreviewPredictLoop();
-    }}
+    rerenderPreviewPaneFromCache();
+    // Defer anything that triggers Streamlit rerun / re-render / async HTTP
+    // out of this synchronous change handler — otherwise persistPreviewState
+    // fires a widget sync mid-render, the parent iframe tears down the DOM
+    // we're half-way building, and class panels render blank.
+    setTimeout(() => {{
+      persistPreviewState();
+      renderPreviewCard();
+      if (previewInputOn && previewSource === 'upload') {{
+        runPreviewUploadPrediction();
+      }} else if (previewInputOn) {{
+        if (previewPredictTimer) stopPreviewPredictLoop();
+        startPreviewPredictLoop();
+      }}
+    }}, 0);
   }};
-  settings.onclick = () => {{
-    previewSettingsOpen = !previewSettingsOpen;
-    renderPreviewSettings();
-  }};
+  if (rawToggle && rawToggle.dataset.bound !== '1') {{
+    rawToggle.dataset.bound = '1';
+    rawToggle.onchange = onViewToggleChanged;
+  }}
+  if (roiToggle.dataset.bound !== '1') {{
+    roiToggle.dataset.bound = '1';
+    roiToggle.onchange = onViewToggleChanged;
+  }}
+  if (toggle.dataset.bound !== '1') {{
+    toggle.dataset.bound = '1';
+    toggle.onchange = () => {{
+      // Preview Input toggle change.  IMPORTANT: defer Streamlit state sync
+      // and HTTP calls using setTimeout(0) so that a programmatic .checked=
+      // assignment (from the earlier render/bind) doesn't abort the current
+      // render via Streamlit rerun.
+      previewInputOn = !!toggle.checked;
+      if (!previewInputOn) {{
+        stopPreviewPredictLoop();
+        // Input OFF: the Preview pane freezes on the last prediction — the
+        // visual loop must not keep streaming (it opened the camera and
+        // showed live frames without the user toggling Input).  The backend
+        // live worker is released in the deferred block below — if a
+        // class-panel view still uses this source, its /live/frame poll
+        // revives the shared worker on the next tick (server-side
+        // self-healing), so the class view never freezes.
+        stopPreviewVisualLoop();
+        if (previewSource === 'device') {{
+          clearPreviewBlob();
+        }}
+      }}
+      setTimeout(async () => {{
+        persistPreviewState();
+        if (!previewInputOn) {{
+          // Release the camera / serial session when inference is turned
+          // off — the camera must not stay on once nothing is displaying
+          // it.  Any class-panel view still using the source self-heals
+          // via /live/frame revival.
+          try {{
+            await fetch(`${{baseUrl}}/live/close?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}`);
+          }} catch (e) {{}}
+        }} else if (previewInputOn) {{
+          if (previewSource === 'upload') {{
+            startPreviewPredictLoop();
+          }} else if (previewSource === 'webcam' || previewSource === 'device') {{
+            try {{ await ensureOpenSourceLive({{silent:true, silentFail:true}}); }} catch (e) {{}}
+            startPreviewPredictLoop();
+          }}
+        }}
+        renderPreviewCard();
+      }}, 0);
+    }};
+  }}
+  if (settings.dataset.bound !== '1') {{
+    settings.dataset.bound = '1';
+    settings.onclick = () => {{
+      previewSettingsOpen = !previewSettingsOpen;
+      renderPreviewSettings();
+    }};
+  }}
   modeTabs.forEach((btn) => {{
     if (btn.dataset.bound === '1') return;
     btn.dataset.bound = '1';
     btn.onclick = () => {{
       previewPreprocessMode = String(btn.getAttribute('data-preview-mode') || 'auto_by_label');
-      persistPreviewState();
-      renderPreviewCard();
-      if (previewInputOn) {{
-        if (previewPredictTimer) stopPreviewPredictLoop();
-        startPreviewPredictLoop();
-      }}
+      setTimeout(() => {{
+        persistPreviewState();
+        renderPreviewCard();
+        if (previewInputOn) {{
+          if (previewPredictTimer) stopPreviewPredictLoop();
+          startPreviewPredictLoop();
+        }}
+      }}, 0);
     }};
   }});
 }}
@@ -7460,94 +7823,88 @@ function render() {{
   root.innerHTML = '';
   for (let i=0; i<STATE.classes.length; i++) {{
     const name = STATE.classes[i];
-    const card = document.createElement('div');
-    card.className = 'card class-card';
-    const head = document.createElement('div');
-    head.className = 'class-head';
-    const title = document.createElement('div');
-    title.className = 'class-title';
-    title.textContent = name;
-    const preprocessBtn = document.createElement('button');
-    preprocessBtn.className = 'preprocess-chip';
-    preprocessBtn.type = 'button';
-    preprocessBtn.textContent = 'Edit';
-    preprocessBtn.onclick = (e) => {{
-      if (e) {{
-        e.preventDefault();
-        e.stopPropagation();
-      }}
-      openClassPreprocessEditor(name);
-    }};
-    const edit = document.createElement('button');
-    edit.className = 'iconbtn';
-    edit.textContent = '✎';
-    edit.onclick = () => renameClass(name);
-    title.appendChild(preprocessBtn);
-    title.appendChild(edit);
-    head.appendChild(title);
-    const more = document.createElement('button');
-    more.className = 'iconbtn more';
-    more.textContent = '⋮';
-    more.onclick = async (e) => {{
-      if (e) {{
-        e.preventDefault();
-        e.stopPropagation();
-      }}
-      await deleteClass(name);
-    }};
-    card.appendChild(more);
-    card.appendChild(head);
-    const div = document.createElement('div');
-    div.className = 'divider';
-    card.appendChild(div);
-    const c = Number(STATE.counts[name] || 0);
-    const sh = document.createElement('div');
-    sh.className = 'summary-title';
-    sh.id = `summaryTitle-${{cssSafe(name)}}`;
-    sh.textContent = `${{c}} ${{c === 1 ? 'Image Sample' : 'Image Samples'}}`;
-    card.appendChild(sh);
+    try {{
+      const card = document.createElement('div');
+      card.className = 'card class-card';
+      const head = document.createElement('div');
+      head.className = 'class-head';
+      const title = document.createElement('div');
+      title.className = 'class-title';
+      title.textContent = name;
+      const preprocessBtn = document.createElement('button');
+      preprocessBtn.className = 'preprocess-chip';
+      preprocessBtn.type = 'button';
+      preprocessBtn.textContent = 'Edit';
+      preprocessBtn.onclick = (e) => {{
+        if (e) {{
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        openClassPreprocessEditor(name);
+      }};
+      const edit = document.createElement('button');
+      edit.className = 'iconbtn';
+      edit.textContent = '✎';
+      edit.onclick = () => renameClass(name);
+      title.appendChild(preprocessBtn);
+      title.appendChild(edit);
+      head.appendChild(title);
+      const more = document.createElement('button');
+      more.className = 'iconbtn more';
+      more.textContent = '⋮';
+      more.onclick = async (e) => {{
+        if (e) {{
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        await deleteClass(name);
+      }};
+      card.appendChild(more);
+      card.appendChild(head);
+      const div = document.createElement('div');
+      div.className = 'divider';
+      card.appendChild(div);
+      const c = Number(STATE.counts[name] || 0);
+      const sh = document.createElement('div');
+      sh.className = 'summary-title';
+      sh.id = `summaryTitle-${{cssSafe(name)}}`;
+      sh.textContent = `${{c}} ${{c === 1 ? 'Image Sample' : 'Image Samples'}}`;
+      card.appendChild(sh);
 
-    const row = document.createElement('div');
-    row.className = openSourceClass === name ? 'btnrow' : 'summary-actions';
+      const row = document.createElement('div');
+      row.className = openSourceClass === name ? 'btnrow' : 'summary-actions';
 
-    const upWebcam = document.createElement('button');
-    upWebcam.className = 'sample';
-    upWebcam.innerHTML = createIcon('webcam') + '<div>Webcam</div>';
-    upWebcam.onclick = () => openSourcePanel('webcam', name);
+      const upWebcam = document.createElement('button');
+      upWebcam.className = 'sample';
+      upWebcam.innerHTML = createIcon('webcam') + '<div>Webcam</div>';
+      upWebcam.onclick = () => openSourcePanel('webcam', name);
 
-    const upDevice = document.createElement('button');
-    upDevice.className = 'sample';
-    upDevice.innerHTML = createIcon('device') + '<div>Device</div>';
-    upDevice.onclick = () => openSourcePanel('device', name);
+      const upDevice = document.createElement('button');
+      upDevice.className = 'sample';
+      upDevice.innerHTML = createIcon('device') + '<div>Device</div>';
+      upDevice.onclick = () => openSourcePanel('device', name);
 
-    const upUpload = document.createElement('button');
-    upUpload.className = 'sample';
-    upUpload.innerHTML = createIcon('upload') + '<div>Upload</div>';
-    upUpload.onclick = () => openSourcePanel('upload', name);
+      const upUpload = document.createElement('button');
+      upUpload.className = 'sample';
+      upUpload.innerHTML = createIcon('upload') + '<div>Upload</div>';
+      upUpload.onclick = () => openSourcePanel('upload', name);
 
-    row.appendChild(upWebcam);
-    row.appendChild(upUpload);
-    row.appendChild(upDevice);
+      row.appendChild(upWebcam);
+      row.appendChild(upUpload);
+      row.appendChild(upDevice);
 
-    if (openSourceClass === name) {{
-      // #region debug-point B:render-open-panel
-      dbgEvent('B', 'app.py:render', '[DEBUG] rendering expanded source panel', {{name, openSourceKind, sampleCount: c}});
-      // #endregion
-      card.appendChild(row);
-      const selectedPort = currentSerialPort || '';
-      const selectedCam = Number(currentWebcamIndex);
-      const sampleCount = c;
-      const panel = document.createElement('div');
-      panel.className = 'source-panel';
-      panel.innerHTML = `
-        <div class="source-left">
-          <div class="source-head">
-            <span>${{sourceLabel(openSourceKind)}}</span>
-            <div class="source-tools">
-              <button class="iconbtn" type="button" title="Close" id="sourceClose-${{cssSafe(name)}}">✕</button>
-            </div>
-          </div>
-          ${{
+      if (openSourceClass === name) {{
+        // #region debug-point B:render-open-panel
+        dbgEvent('B', 'app.py:render', '[DEBUG] rendering expanded source panel', {{name, openSourceKind, sampleCount: c}});
+        // #endregion
+        card.appendChild(row);
+        const selectedPort = currentSerialPort || '';
+        const sampleCount = c;
+        const panel = document.createElement('div');
+        panel.className = 'source-panel';
+        let bodyMarkup;
+        try {{
+          bodyMarkup =
             openSourceKind === 'upload'
               ? `<button class="upload-pick" type="button" id="uploadPick-${{cssSafe(name)}}">Choose images from your files</button>
                  <div class="upload-hint">Images are added to this class and appear immediately on the right.</div>`
@@ -7578,231 +7935,321 @@ function render() {{
                        <button class="btn" type="button" id="sourceHold-${{cssSafe(name)}}">${{holdRecording && holdRecordClass === name ? 'Recording...' : 'Hold to Capture'}}</button>
                        <button class="iconbtn source-settings" type="button" id="sourceSettingsToggle-${{cssSafe(name)}}" title="Source settings">⚙</button>
                      </div>`
-              )
-          }}
-        </div>
-        <div class="source-right">
-          <h4>${{sourceSamplesTitle(openSourceKind)}}</h4>
-          <div class="source-count" id="sourceCount-${{cssSafe(name)}}">${{sampleCount}}<small>${{sampleCount === 1 ? 'Image Sample' : 'Image Samples'}}</small></div>
-          <div id="samplesHost-${{cssSafe(name)}}">${{buildSamplesMarkup(name)}}</div>
-        </div>
-      `;
-      card.appendChild(panel);
-    }} else {{
-      const summary = document.createElement('div');
-      summary.className = 'summary-row';
-      const samples = document.createElement('div');
-      samples.className = 'summary-samples';
-      samples.innerHTML = buildSamplesStripMarkup(name);
-      summary.appendChild(row);
-      summary.appendChild(samples);
-      card.appendChild(summary);
-    }}
-    root.appendChild(card);
-  }}
-  const add = document.createElement('div');
-  add.className = 'addclass';
-  add.innerHTML = '<span style="font-size:18px;">⊞</span><span>Add a class</span>';
-  add.onclick = () => addClass();
-  root.appendChild(add);
-
-  const trainBtn = document.getElementById('trainBtn');
-  recomputeTrainEnabled();
-  refreshTrainRec();
-  syncTrainUi();
-  trainBtn.onclick = () => {{
-    if (!STATE.train_enabled) return;
-    startTrain();
-  }};
-
-  const exportBtn = document.getElementById('exportBtn');
-  exportBtn.disabled = !STATE.export_enabled;
-  exportBtn.onclick = async () => {{
-    if (!STATE.export_enabled) return;
-    exportBtn.disabled = true;
-    try {{
-      const pickRes = await fetch(`${{baseUrl}}/export/pick_dir?session=${{encodeURIComponent(STATE.session)}}`);
-      const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
-      if (!pickRes.ok || pick.ok !== '1') {{
-        if (pick && pick.canceled === '1') return;
-        throw new Error(pick.error || 'Unable to choose folder.');
-      }}
-      const exportDir = String(pick.export_dir || '').trim();
-      if (!exportDir) return;
-      const runData = await exportRunWithOverwriteConfirm(
-        exportDir,
-        String(exportModelName || 'tm'),
-        String(exportArrayName || '')
-      );
-      if (!runData || runData.canceled === '1') return;
-      toast(`Exported to: ${{String(runData.export_dir || exportDir)}}`);
-    }} catch (e) {{
-      toast(String(e && e.message ? e.message : e));
-    }} finally {{
-      exportBtn.disabled = !STATE.export_enabled;
-    }}
-  }};
-  renderPreviewCard();
-  renderTrainStatus();
-  bindPreviewControls();
-  renderClassPreprocessModal();
-
-  document.getElementById('advBtn').onclick = toggleAdvancedInline;
-  const advReset = document.getElementById('advReset');
-  if (advReset) advReset.onclick = () => resetTrainCfg();
-  const advUseRec = document.getElementById('advUseRec');
-  if (advUseRec) advUseRec.onclick = () => applyRecommendedTrainCfg();
-  bindAdvancedInlineHandlers();
-  renderAdvancedPanel();
-  const nav = document.getElementById('goHome');
-  const navOpen = document.getElementById('navOpenProject');
-  const navSave = document.getElementById('navSaveProject');
-  const navExportDataset = document.getElementById('navExportDataset');
-  const navReturn = document.getElementById('navReturn');
-  const navReset = document.getElementById('navResetProject');
-  if (nav) nav.onclick = (e) => {{
-    if (e) e.stopPropagation();
-    toggleNavMenu();
-  }};
-  if (navOpen) navOpen.onclick = async (e) => {{
-    if (e) e.stopPropagation();
-    closeNavMenu();
-    await openProject();
-  }};
-  if (navSave) navSave.onclick = async (e) => {{
-    if (e) e.stopPropagation();
-    closeNavMenu();
-    await saveProject();
-  }};
-  if (navExportDataset) navExportDataset.onclick = async (e) => {{
-    if (e) e.stopPropagation();
-    closeNavMenu();
-    await exportDataset();
-  }};
-  if (navReturn) navReturn.onclick = async (e) => {{
-    if (e) e.stopPropagation();
-    closeNavMenu();
-    await returnHome();
-  }};
-  if (navReset) navReset.onclick = async (e) => {{
-    if (e) e.stopPropagation();
-    closeNavMenu();
-    await resetProject();
-  }};
-  if (!navMenuBound) {{
-    document.addEventListener('click', () => closeNavMenu());
-    navMenuBound = true;
-  }}
-  if (openSourceClass) {{
-    const safe = cssSafe(openSourceClass);
-    const closeBtn = document.getElementById(`sourceClose-${{safe}}`);
-    const capBtn = document.getElementById(`sourceCapture-${{safe}}`);
-    const holdBtn = document.getElementById(`sourceHold-${{safe}}`);
-    const devSel = document.getElementById(`deviceSelect-${{safe}}`);
-    const uploadPick = document.getElementById(`uploadPick-${{safe}}`);
-    const settingsToggle = document.getElementById(`sourceSettingsToggle-${{safe}}`);
-    const settingsSave = document.getElementById(`sourceSettingsSave-${{safe}}`);
-    const settingsCancel = document.getElementById(`sourceSettingsCancel-${{safe}}`);
-    if (closeBtn) closeBtn.onclick = () => closeSourcePanel();
-    if (capBtn) capBtn.onclick = captureSource;
-    if (holdBtn) {{
-      holdBtn.onpointerdown = (e) => {{
-        try {{ holdBtn.setPointerCapture(e.pointerId); }} catch (err) {{}}
-        e.preventDefault();
-        startHoldCapture();
-      }};
-      holdBtn.onpointerup = (e) => {{
-        e.preventDefault();
-        stopHoldCapture();
-      }};
-      holdBtn.onpointercancel = () => stopHoldCapture();
-      holdBtn.onpointerleave = () => stopHoldCapture();
-      holdBtn.onlostpointercapture = () => stopHoldCapture();
-    }}
-    if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
-    if (devSel) {{
-      const selectId = `deviceSelect-${{safe}}`;
-      devSel.onpointerdown = () => refreshSerialPorts(false, selectId);
-      devSel.onmousedown = () => refreshSerialPorts(false, selectId);
-    }}
-    if (settingsToggle) settingsToggle.onclick = () => toggleSourceSettings(openSourceClass);
-    if (settingsSave) settingsSave.onclick = () => applySourceSettings(openSourceClass);
-    if (settingsCancel) settingsCancel.onclick = () => {{
-      sourceSettingsOpen = false;
-      render();
-    }};
-    if (uploadPick) uploadPick.onclick = async () => {{
-      if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_upload_files) {{
-        // Packaged app: the SPA <input type="file"> does not open a dialog
-        // inside pywebview on macOS — use the desktop shell's native picker.
-        try {{
-          const results = await window.pywebview.api.pick_upload_files(baseUrl, STATE.session, openSourceClass);
-          const total = Array.isArray(results) ? results.length : 0;
-          if (!total) return;
-          let uploaded = 0;
-          const failed = [];
-          for (const r of (results || [])) {{
-            const fname = String((r && r.filename) || 'file');
-            if (r && r.ok) {{
-              uploaded += 1;
-              const thumb = String((r && r.thumb_b64) || (r && r.image_b64) || '');
-              if (thumb) prependSamplePreview(openSourceClass, {{src: `data:image/png;base64,${{thumb}}`, filename: String(r.saved_filename || fname)}});
-              incrementSampleCount(openSourceClass, 1);
-            }} else {{
-              const why = String((r && r.error) || '');
-              failed.push(why ? `${{fname}} (${{why}})` : fname);
-              toast(`Upload failed: ${{fname}}${{why ? ' — ' + why : ''}}`, 5000);
-            }}
-          }}
-          recomputeTrainEnabled();
-          syncTrainUi();
-          const lines = [`Uploaded ${{uploaded}}/${{total}} sample(s) to ${{openSourceClass}}.`];
-          if (failed.length) lines.push(`Failed ${{failed.length}}: ${{failed.slice(0, 8).join('; ')}}${{failed.length > 8 ? '; ...' : ''}}`);
-          toast(lines.join(' '), Math.max(4000, 2000 + Math.min(8000, failed.length * 600)));
-        }} catch (e) {{
-          toast(String(e && e.message ? e.message : e), 6000);
+              );
+        }} catch (markupErr) {{
+          console.error('[render] source-panel innerHTML build failed for', name, markupErr);
+          bodyMarkup = `<div class="render-error" style="padding:12px;background:#331010;color:#ffaaaa;border-radius:8px;font-family:monospace;white-space:pre-wrap;font-size:12px;"><b>Render error (${{escapeHtml(name)}}):</b>\n${{escapeHtml(String(markupErr && markupErr.stack || markupErr.message || markupErr))}}</div>`;
         }}
-        return;
+        try {{
+          panel.innerHTML = `
+            <div class="source-left">
+              <div class="source-head">
+                <span>${{sourceLabel(openSourceKind)}}</span>
+                <div class="source-tools">
+                  <button class="iconbtn" type="button" title="Close" id="sourceClose-${{cssSafe(name)}}">✕</button>
+                </div>
+              </div>
+              ${{bodyMarkup}}
+            </div>
+            <div class="source-right">
+              <h4>${{sourceSamplesTitle(openSourceKind)}}</h4>
+              <div class="source-count" id="sourceCount-${{cssSafe(name)}}">${{sampleCount}}<small>${{sampleCount === 1 ? 'Image Sample' : 'Image Samples'}}</small></div>
+              <div id="samplesHost-${{cssSafe(name)}}">${{buildSamplesMarkup(name)}}</div>
+            </div>
+          `;
+        }} catch (htmlErr) {{
+          console.error('[render] panel.innerHTML assignment failed for', name, htmlErr);
+          panel.innerHTML = `<div class="render-error" style="padding:12px;background:#331010;color:#ffaaaa;border-radius:8px;font-family:monospace;white-space:pre-wrap;font-size:12px;"><b>Preview render error:</b>\n${{escapeHtml(String(htmlErr && htmlErr.stack || htmlErr.message || htmlErr))}}</div>`;
+        }}
+        card.appendChild(panel);
+      }} else {{
+        const summary = document.createElement('div');
+        summary.className = 'summary-row';
+        const samples = document.createElement('div');
+        samples.className = 'summary-samples';
+        try {{
+          samples.innerHTML = buildSamplesStripMarkup(name);
+        }} catch (stripErr) {{
+          console.error('[render] samples strip failed for', name, stripErr);
+          samples.innerHTML = `<div class="render-error" style="padding:8px;color:#ffaaaa;font-family:monospace;font-size:12px;">Samples render failed: ${{escapeHtml(String(stripErr && stripErr.message || stripErr))}}</div>`;
+        }}
+        summary.appendChild(row);
+        summary.appendChild(samples);
+        card.appendChild(summary);
       }}
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'image/*';
-      input.multiple = true;
-      input.onchange = () => uploadFiles(openSourceClass, input.files);
-      input.click();
-    }};
-    syncSourceActionButtons(openSourceClass);
+      root.appendChild(card);
+    }} catch (classErr) {{
+      // Swallow individual class failures so a single broken preview/state
+      // doesn't abort the entire render and leave *all* classes blank.
+      // Also show the error in-DOM so the user doesn't need devtools.
+      console.error('[render] class card build FAILED for class:', name, classErr);
+      const errCard = document.createElement('div');
+      errCard.className = 'card class-card';
+      const errHead = document.createElement('div');
+      errHead.className = 'class-head';
+      const errTitle = document.createElement('div');
+      errTitle.className = 'class-title';
+      errTitle.textContent = name;
+      errHead.appendChild(errTitle);
+      errCard.appendChild(errHead);
+      const errDivider = document.createElement('div');
+      errDivider.className = 'divider';
+      errCard.appendChild(errDivider);
+      const errBody = document.createElement('div');
+      errBody.style.cssText = 'padding:12px 16px;background:#331010;color:#ffaaaa;border-radius:8px;font-family:monospace;white-space:pre-wrap;font-size:12px;margin:8px;';
+      errBody.innerHTML = `<b>Render failed for class "${{escapeHtml(name)}}":</b>\n${{escapeHtml(String(classErr && classErr.stack || classErr.message || classErr))}}\n\nPlease paste this error text when asking for help.`;
+      errCard.appendChild(errBody);
+      root.appendChild(errCard);
+      // Don't rethrow — keep looping so other classes still render.
+    }}
   }}
-  root.querySelectorAll('.class-card').forEach((card, idx) => {{
-    const className = STATE.classes[idx];
-    bindSampleDeleteButtons(card, className);
-  }});
-  bindLayoutImageObservers(root);
+  try {{
+    const add = document.createElement('div');
+    add.className = 'addclass';
+    add.innerHTML = '<span style="font-size:18px;">⊞</span><span>Add a class</span>';
+    add.onclick = () => addClass();
+    root.appendChild(add);
 
-  ensureOpenSourceLive();
-  updateFlow();
-  scheduleLayoutResync();
-  if (!resizeBound) {{
-    window.addEventListener('resize', () => {{
-      // #region debug-point C:window-resize
-      dbgEvent('C', 'app.py:window.resize', '[DEBUG] window resize event', {{
-        session: String(STATE.session || ''),
-        innerWidth: window.innerWidth || 0,
-        innerHeight: window.innerHeight || 0,
-        docClientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
-        docScrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
-      }});
-      // #endregion
-      scheduleLayoutResync();
+    const trainBtn = document.getElementById('trainBtn');
+    recomputeTrainEnabled();
+    refreshTrainRec();
+    syncTrainUi();
+    if (trainBtn) trainBtn.onclick = () => {{
+      if (!STATE.train_enabled) return;
+      startTrain();
+    }};
+
+    const exportBtn = document.getElementById('exportBtn');
+    if (exportBtn) {{
+      exportBtn.disabled = !STATE.export_enabled;
+      exportBtn.onclick = async () => {{
+        if (!STATE.export_enabled) return;
+        exportBtn.disabled = true;
+        try {{
+          const pickRes = await fetch(`${{baseUrl}}/export/pick_dir?session=${{encodeURIComponent(STATE.session)}}`);
+          const pick = await pickRes.json().catch(() => ({{ok:'0'}}));
+          if (!pickRes.ok || pick.ok !== '1') {{
+            if (pick && pick.canceled === '1') return;
+            throw new Error(pick.error || 'Unable to choose folder.');
+          }}
+          const exportDir = String(pick.export_dir || '').trim();
+          if (!exportDir) return;
+          const runData = await exportRunWithOverwriteConfirm(
+            exportDir,
+            String(exportModelName || 'tm'),
+            String(exportArrayName || '')
+          );
+          if (!runData || runData.canceled === '1') return;
+          toast(`Exported to: ${{String(runData.export_dir || exportDir)}}`);
+        }} catch (e) {{
+          toast(String(e && e.message ? e.message : e));
+        }} finally {{
+          exportBtn.disabled = !STATE.export_enabled;
+        }}
+      }};
+    }}
+    try {{
+      renderPreviewCard();
+      renderTrainStatus();
+      bindPreviewControls();
+      renderClassPreprocessModal();
+    }} catch (previewErr) {{
+      console.error('[render] preview/train binding failed', previewErr);
+      toast(`Preview init failed: ${{String(previewErr && previewErr.message || previewErr)}}`, 8000);
+    }}
+
+    const advBtn = document.getElementById('advBtn');
+    if (advBtn) advBtn.onclick = toggleAdvancedInline;
+    const advReset = document.getElementById('advReset');
+    if (advReset) advReset.onclick = () => resetTrainCfg();
+    const advUseRec = document.getElementById('advUseRec');
+    if (advUseRec) advUseRec.onclick = () => applyRecommendedTrainCfg();
+    try {{ bindAdvancedInlineHandlers(); }} catch (e) {{ console.error('[render] bindAdvancedInlineHandlers', e); }}
+    try {{ renderAdvancedPanel(); }} catch (e) {{ console.error('[render] renderAdvancedPanel', e); }}
+    const nav = document.getElementById('goHome');
+    const navOpen = document.getElementById('navOpenProject');
+    const navSave = document.getElementById('navSaveProject');
+    const navExportDataset = document.getElementById('navExportDataset');
+    const navReturn = document.getElementById('navReturn');
+    const navReset = document.getElementById('navResetProject');
+    if (nav) nav.onclick = (e) => {{
+      if (e) e.stopPropagation();
+      toggleNavMenu();
+    }};
+    if (navOpen) navOpen.onclick = async (e) => {{
+      if (e) e.stopPropagation();
+      closeNavMenu();
+      await openProject();
+    }};
+    if (navSave) navSave.onclick = async (e) => {{
+      if (e) e.stopPropagation();
+      closeNavMenu();
+      await saveProject();
+    }};
+    if (navExportDataset) navExportDataset.onclick = async (e) => {{
+      if (e) e.stopPropagation();
+      closeNavMenu();
+      await exportDataset();
+    }};
+    if (navReturn) navReturn.onclick = async (e) => {{
+      if (e) e.stopPropagation();
+      closeNavMenu();
+      await returnHome();
+    }};
+    if (navReset) navReset.onclick = async (e) => {{
+      if (e) e.stopPropagation();
+      closeNavMenu();
+      await resetProject();
+    }};
+    if (!navMenuBound) {{
+      document.addEventListener('click', () => closeNavMenu());
+      navMenuBound = true;
+    }}
+    if (openSourceClass) {{
+      const safe = cssSafe(openSourceClass);
+      const closeBtn = document.getElementById(`sourceClose-${{safe}}`);
+      const capBtn = document.getElementById(`sourceCapture-${{safe}}`);
+      const holdBtn = document.getElementById(`sourceHold-${{safe}}`);
+      const devSel = document.getElementById(`deviceSelect-${{safe}}`);
+      const uploadPick = document.getElementById(`uploadPick-${{safe}}`);
+      const settingsToggle = document.getElementById(`sourceSettingsToggle-${{safe}}`);
+      const settingsSave = document.getElementById(`sourceSettingsSave-${{safe}}`);
+      const settingsCancel = document.getElementById(`sourceSettingsCancel-${{safe}}`);
+      if (closeBtn) closeBtn.onclick = () => closeSourcePanel();
+      if (capBtn) capBtn.onclick = captureSource;
+      if (holdBtn) {{
+        holdBtn.onpointerdown = (e) => {{
+          try {{ holdBtn.setPointerCapture(e.pointerId); }} catch (err) {{}}
+          e.preventDefault();
+          startHoldCapture();
+        }};
+        holdBtn.onpointerup = (e) => {{
+          e.preventDefault();
+          stopHoldCapture();
+        }};
+        holdBtn.onpointercancel = () => stopHoldCapture();
+        holdBtn.onpointerleave = () => stopHoldCapture();
+        holdBtn.onlostpointercapture = () => stopHoldCapture();
+      }}
+      if (devSel) devSel.onchange = (e) => changeDevicePort(openSourceClass, e.target.value || '');
+      if (devSel) {{
+        const selectId = `deviceSelect-${{safe}}`;
+        devSel.onpointerdown = () => refreshSerialPorts(false, selectId);
+        devSel.onmousedown = () => refreshSerialPorts(false, selectId);
+      }}
+      if (settingsToggle) settingsToggle.onclick = () => toggleSourceSettings(openSourceClass);
+      if (settingsSave) settingsSave.onclick = () => applySourceSettings(openSourceClass);
+      if (settingsCancel) settingsCancel.onclick = () => {{
+        sourceSettingsOpen = false;
+        render();
+      }};
+      if (uploadPick) uploadPick.onclick = async () => {{
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_upload_files) {{
+          // Packaged app: the SPA <input type="file"> does not open a dialog
+          // inside pywebview on macOS — use the desktop shell's native picker.
+          try {{
+            const sess = String(STATE.session || '');
+            if (!sess) {{
+              toast('Upload not ready yet — wait for the project to load, then try again.', 6000);
+              return;
+            }}
+            const results = await window.pywebview.api.pick_upload_files(baseUrl, sess, openSourceClass);
+            const total = Array.isArray(results) ? results.length : 0;
+            if (!results || !total) {{
+              // Either user Cancelled the dialog, or picker hit a hard error.
+              const err = (results && results[0] && results[0].error) ? String(results[0].error) : '';
+              if (err) toast(`Upload aborted: ${{err}}`, 6000);
+              return;
+            }}
+            let uploaded = 0;
+            const failed = [];
+            for (const r of (results || [])) {{
+              const fname = String((r && r.filename) || 'file');
+              if (r && r.ok) {{
+                uploaded += 1;
+                const thumb = String((r && r.thumb_b64) || (r && r.image_b64) || '');
+                if (thumb) prependSamplePreview(openSourceClass, {{src: `data:image/png;base64,${{thumb}}`, filename: String(r.saved_filename || r.filename || fname)}});
+                incrementSampleCount(openSourceClass, 1);
+              }} else {{
+                const why = String((r && r.error) || '');
+                failed.push(why ? `${{fname}} (${{why}})` : fname);
+                toast(`Upload failed: ${{fname}}${{why ? ' — ' + why : ''}}`, 5000);
+              }}
+            }}
+            recomputeTrainEnabled();
+            syncTrainUi();
+            updateOpenSamplesPanel(openSourceClass);
+            const lines = [`Uploaded ${{uploaded}}/${{total}} sample(s) to ${{openSourceClass}}.`];
+            if (failed.length) lines.push(`Failed ${{failed.length}}: ${{failed.slice(0, 8).join('; ')}}${{failed.length > 8 ? '; ...' : ''}}`);
+            toast(lines.join(' '), Math.max(4000, 2000 + Math.min(8000, failed.length * 600)));
+          }} catch (e) {{
+            toast(String(e && e.message ? e.message : e), 6000);
+          }}
+          return;
+        }}
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+        input.onchange = () => uploadFiles(openSourceClass, input.files);
+        input.click();
+      }};
+      syncSourceActionButtons(openSourceClass);
+    }}
+    root.querySelectorAll('.class-card').forEach((card, idx) => {{
+      const className = STATE.classes[idx];
+      if (className) bindSampleDeleteButtons(card, className);
     }});
-    resizeBound = true;
+    bindLayoutImageObservers(root);
+
+    // The very first open of a freshly-created project can race Streamlit's
+    // own STATE.session hydration — so first call is silent if session is
+    // still empty, then we retry once 2 s later.
+    const sessAtLaunch = String(STATE.session || '').trim();
+    if (sessAtLaunch) {{
+      ensureOpenSourceLive({{silentFail: true}});
+    }} else {{
+      ensureOpenSourceLive({{silent: true}});
+      setTimeout(() => {{
+        const sess = String(STATE.session || '').trim();
+        if (sess) {{
+          ensureOpenSourceLive({{silentFail: true}});
+          if (openSourceClass && openSourceKind && (openSourceKind === 'webcam' || openSourceKind === 'device')) {{
+            startSourceLiveLoop();
+          }}
+        }}
+      }}, 2000);
+    }}
+    updateFlow();
+    scheduleLayoutResync();
+    if (!resizeBound) {{
+      window.addEventListener('resize', () => {{
+        // #region debug-point C:window-resize
+        dbgEvent('C', 'app.py:window.resize', '[DEBUG] window resize event', {{
+          session: String(STATE.session || ''),
+          innerWidth: window.innerWidth || 0,
+          innerHeight: window.innerHeight || 0,
+          docClientHeight: document.documentElement ? document.documentElement.clientHeight : 0,
+          docScrollHeight: document.documentElement ? document.documentElement.scrollHeight : 0,
+        }});
+        // #endregion
+        scheduleLayoutResync();
+      }});
+      resizeBound = true;
+    }}
+    window.onpointerup = () => stopHoldCapture();
+    window.onblur = () => stopHoldCapture();
+    document.onvisibilitychange = () => {{
+      if (document.hidden) stopHoldCapture();
+    }};
+    toast(STATE.notice);
+  }} catch (tailErr) {{
+    // Last-resort safety net: class cards are already in the DOM at this
+    // point, so even if the preview/train binding code blows up we still
+    // show a usable UI + tell the user *exactly* what exploded.
+    console.error('[render] post-classes binding FAILED', tailErr);
+    toast(`UI bind error: ${{String(tailErr && tailErr.message || tailErr)}} (see red error boxes for class-level details)`, 12000);
   }}
-  window.onpointerup = () => stopHoldCapture();
-  window.onblur = () => stopHoldCapture();
-  document.onvisibilitychange = () => {{
-    if (document.hidden) stopHoldCapture();
-  }};
-  toast(STATE.notice);
 }}
 window.addEventListener('load', () => {{
   // #region debug-point A:window-load
@@ -7864,7 +8311,7 @@ def _render_image_project() -> None:
     inject_teachable_style()
     controller = _ensure_fresh_record_controller()
     webcam_options = _list_camera_options()
-    preferred_webcam_index = _preferred_webcam_index(webcam_options)
+    preferred_webcam_index, preferred_webcam_uid = _preferred_webcam(webcam_options)
     # ── Pull the SPA's AJAX-written live config BEFORE anything writes to
     # the controller.  The SPA persists serial_port / webcam_index / baud /
     # frame side / channels ONLY via /live/config (the set_serial_port /
@@ -7894,17 +8341,61 @@ def _render_image_project() -> None:
         if persisted and str(persisted.get("webcam_id") or ""):
             from record_controller import _resolve_webcam_index_from_unique_id
 
-            restored_index = _resolve_webcam_index_from_unique_id(str(persisted["webcam_id"]))
+            persisted_uid = str(persisted["webcam_id"])
+            # The persisted uniqueID is AUTHORITATIVE (the camera is opened
+            # by uid on macOS).  The resolved index only preselects the
+            # dropdown — when the camera is currently disconnected the uid
+            # is still kept so the open fails with a clear message instead
+            # of silently falling back to a positional probe of index 0
+            # (which opened the virtual camera).
+            restored_index = _resolve_webcam_index_from_unique_id(persisted_uid)
+            st.session_state.tm_webcam_id = persisted_uid
+            st.session_state.tm_webcam_user_selected = True
             if restored_index is not None:
                 st.session_state.tm_webcam_index = int(restored_index)
-                st.session_state.tm_webcam_id = str(persisted["webcam_id"])
-                st.session_state.tm_webcam_user_selected = True
         if restored_index is None:
-            current_webcam_label = next((str(item.get("label", "")) for item in webcam_options if int(item.get("index", 0)) == int(st.session_state.tm_webcam_index)), "")
+            current_webcam_index = int(getattr(st.session_state, "tm_webcam_index", preferred_webcam_index) or preferred_webcam_index)
+            current_webcam_label = next(
+                (str(item.get("label", "")) for item in webcam_options if int(item.get("index", 0)) == int(current_webcam_index)),
+                "",
+            )
+            # Helper: look up the unique_id for a given camera-index from the
+            # freshly-enumerated webcam_options (same index could be a
+            # different camera across boots if virtuals are inserted).
+            def _uid_for_index(camera_index: int) -> str:
+                for item in webcam_options:
+                    try:
+                        if int(item.get("index", -1)) == int(camera_index):
+                            return str(
+                                item.get("unique_id") or item.get("uid") or item.get("id") or ""
+                            )
+                    except Exception:
+                        continue
+                return ""
+
             if (not st.session_state.get("tm_webcam_user_selected", False)) and webcam_options:
+                # Auto-select the preferred non-virtual camera (index + UID
+                # together — we MUST set both, otherwise `_open_working_camera`
+                # sees an empty UID and falls back to positional index 0,
+                # which on macOS with Iriun installed is the Iriun virtual
+                # feed even when index=preferred is correct).
                 st.session_state.tm_webcam_index = int(preferred_webcam_index)
+                st.session_state.tm_webcam_id = str(preferred_webcam_uid or _uid_for_index(preferred_webcam_index))
+                st.session_state.tm_webcam_user_selected = False
             elif webcam_options and _is_virtual_camera_label(current_webcam_label):
+                # Heal an auto-selected virtual camera: swap to the preferred
+                # physical one, and remember to also swap the unique_id.
                 st.session_state.tm_webcam_index = int(preferred_webcam_index)
+                st.session_state.tm_webcam_id = str(preferred_webcam_uid or _uid_for_index(preferred_webcam_index))
+                st.session_state.tm_webcam_user_selected = False
+            else:
+                # Keep the user's current index, but ALWAYS look up the
+                # matching unique_id from the fresh enumeration so the next
+                # controller open uses a unique_id-based open (no drift).
+                current_uid = str(getattr(st.session_state, "tm_webcam_id", "") or "")
+                if not current_uid:
+                    st.session_state.tm_webcam_id = _uid_for_index(int(current_webcam_index))
+                st.session_state.tm_webcam_index = int(current_webcam_index)
     serial_ports = [
         {
             "device": p.device,
@@ -8522,7 +9013,7 @@ def _render_tm_class_panel() -> None:
             btn_a, btn_b, btn_c = st.columns(3, gap="small")
             with btn_a:
                 with st.popover("▢\nWebcam", use_container_width=True):
-                    permission = ensure_camera_access(int(st.session_state.tm_webcam_index))
+                    permission = ensure_camera_access(int(st.session_state.tm_webcam_index or 0), probe_open=False, unique_id=str(st.session_state.get("tm_webcam_id") or ""))
                     st.session_state.tm_camera_permission_status = permission.status
                     st.session_state.tm_camera_permission_note = permission.message
                     st.session_state.tm_camera_permission_class = name
@@ -8651,14 +9142,18 @@ def _render_hold_capture_panel(controller: RecordController, class_name: str, sa
         if preview is None:
             st.warning("Unable to preview device stream. Check serial port and baudrate.")
     elif source == "webcam":
-        permission = ensure_camera_access(int(st.session_state.tm_webcam_index))
+        permission = ensure_camera_access(int(st.session_state.tm_webcam_index or 0), probe_open=False, unique_id=str(st.session_state.get("tm_webcam_id") or ""))
         st.session_state.tm_camera_permission_status = permission.status
         st.session_state.tm_camera_permission_note = permission.message
         if not permission.allowed:
             st.error(permission.message)
             st.markdown("</div>", unsafe_allow_html=True)
             return
-        preview = controller.preview_webcam_png(int(st.session_state.tm_webcam_index))
+        preview = controller.preview_webcam_png(
+            int(st.session_state.tm_webcam_index or 0),
+            webcam_id=str(st.session_state.get("tm_webcam_id") or ""),
+            session_id=str(st.session_state.get("session_id") or ""),
+        )
         if preview is None:
             st.warning("Unable to preview webcam. Check system permission or whether the camera is in use.")
 
