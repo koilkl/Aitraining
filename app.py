@@ -3279,7 +3279,6 @@ function syncFrameHeight() {{
   sendStreamlitMessage('streamlit:setFrameHeight', {{height: targetHeight}});
 }}
 function queueFrameHeightSync() {{
-function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;
   if (frameHeightRaf) {{
     try {{ cancelAnimationFrame(frameHeightRaf); }} catch (e) {{}}
