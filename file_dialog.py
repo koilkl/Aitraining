@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -131,6 +132,7 @@ def _win_native_dialog_sta(
     IDX_GET_DISPLAY_NAME = 5
     # IUnknown:
     IDX_RELEASE = 2
+    IDX_CLOSE = 23
 
     class FILTERSPEC(ctypes.Structure):
         _fields_ = [("pszName", wintypes.LPCWSTR), ("pszSpec", wintypes.LPCWSTR)]
@@ -179,12 +181,14 @@ def _win_native_dialog_sta(
         clsid = CLSID_FileSaveDialog if save else CLSID_FileOpenDialog
         iid = IID_IFileSaveDialog if save else IID_IFileOpenDialog
         dialog = ctypes.c_void_p()
+        t_create = time.perf_counter()
         hres = ole32.CoCreateInstance(
             ctypes.byref(clsid), None, CLSCTX_INPROC_SERVER, ctypes.byref(iid), ctypes.byref(dialog)
         )
         if hres < 0 or not dialog.value:
             raise OSError(f"CoCreateInstance failed: 0x{hres & 0xFFFFFFFF:08X}")
         dialog_ptr = dialog.value
+        t_created = time.perf_counter()
 
         # Merge our flags into the dialog's OWN defaults (GetOptions →
         # OR → SetOptions); SetOptions REPLACES the whole mask.
@@ -256,7 +260,9 @@ def _win_native_dialog_sta(
         # appears on top (an unowned dialog from this process pops up
         # BEHIND the app and leaves the app window grayed-out/inactive).
         fg = user32.GetForegroundWindow()
+        t_show = time.perf_counter()
         hres = _method(dialog_ptr, IDX_SHOW, HRESULT, wintypes.HWND)(dialog_ptr, fg.value if fg.value else None)
+        _log_dialog_timing(t_created - t_create, time.perf_counter() - t_show, save=save)
         if hres == HR_ERROR_CANCELLED:
             return False, None
         if hres < 0:
@@ -287,6 +293,107 @@ def _win_native_dialog_sta(
         if dialog_ptr:
             _release(dialog_ptr)
         ole32.CoUninitialize()
+
+
+def _log_dialog_timing(create_s: float, show_s: float, *, save: bool) -> None:
+    """Append native-dialog timings to %TEMP%/TFLiteTraining/dialog.log —
+    only useful for diagnosing slow first-opens on user machines."""
+    try:
+        p = Path(tempfile.gettempdir()) / "TFLiteTraining" / "dialog.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"create={create_s * 1000:.0f}ms show={show_s * 1000:.0f}ms save={save}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def _warm_native_dialog() -> None:
+    """Pre-warm the native dialog in the background.
+
+    The FIRST IFileOpenDialog Show() in a process loads the shell's
+    namespace extensions (1-3 s on stock Windows).  Create + Show + close
+    after ~120 ms so that cost is paid during app startup and the first
+    user-facing dialog opens instantly.  Best-effort: any failure is
+    silently ignored (the real dialog still works, just slower once).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _WarmResult:
+        pass
+
+    result = _WarmResult()
+
+    def _run() -> None:
+        ole32 = ctypes.WinDLL("ole32")
+        HRESULT = ctypes.c_long
+        try:
+            from file_dialog import _win_native_dialog_sta  # reuse via a tiny clone below
+
+            _win_native_dialog_sta  # noqa: B018 — import check only
+        except Exception:
+            pass
+        # The warm-up needs Show+Close, which _win_native_dialog_sta does
+        # not expose — drive the dialog directly here.
+        import threading as _th
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", wintypes.BYTE * 8),
+            ]
+
+        CLSID_FileOpenDialog = GUID(0xDC1C5A9C, 0xE88A, 0x4DDE, (0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7))
+        IID_IFileOpenDialog = GUID(0xD57C7288, 0xD4AD, 0x4768, (0xBE, 0x02, 0x9D, 0x96, 0x95, 0x32, 0xD9, 0x60))
+        ole32.CoInitializeEx.restype = HRESULT
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        ole32.CoUninitialize.restype = None
+        ole32.CoCreateInstance.restype = HRESULT
+        ole32.CoCreateInstance.argtypes = [
+            ctypes.POINTER(GUID), ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        if ole32.CoInitializeEx(None, 0x2) < 0:
+            return
+        dialog = ctypes.c_void_p()
+        try:
+            hres = ole32.CoCreateInstance(
+                ctypes.byref(CLSID_FileOpenDialog), None, 0x1, ctypes.byref(IID_IFileOpenDialog), ctypes.byref(dialog)
+            )
+            if hres < 0 or not dialog.value:
+                return
+
+            def _method(ptr, index, restype, *argtypes):
+                vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+                return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+            def _release(ptr):
+                try:
+                    _method(ptr, 2, wintypes.ULONG)(ptr)
+                except Exception:
+                    pass
+
+            box = {"hres": None}
+
+            def _show():
+                box["hres"] = _method(dialog.value, 3, HRESULT, wintypes.HWND)(dialog.value, None)
+
+            t = _th.Thread(target=_show, daemon=True)
+            t.start()
+            time.sleep(0.15)
+            try:
+                _method(dialog.value, 23, HRESULT)(dialog.value)  # IFileDialog::Close
+            except Exception:
+                pass
+            t.join(2.0)
+            _release(dialog.value)
+        finally:
+            ole32.CoUninitialize()
+
+    t = threading.Thread(target=_run, daemon=True, name="win-dialog-warmup")
+    t.start()
 
 
 # --------------------------------------------------------------------------

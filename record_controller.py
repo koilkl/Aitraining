@@ -253,6 +253,38 @@ def _generate_model_resolver_h(tflite_bytes: bytes) -> str:
     return "\n".join(lines)
 
 
+_WIN_DIALOG_WARM_DONE = False
+_WIN_DIALOG_WARM_LOCK = threading.Lock()
+
+
+def _warm_windows_file_dialog() -> None:
+    """Pre-warm the native Windows file dialog once per process.
+
+    The first IFileOpenDialog Show() in a process loads the shell's
+    namespace extensions (~1-3 s).  Pay that cost in the background at
+    server start so the first user-facing Open/Save dialog opens
+    instantly.  Windows-only; idempotent across hot-reloads.
+    """
+    global _WIN_DIALOG_WARM_DONE
+    if os.name != "nt":
+        return
+    with _WIN_DIALOG_WARM_LOCK:
+        if _WIN_DIALOG_WARM_DONE:
+            return
+        _WIN_DIALOG_WARM_DONE = True
+
+    def _run() -> None:
+        try:
+            time.sleep(1.5)  # let app startup settle first
+            from file_dialog import _warm_native_dialog
+
+            _warm_native_dialog()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True, name="win-dialog-warmup").start()
+
+
 # Live-worker liveness contract (see _live_running / _get_live_preview):
 # - LIVE_IDLE_S: a worker that NO consumer has polled for this long is
 #   reaped (releases the camera; never while a hold capture is active).
@@ -348,6 +380,7 @@ class RecordController:
             t = threading.Thread(target=server.serve_forever, daemon=True)
             self._thread = t
             t.start()
+        _warm_windows_file_dialog()
 
     def set_config(self, session_id: str, cfg: SessionConfig) -> None:
         with self._lock:
