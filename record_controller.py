@@ -935,6 +935,25 @@ class RecordController:
     def _handle_post(self, req: BaseHTTPRequestHandler) -> None:
         parsed = urlparse(req.path)
         path = parsed.path
+        if path == "/diag":
+            # Layout diagnostics from the SPA — appended to
+            # %TEMP%/TFLiteTraining/layout_diag.log for debugging
+            # iframe-height issues (best-effort, never fails the request).
+            try:
+                import json as _json
+                import tempfile as _tempfile
+
+                raw_len = int(req.headers.get("Content-Length") or 0)
+                data = req.rfile.read(raw_len) if raw_len > 0 else b"{}"
+                obj = _json.loads(data.decode("utf-8", "replace") or "{}")
+                p = Path(_tempfile.gettempdir()) / "TFLiteTraining" / "layout_diag.log"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with p.open("a", encoding="utf-8") as f:
+                    f.write(_json.dumps(obj) + "\n")
+            except Exception:
+                pass
+            _send_json(req, {"ok": "1"}, cors=True)
+            return
         if path not in {
             "/upload",
             "/train/start",

@@ -3317,6 +3317,21 @@ function syncFrameHeight() {{
   // #endregion
   _lastFrameHeight = sendH;
   _lastFrameHeightAt = now;
+  reportLayoutDiag(metrics);
+}}
+let _lastLayoutDiagAt = 0;
+function reportLayoutDiag(metrics) {{
+  try {{
+    if (!baseUrl) return;
+    const nowMs = Date.now();
+    if (nowMs - _lastLayoutDiagAt < 1500) return;  // throttle
+    _lastLayoutDiagAt = nowMs;
+    fetch(`${{baseUrl}}/diag`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(Object.assign({{t: nowMs}}, metrics || {{}})),
+    }}).catch(() => {{}});
+  }} catch (e) {{}}
 }}
 function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;
