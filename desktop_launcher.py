@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import multiprocessing
 import os
@@ -183,6 +184,19 @@ def _run_streamlit_server(port: int, log_path: str) -> None:
         pass
 
     app_py = _resource_path("app.py")
+    # Stamp the app.py that is actually about to run.  In a frozen build this
+    # is the copy baked in at package time -- pushing source changes does
+    # nothing until the installer is rebuilt, and without this line there is
+    # no way to tell from the outside which snapshot is live.
+    try:
+        _raw = app_py.read_bytes()
+        _startup_log(
+            f"app.py: path={app_py} size={len(_raw)} "
+            f"mtime={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(app_py.stat().st_mtime))} "
+            f"sha1={hashlib.sha1(_raw).hexdigest()[:12]}"
+        )
+    except Exception:
+        pass
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
     os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"
