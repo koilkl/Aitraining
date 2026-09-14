@@ -83,8 +83,23 @@ if ($leaked) {
 }
 
 if ($Clean) {
-    if (Test-Path $distDir) { Remove-Item -Recurse -Force $distDir }
-    if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
+    foreach ($dir in @($distDir, $buildDir)) {
+        if (-not (Test-Path $dir)) { continue }
+        $removed = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+            if (-not (Test-Path $dir)) { $removed = $true; break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $removed) {
+            Write-Host "ERROR: Cannot remove $dir - another program is using it." -ForegroundColor Red
+            Write-Host "  Most common cause: a terminal whose current directory is inside dist" -ForegroundColor Yellow
+            Write-Host "  (e.g. a VS Code terminal tab where you ran 'cd dist'). Fix: cd .. in" -ForegroundColor Yellow
+            Write-Host "  that tab, or close the tab. Also check for a File Explorer window open" -ForegroundColor Yellow
+            Write-Host "  inside dist, or a still-running app." -ForegroundColor Yellow
+            exit 1
+        }
+    }
 }
 
 python -m PyInstaller --clean --noconfirm TFLiteTraining.spec
