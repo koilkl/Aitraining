@@ -73,6 +73,15 @@ if ($running) {
     Start-Sleep -Milliseconds 800
 }
 
+# Also reap leaked WebView2 subprocesses (msedgewebview2.exe) that can keep
+# dist locked via their inherited working directory.
+$leaked = Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue
+if ($leaked) {
+    Write-Host "  Reaping leaked WebView2 subprocesses..." -ForegroundColor Yellow
+    $leaked | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
+
 if ($Clean) {
     if (Test-Path $distDir) { Remove-Item -Recurse -Force $distDir }
     if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }

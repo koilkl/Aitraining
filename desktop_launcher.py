@@ -504,6 +504,16 @@ def _startup_window_logic(window: "webview.Window") -> None:
 
 
 def main() -> None:
+    # Move off the launch directory FIRST. When the app is double-clicked its
+    # CWD is dist\TFLiteTraining; WebView2 subprocesses (msedgewebview2.exe)
+    # inherit that CWD and leak it after close, so dist stays locked and the
+    # build script can't remove it. Chdir to the app-data dir instead.
+    try:
+        _data_dir = _app_data_dir()
+        _data_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(_data_dir))
+    except Exception:
+        pass
     _configure_multiprocessing_executable()
     try:
         multiprocessing.set_start_method("spawn", force=True)
