@@ -3917,6 +3917,10 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
     return options
 
 
+_WIN_WEBCAM_CACHE: Dict[str, Any] = {"options": [], "at": 0.0}
+_WIN_WEBCAM_CACHE_TTL_S = 4.0
+
+
 def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
     """Windows camera friendly names (cv2 has no name API on Windows).
 
@@ -3927,7 +3931,14 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
 
     Fallback: PowerShell PnP camera friendly names (best-effort order).
     Returns [] when neither works — the caller then uses generic labels.
+
+    Results are cached for a few seconds: Streamlit reruns call this on
+    every render and each enumeration shells out (ffmpeg ~1-2 s), which
+    made the page feel sluggish.
     """
+    now = time.time()
+    if _WIN_WEBCAM_CACHE["at"] and (now - _WIN_WEBCAM_CACHE["at"]) < _WIN_WEBCAM_CACHE_TTL_S:
+        return list(_WIN_WEBCAM_CACHE["options"])
 
     def _ffmpeg_dshow_names() -> List[str]:
         ffmpeg = None
@@ -3944,7 +3955,8 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
         try:
             proc = subprocess.run(
                 [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-                capture_output=True, text=True, check=False, timeout=10,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                check=False, timeout=10,
             )
         except Exception:
             return []
@@ -3969,12 +3981,16 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
 
     def _powershell_names() -> List[str]:
         try:
+            # Force UTF-8 console output so non-ASCII device names (e.g.
+            # Chinese "USB 摄像头") survive the pipe intact.
             proc = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
                     "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' } | ForEach-Object { $_.Name }",
                 ],
-                capture_output=True, text=True, check=False, timeout=10,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                check=False, timeout=10,
             )
         except Exception:
             return []
@@ -3984,7 +4000,9 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
     options: List[Dict[str, str]] = []
     for idx, name in enumerate(names[:max_count]):
         options.append({"index": idx, "label": str(name), "unique_id": ""})
-    return options
+    _WIN_WEBCAM_CACHE["options"] = options
+    _WIN_WEBCAM_CACHE["at"] = now
+    return list(options)
 
 
 def _resolve_webcam_index_from_unique_id(unique_id: Optional[str], max_count: int = 6) -> Optional[int]:

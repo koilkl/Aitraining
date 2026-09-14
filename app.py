@@ -7484,21 +7484,6 @@ function bindPreviewControls() {{
     }};
   }});
 }}
-function prependSampleTileToDom(className, item) {{
-  const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
-  if (!host) return;
-  const tile = buildSampleTileMarkup(item, 0);
-  const grid = host.querySelector('.samples-grid');
-  if (grid) {{
-    grid.insertAdjacentHTML('afterbegin', tile);
-  }} else {{
-    host.innerHTML = `<div class="samples-grid">${{tile}}</div>`;
-  }}
-  bindSampleDeleteButtons(host, className);
-  setClassSampleCountLabel(className);
-  queueFrameHeightSync();
-}}
-
 function updateOpenSamplesPanel(className) {{
   const host = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
   if (!host) return;
