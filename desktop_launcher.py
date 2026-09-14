@@ -306,34 +306,6 @@ def _schedule_window_layout_refresh(window: "webview.Window", reason: str = "") 
         _run_once(delay_s)
 
 
-_LAST_NATIVE_NUDGE_AT = 0.0
-
-
-def _maybe_native_resize_nudge(window: "webview.Window", reason: str = "") -> bool:
-    global _LAST_NATIVE_NUDGE_AT
-    reason_s = str(reason or "")
-    if reason_s.startswith("resized:"):
-        return False
-    if not (reason_s.startswith("image-project-mount") or reason_s in {"shown", "loaded", "startup", "open-project"}):
-        return False
-    now = time.time()
-    if (now - float(_LAST_NATIVE_NUDGE_AT or 0.0)) < 1.2:
-        return False
-    resize_fn = getattr(window, "resize", None)
-    width = int(getattr(window, "width", 0) or 0)
-    height = int(getattr(window, "height", 0) or 0)
-    if not callable(resize_fn) or width < 300 or height < 300:
-        return False
-    try:
-        _LAST_NATIVE_NUDGE_AT = now
-        resize_fn(width + 1, height + 1)
-        time.sleep(0.03)
-        resize_fn(width, height)
-        return True
-    except Exception as e:
-        return False
-
-
 class _ShellApi:
     def __init__(self) -> None:
         self.window = None

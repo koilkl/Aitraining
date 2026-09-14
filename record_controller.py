@@ -385,6 +385,7 @@ class RecordController:
             self._thread = t
             t.start()
         _warm_windows_file_dialog()
+        _warm_windows_webcam_list()
 
     def set_config(self, session_id: str, cfg: SessionConfig) -> None:
         with self._lock:
@@ -3957,6 +3958,8 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
 
 _WIN_WEBCAM_CACHE: Dict[str, Any] = {"options": [], "at": 0.0}
 _WIN_WEBCAM_CACHE_TTL_S = 30.0
+_WIN_WEBCAM_LOCK = threading.Lock()
+_WIN_WEBCAM_REFRESHING = False
 
 
 def _no_console_kwargs() -> Dict[str, Any]:
@@ -3970,21 +3973,56 @@ def _no_console_kwargs() -> Dict[str, Any]:
 def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
     """Windows camera friendly names (cv2 has no name API on Windows).
 
-    Preferred: ffmpeg -list_devices (DirectShow) — its device order matches
-    the order cv2 opens with CAP_DSHOW, so the label at dropdown index N is
-    the camera that actually opens at index N (the probe in
-    _open_working_camera tries CAP_DSHOW first on Windows).
-
-    Fallback: PowerShell PnP camera friendly names (best-effort order).
-    Returns [] when neither works — the caller then uses generic labels.
-
-    Results are cached for a few seconds: Streamlit reruns call this on
-    every render and each enumeration shells out (ffmpeg ~1-2 s), which
-    made the page feel sluggish.
+    NEVER blocks: returns the cached list immediately (even if stale) and
+    refreshes in the background when the cache is cold or older than
+    _WIN_WEBCAM_CACHE_TTL_S.  Enumerating shells out to ffmpeg (~2.6 s
+    measured), and Streamlit calls this on every render of the image
+    project page — blocking here froze the first render after opening a
+    project.  An empty list is returned only on the very first call in a
+    process, before the background refresh lands; the caller then falls
+    back to generic "Camera N" labels for one rerun.
     """
     now = time.time()
-    if _WIN_WEBCAM_CACHE["at"] and (now - _WIN_WEBCAM_CACHE["at"]) < _WIN_WEBCAM_CACHE_TTL_S:
-        return list(_WIN_WEBCAM_CACHE["options"])
+    with _WIN_WEBCAM_LOCK:
+        cached = list(_WIN_WEBCAM_CACHE["options"])
+        fresh = _WIN_WEBCAM_CACHE["at"] and (now - _WIN_WEBCAM_CACHE["at"]) < _WIN_WEBCAM_CACHE_TTL_S
+    if not fresh:
+        _schedule_windows_webcam_refresh(max_count)
+    return cached[:max_count]
+
+
+def _warm_windows_webcam_list() -> None:
+    """Populate the webcam cache in the background at server start, so the
+    first image-project render already has friendly names ready."""
+    if sys.platform != "win32":
+        return
+    _schedule_windows_webcam_refresh(6)
+
+
+def _schedule_windows_webcam_refresh(max_count: int) -> None:
+    global _WIN_WEBCAM_REFRESHING
+    with _WIN_WEBCAM_LOCK:
+        if _WIN_WEBCAM_REFRESHING:
+            return
+        _WIN_WEBCAM_REFRESHING = True
+
+    def _run() -> None:
+        global _WIN_WEBCAM_REFRESHING
+        try:
+            _enumerate_windows_webcams(max_count)
+        except Exception:
+            pass
+        finally:
+            with _WIN_WEBCAM_LOCK:
+                _WIN_WEBCAM_REFRESHING = False
+
+    threading.Thread(target=_run, daemon=True, name="win-webcam-refresh").start()
+
+
+def _enumerate_windows_webcams(max_count: int) -> List[Dict[str, str]]:
+    """Blocking enumeration — only call from the background refresh thread
+    (or a non-render path such as the /webcam/options HTTP route)."""
+    now = time.time()
 
     def _ffmpeg_dshow_names() -> List[str]:
         ffmpeg = None
@@ -4046,8 +4084,9 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
     options: List[Dict[str, str]] = []
     for idx, name in enumerate(names[:max_count]):
         options.append({"index": idx, "label": str(name), "unique_id": ""})
-    _WIN_WEBCAM_CACHE["options"] = options
-    _WIN_WEBCAM_CACHE["at"] = now
+    with _WIN_WEBCAM_LOCK:
+        _WIN_WEBCAM_CACHE["options"] = options
+        _WIN_WEBCAM_CACHE["at"] = now
     return list(options)
 
 
