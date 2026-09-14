@@ -159,12 +159,16 @@ def _pick_save_dialog(default_name: str = "project.tmproj") -> Optional[str]:
 
 def _pick_open_dialog() -> Optional[str]:
     """Cross-platform open-file picker for .tmproj files (native on macOS/Windows)."""
-    from file_dialog import pick_open_file
+    import time as _time
 
+    from file_dialog import _log_dialog_event, pick_open_file
+
+    t0 = _time.perf_counter()
     picked = pick_open_file(
         title="Open Project",
         filetypes=[("Teachable Machine Project", "*.tmproj")],
     )
+    _log_dialog_event(f"pick_open total: {(_time.perf_counter() - t0) * 1000:.0f}ms")
     if not picked:
         return None
     p = Path(str(picked)).expanduser()

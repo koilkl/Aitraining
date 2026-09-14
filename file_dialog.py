@@ -295,6 +295,18 @@ def _win_native_dialog_sta(
         ole32.CoUninitialize()
 
 
+def _log_dialog_event(msg: str) -> None:
+    """Append a diagnostic line to %TEMP%/TFLiteTraining/dialog.log."""
+    try:
+        p = Path(tempfile.gettempdir()) / "TFLiteTraining" / "dialog.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 def _log_dialog_timing(create_s: float, show_s: float, *, save: bool) -> None:
     """Append native-dialog timings to %TEMP%/TFLiteTraining/dialog.log —
     only useful for diagnosing slow first-opens on user machines."""
@@ -326,14 +338,12 @@ def _warm_native_dialog() -> None:
     result = _WarmResult()
 
     def _run() -> None:
-        ole32 = ctypes.WinDLL("ole32")
-        HRESULT = ctypes.c_long
         try:
-            from file_dialog import _win_native_dialog_sta  # reuse via a tiny clone below
-
-            _win_native_dialog_sta  # noqa: B018 — import check only
-        except Exception:
-            pass
+            ole32 = ctypes.WinDLL("ole32")
+        except Exception as e:
+            _log_dialog_event(f"warmup FAILED (WinDLL): {e!r}")
+            return
+        HRESULT = ctypes.c_long
         # The warm-up needs Show+Close, which _win_native_dialog_sta does
         # not expose — drive the dialog directly here.
         import threading as _th
@@ -389,6 +399,7 @@ def _warm_native_dialog() -> None:
                 pass
             t.join(2.0)
             _release(dialog.value)
+            _log_dialog_event("warmup done")
         finally:
             ole32.CoUninitialize()
 
@@ -481,8 +492,8 @@ def pick_open_file(
             if ok:
                 return path
             return None  # user canceled — never open a second dialog
-        except Exception:
-            pass  # native failed — fall through to PowerShell
+        except Exception as e:
+            _log_dialog_event(f"native FAILED (open): {e!r}")  # fell through to PowerShell
         body = (
             f"$d = New-Object System.Windows.Forms.OpenFileDialog; "
             f"$d.Title = {_quote_ps(title)}; "
@@ -492,13 +503,16 @@ def pick_open_file(
         if initial_dir:
             body += f"$d.InitialDirectory = {_quote_ps(initial_dir)}; "
         body += "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $result = $d.FileName }"
+        _log_dialog_event("served by: powershell (open)")
+        t0 = time.perf_counter()
         try:
             ok, picked = _pick_via_powershell(body)
+            _log_dialog_event(f"powershell done: {(time.perf_counter() - t0) * 1000:.0f}ms ok={ok}")
             if ok:
                 return picked
             return None  # canceled
-        except Exception:
-            pass  # PowerShell failed — fall through to tkinter
+        except Exception as e:
+            _log_dialog_event(f"powershell FAILED: {e!r}")
     return _pick_open_file_tk(title, filetypes, initial_dir)
 
 
@@ -526,8 +540,8 @@ def pick_save_file(
             if ok:
                 return path
             return None  # canceled
-        except Exception:
-            pass
+        except Exception as e:
+            _log_dialog_event(f"native FAILED (save): {e!r}")
         body = (
             f"$d = New-Object System.Windows.Forms.SaveFileDialog; "
             f"$d.Title = {_quote_ps(title)}; "
@@ -538,13 +552,16 @@ def pick_save_file(
         if initial_dir:
             body += f"$d.InitialDirectory = {_quote_ps(initial_dir)}; "
         body += "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $result = $d.FileName }"
+        _log_dialog_event("served by: powershell (save)")
+        t0 = time.perf_counter()
         try:
             ok, picked = _pick_via_powershell(body)
+            _log_dialog_event(f"powershell done: {(time.perf_counter() - t0) * 1000:.0f}ms ok={ok}")
             if ok:
                 return picked
             return None  # canceled
-        except Exception:
-            pass
+        except Exception as e:
+            _log_dialog_event(f"powershell FAILED: {e!r}")
     return _pick_save_file_tk(title, default_name, filetypes, initial_dir)
 
 
@@ -571,8 +588,8 @@ def pick_folder(title: str = "Choose Folder", initial_dir: Optional[str] = None)
             if ok:
                 return path
             return None  # canceled
-        except Exception:
-            pass
+        except Exception as e:
+            _log_dialog_event(f"native FAILED (folder): {e!r}")
         body = (
             f"$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
             f"$d.Description = {_quote_ps(title)}; "
@@ -581,13 +598,16 @@ def pick_folder(title: str = "Choose Folder", initial_dir: Optional[str] = None)
         if initial_dir:
             body += f"$d.SelectedPath = {_quote_ps(initial_dir)}; "
         body += "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $result = $d.SelectedPath }"
+        _log_dialog_event("served by: powershell (folder)")
+        t0 = time.perf_counter()
         try:
             ok, picked = _pick_via_powershell(body)
+            _log_dialog_event(f"powershell done: {(time.perf_counter() - t0) * 1000:.0f}ms ok={ok}")
             if ok:
                 return picked
             return None  # canceled
-        except Exception:
-            pass
+        except Exception as e:
+            _log_dialog_event(f"powershell FAILED: {e!r}")
     return _pick_folder_tk(title, initial_dir)
 
 
