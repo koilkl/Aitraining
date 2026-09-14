@@ -248,7 +248,15 @@ def _win_native_dialog_sta(
                     dialog_ptr, folder_item.value
                 )
 
-        hres = _method(dialog_ptr, IDX_SHOW, HRESULT, wintypes.HWND)(dialog_ptr, None)
+        user32 = ctypes.WinDLL("user32")
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetForegroundWindow.argtypes = []
+        # The user just clicked in the app window, so the foreground window
+        # IS the app's main window — use it as the owner so the dialog
+        # appears on top (an unowned dialog from this process pops up
+        # BEHIND the app and leaves the app window grayed-out/inactive).
+        fg = user32.GetForegroundWindow()
+        hres = _method(dialog_ptr, IDX_SHOW, HRESULT, wintypes.HWND)(dialog_ptr, fg.value if fg.value else None)
         if hres == HR_ERROR_CANCELLED:
             return False, None
         if hres < 0:

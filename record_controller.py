@@ -3919,7 +3919,7 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
 
 
 _WIN_WEBCAM_CACHE: Dict[str, Any] = {"options": [], "at": 0.0}
-_WIN_WEBCAM_CACHE_TTL_S = 4.0
+_WIN_WEBCAM_CACHE_TTL_S = 30.0
 
 
 def _no_console_kwargs() -> Dict[str, Any]:
