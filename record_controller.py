@@ -4161,14 +4161,40 @@ def _save_png(dataset_root: Path, class_name: str, png: bytes) -> Path:
     return p
 
 
+_CLASS_FILES_CACHE: Dict[Tuple[str, int], Tuple[float, List[Path]]] = {}
+_CLASS_FILES_LOCK = threading.Lock()
+_CLASS_FILES_CACHE_TTL_S = 3.0
+
+
 def _list_class_image_files(class_dir: Path) -> List[Path]:
+    """List a class dir's sample images, newest first.
+
+    Short-TTL cache keyed by (dir, mtime_ns): project-open renders list the
+    dataset on the Python side AND the SPA then syncs /class_state per
+    class — without this the same directory tree is walked several times
+    per open.  Saves bump the dir mtime_ns, so the cache misses exactly
+    when the listing could have changed.
+    """
     if not class_dir.exists():
         return []
-    return sorted(
+    try:
+        key = (str(class_dir), int(class_dir.stat().st_mtime_ns))
+    except OSError:
+        key = None
+    if key is not None:
+        with _CLASS_FILES_LOCK:
+            hit = _CLASS_FILES_CACHE.get(key)
+            if hit is not None and time.time() - hit[0] < _CLASS_FILES_CACHE_TTL_S:
+                return list(hit[1])
+    files = sorted(
         [p for p in class_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
+    if key is not None:
+        with _CLASS_FILES_LOCK:
+            _CLASS_FILES_CACHE[key] = (time.time(), files)
+    return list(files)
 
 
 def _preview_item_payload(path: Path) -> Dict[str, str]:

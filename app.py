@@ -1327,31 +1327,6 @@ def _list_camera_options(max_count: int = 6) -> List[Dict[str, str]]:
         ]
 
 
-def _tm_sample_previews(classes: List[str], limit_per_class: Optional[int] = None) -> Dict[str, List[Dict[str, str]]]:
-    out: Dict[str, List[Dict[str, str]]] = {}
-    root = _tm_dataset_dir()
-    for name in classes:
-        class_dir = root / sanitize_class_name(name)
-        previews: List[Dict[str, str]] = []
-        if class_dir.exists():
-            files = _tm_class_image_files(class_dir)
-            if limit_per_class is not None:
-                files = files[:limit_per_class]
-            for p in files:
-                try:
-                    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
-                    previews.append(
-                        {
-                            "src": f"data:image/png;base64,{b64}",
-                            "filename": str(p.name),
-                        }
-                    )
-                except Exception:
-                    continue
-        out[name] = previews
-    return out
-
-
 def _is_likely_user_serial_port(device: str, description: str) -> bool:
     d = (device or "").strip().lower()
     desc = (description or "").strip().lower()
@@ -8569,15 +8544,28 @@ def _render_image_project() -> None:
             st.rerun()
 
     counts: Dict[str, int] = {}
+    sample_previews: Dict[str, List[Dict[str, str]]] = {}
     empty_classes: List[str] = []
     total_samples = 0
     for name in classes:
         class_dir = _tm_dataset_dir() / sanitize_class_name(name)
-        n = len(_tm_class_image_files(class_dir)) if class_dir.exists() else 0
+        files = _tm_class_image_files(class_dir) if class_dir.exists() else []
+        n = len(files)
         counts[name] = n
         total_samples += n
         if n == 0:
             empty_classes.append(name)
+        # Build the sample-strip previews from the SAME listing — a second
+        # full scan per class here (the old _tm_sample_previews call below)
+        # doubled every project-open.
+        previews: List[Dict[str, str]] = []
+        for p in files[:12]:
+            try:
+                b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+                previews.append({"src": f"data:image/png;base64,{b64}", "filename": str(p.name)})
+            except Exception:
+                continue
+        sample_previews[name] = previews
     train_ready = len([c for c in classes if counts.get(c, 0) > 0]) >= 2 and not empty_classes and total_samples > 0
     st.session_state.tm_train_ready = train_ready
     if not train_ready:
@@ -8665,7 +8653,6 @@ def _render_image_project() -> None:
     if not notice:
         notice = str(st.session_state.get("tm_frontend_notice", "") or "")
     st.session_state.tm_frontend_notice = ""
-    sample_previews = _tm_sample_previews(classes, limit_per_class=12)
     initial_open_source_class = str(st.session_state.get("tm_open_source_class", "") or "")
     initial_open_source_kind = str(st.session_state.get("tm_open_source_kind", "") or "")
     # NOTE: the live-config read-back now happens at the TOP of this render
