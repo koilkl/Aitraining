@@ -26,6 +26,14 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# Windows camera-name listing shells out to a static ffmpeg binary
+# (-list_devices dshow); imageio_ffmpeg ships one per platform.
+try:
+    tmp_ret = collect_all('imageio_ffmpeg')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+except Exception:
+    pass
+
 tmp_ret = collect_all('tensorflow')
 # Exclude the C++ headers under tensorflow/include — they are dev-only, bloat
 # the bundle by ~1 GB, and their deep paths exceed Windows MAX_PATH in the

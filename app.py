@@ -3202,10 +3202,81 @@ let layoutResyncRaf = 0;
 let layoutResyncTimers = [];
 let mountReflowTimers = [];
 let homeNavigateTimer = 0;
-let lastFrameHeight = 0;
+let _lastFrameHeight = 0;
+let _lastFrameHeightAt = 0;
 function syncFrameHeight() {{
   if (window.__tmNavigatingAway) return;
   initStreamlitFrame();
+  // Save outer scroll positions BEFORE touching any heights.
+  // The previous cleanse step set iframe.height=0 which collapsed the whole
+  // streamlit wrapper, forcing the browser to snap scrollTop back to 0 and
+  // making the scrollbar "jump to top" every time we synced.
+  let savedScrollTop = 0;
+  let savedOuterScrollTop = 0;
+  let oldOuterScrollH = 0;
+  try {{
+    const main = document.querySelector('section.stMain, main');
+    if (main) savedOuterScrollTop = main.scrollTop || 0;
+    const scrollEl = document.scrollingElement || document.documentElement;
+    if (scrollEl) {{
+      savedScrollTop = scrollEl.scrollTop || 0;
+      oldOuterScrollH = scrollEl.scrollHeight || 0;
+    }}
+  }} catch (e) {{}}
+  // --- Pre-cleanse: unlock flex locks (don't touch heights to avoid jump) -
+  // The real lock is flex: 0 0 <old-px> on stElementContainer. Setting
+  // iframe.height to 0 here caused the scroll-jump bug, so we only unlock
+  // flex/flexBasis/overflow/maxHeight now.
+  try {{
+    const frame = window.frameElement;
+    if (frame && frame.style) {{
+      // Do NOT set frame.style.height = '0px' here — it causes scroll reset.
+      frame.style.minHeight = '0px';
+      frame.style.maxHeight = 'none';
+      frame.style.flex = '0 1 auto';
+      frame.style.flexBasis = 'auto';
+      frame.style.display = 'block';
+      if (frame.parentElement && frame.parentElement.style) {{
+        const el1 = frame.parentElement;
+        el1.style.height = 'auto';
+        el1.style.minHeight = '0px';
+        el1.style.maxHeight = 'none';
+        el1.style.overflow = 'visible';
+        el1.style.overflowY = 'visible';
+        el1.style.flex = '0 1 auto';
+        el1.style.flexBasis = 'auto';
+        el1.style.flexGrow = '0';
+        el1.style.flexShrink = '1';
+        const el2 = el1.parentElement;
+        if (el2 && el2.style) {{
+          el2.style.height = 'auto';
+          el2.style.minHeight = '0px';
+          el2.style.maxHeight = 'none';
+          el2.style.overflow = 'visible';
+          el2.style.overflowY = 'visible';
+          el2.style.flex = '1 1 auto';
+          el2.style.flexBasis = 'auto';
+          const el3 = el2.parentElement;
+          if (el3 && el3.style && !String(el3.className || '').includes('stMain')) {{
+            el3.style.height = 'auto';
+            el3.style.minHeight = '0px';
+            el3.style.maxHeight = 'none';
+            el3.style.overflow = 'visible';
+            el3.style.overflowY = 'visible';
+            el3.style.flex = '0 1 auto';
+            el3.style.flexBasis = 'auto';
+          }}
+        }}
+      }}
+    }}
+    const wrap = document.querySelector('.wrap');
+    if (wrap && wrap.style) {{
+      wrap.style.overflow = 'visible';
+      wrap.style.overflowY = 'visible';
+      wrap.style.overflowX = 'visible';
+    }}
+  }} catch (e) {{}}
+  // -----------------------------------------------------------------------
   let nextHeight = 0;
   let nextWidth = 0;
   let metrics = {{}};
@@ -3213,59 +3284,109 @@ function syncFrameHeight() {{
     const body = document.body;
     const doc = document.documentElement;
     const wrap = document.querySelector('.wrap');
-    nextHeight = Math.max(
-      body ? body.scrollHeight : 0,
-      doc ? doc.scrollHeight : 0,
+    const layout = document.querySelector('.layout');
+    const WRAP_PAD_TOP = 72;
+    const WRAP_PAD_BOT = 92;
+    const WRAP_MIN = 620;
+    let naturalH = 0;
+    if (layout) {{
+      const layoutH = Math.max(
+        Number(layout.scrollHeight) || 0,
+        Number(layout.offsetHeight) || 0,
+        Number(layout.getBoundingClientRect?.().height) || 0,
+      );
+      naturalH = Math.max(layoutH + WRAP_PAD_TOP + WRAP_PAD_BOT, WRAP_MIN);
+    }}
+    const legacyH = Math.max(
+      wrap ? Math.ceil(wrap.scrollHeight) : 0,
+      wrap ? Math.ceil(wrap.offsetHeight) : 0,
+      body ? Math.ceil(body.scrollHeight) : 0,
+      body ? Math.ceil(body.offsetHeight) : 0,
+      doc ? Math.ceil(doc.scrollHeight) : 0,
+      0,
     );
+    if (naturalH > 0) {{
+      nextHeight = naturalH;
+      if (legacyH > naturalH && (legacyH - naturalH) <= 24) {{
+        nextHeight = legacyH;
+      }}
+    }} else {{
+      nextHeight = legacyH || WRAP_MIN;
+    }}
     nextWidth = Math.max(
-      body ? body.scrollWidth : 0,
-      body ? body.offsetWidth : 0,
-      doc ? doc.scrollWidth : 0,
-      doc ? doc.offsetWidth : 0,
-      doc ? doc.clientWidth : 0,
+      Number(doc && doc.clientWidth) || 0,
+      Number(body && body.clientWidth) || 0,
       wrap ? Math.round(wrap.getBoundingClientRect().width) : 0,
+      0,
     );
     metrics = {{
       nextHeight,
       nextWidth,
-      bodyScrollHeight: body ? body.scrollHeight : 0,
-      bodyOffsetHeight: body ? body.offsetHeight : 0,
-      bodyScrollWidth: body ? body.scrollWidth : 0,
-      bodyOffsetWidth: body ? body.offsetWidth : 0,
-      docScrollHeight: doc ? doc.scrollHeight : 0,
-      docOffsetHeight: doc ? doc.offsetHeight : 0,
-      docScrollWidth: doc ? doc.scrollWidth : 0,
-      docOffsetWidth: doc ? doc.offsetWidth : 0,
-      docClientHeight: doc ? doc.clientHeight : 0,
-      docClientWidth: doc ? doc.clientWidth : 0,
+      naturalH,
+      legacyH,
+      wrapScroll: wrap ? Math.ceil(wrap.scrollHeight) : 0,
+      wrapOffset: wrap ? Math.ceil(wrap.offsetHeight) : 0,
+      bodyScroll: body ? Math.ceil(body.scrollHeight) : 0,
+      bodyOffset: body ? Math.ceil(body.offsetHeight) : 0,
+      docScroll: doc ? Math.ceil(doc.scrollHeight) : 0,
       wrapWidth: wrap ? Math.round(wrap.getBoundingClientRect().width) : 0,
-      wrapHeight: wrap ? Math.round(wrap.getBoundingClientRect().height) : 0,
+      lastSent: _lastFrameHeight,
       windowInnerHeight: window.innerHeight || 0,
       windowInnerWidth: window.innerWidth || 0,
       classCount: Array.isArray(STATE.classes) ? STATE.classes.length : 0,
     }};
   }} catch (e) {{}}
   if (!nextHeight || !Number.isFinite(nextHeight)) return;
-  const targetHeight = Math.ceil(nextHeight + 12);
-  // Break the resize feedback loop: only post when the height actually moved.
-  // Without this, posting the same height re-triggers a resize → re-measure →
-  // re-post forever, which is what makes the scrollbar visibly "shrink" on
-  // mount and drags out render time.
-  if (Math.abs(targetHeight - lastFrameHeight) <= 2) return;
-  lastFrameHeight = targetHeight;
+  const now = Date.now();
+  const clampedH = Math.round(nextHeight);
+  let sendH = clampedH;
+  if (_lastFrameHeight > 0) {{
+    const diff = sendH - _lastFrameHeight;
+    if (diff > 0 && diff < 4) return; // ignore tiny growth jitter
+  }}
   try {{
     const frame = window.frameElement;
     if (frame && frame.style) {{
-      frame.style.height = `${{targetHeight}}px`;
-      frame.style.minHeight = `${{targetHeight}}px`;
+      frame.style.height = `${{sendH}}px`;
+      frame.style.minHeight = '0px';
+      frame.style.maxHeight = 'none';
+      frame.style.flex = '0 1 auto';
+      frame.style.flexBasis = 'auto';
       frame.style.width = '100%';
       frame.style.maxWidth = '100%';
       if (frame.parentElement && frame.parentElement.style) {{
-        frame.parentElement.style.width = '100%';
-        frame.parentElement.style.maxWidth = '100%';
-        frame.parentElement.style.height = `${{targetHeight}}px`;
-        frame.parentElement.style.minHeight = `${{targetHeight}}px`;
-        frame.parentElement.style.overflow = 'hidden';
+        const el1 = frame.parentElement;
+        el1.style.width = '100%';
+        el1.style.maxWidth = '100%';
+        el1.style.height = `${{sendH}}px`;
+        el1.style.minHeight = '0px';
+        el1.style.maxHeight = 'none';
+        el1.style.overflow = 'visible';
+        el1.style.overflowY = 'visible';
+        el1.style.flex = '0 1 auto';
+        el1.style.flexBasis = 'auto';
+        el1.style.flexGrow = '0';
+        el1.style.flexShrink = '1';
+        const el2 = el1.parentElement;
+        if (el2 && el2.style) {{
+          el2.style.height = 'auto';
+          el2.style.minHeight = '0px';
+          el2.style.maxHeight = 'none';
+          el2.style.overflow = 'visible';
+          el2.style.overflowY = 'visible';
+          el2.style.flex = '1 1 auto';
+          el2.style.flexBasis = 'auto';
+          const el3 = el2.parentElement;
+          if (el3 && el3.style && !String(el3.className || '').includes('stMain')) {{
+            el3.style.height = 'auto';
+            el3.style.minHeight = '0px';
+            el3.style.maxHeight = 'none';
+            el3.style.overflow = 'visible';
+            el3.style.overflowY = 'visible';
+            el3.style.flex = '0 1 auto';
+            el3.style.flexBasis = 'auto';
+          }}
+        }}
       }}
     }}
     if (nextWidth && Number.isFinite(nextWidth) && document.body && document.body.style) {{
@@ -3273,10 +3394,41 @@ function syncFrameHeight() {{
       document.body.style.maxWidth = '100%';
     }}
   }} catch (e) {{}}
+  // --- Restore outer scroll positions after the resize --------------------
+  // Because we changed iframe/container size, the browser may have clamped
+  // scrollTop. Restore what the user had, clamped to the new max.
+  try {{
+    const main = document.querySelector('section.stMain, main');
+    if (main) {{
+      const maxMain = Math.max(0, (main.scrollHeight || 0) - (main.clientHeight || 0));
+      if (savedOuterScrollTop > 0 && main.scrollTop !== savedOuterScrollTop) {{
+        main.scrollTop = Math.min(savedOuterScrollTop, Math.max(0, maxMain));
+      }}
+    }}
+    const scrollEl = document.scrollingElement || document.documentElement;
+    if (scrollEl) {{
+      const newScrollH = scrollEl.scrollHeight || 0;
+      // If the page got shorter, scale the scroll position proportionally so
+      // the user stays at roughly the same relative spot instead of snapping
+      // to an invalid (too-large) saved position.
+      let wantTop = savedScrollTop;
+      if (oldOuterScrollH > 0 && newScrollH > 0 && newScrollH !== oldOuterScrollH) {{
+        const rel = savedScrollTop / Math.max(1, oldOuterScrollH);
+        wantTop = Math.round(rel * newScrollH);
+      }}
+      const maxTop = Math.max(0, newScrollH - (scrollEl.clientHeight || 0));
+      if (savedScrollTop > 0 || (scrollEl.scrollTop > 0 && scrollEl.scrollTop !== wantTop)) {{
+        scrollEl.scrollTop = Math.min(wantTop, Math.max(0, maxTop));
+      }}
+    }}
+    // Notify Streamlit AFTER we've restored scroll so it doesn't override.
+    sendStreamlitMessage('streamlit:setFrameHeight', {{height: sendH}});
+  }} catch (e) {{}}
   // #region debug-point A:sync-frame-height
   dbgEvent('A', 'app.py:syncFrameHeight', '[DEBUG] syncFrameHeight posting iframe height', metrics);
   // #endregion
-  sendStreamlitMessage('streamlit:setFrameHeight', {{height: targetHeight}});
+  _lastFrameHeight = sendH;
+  _lastFrameHeightAt = now;
 }}
 function queueFrameHeightSync() {{
   if (window.__tmNavigatingAway) return;

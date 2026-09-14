@@ -3909,9 +3909,81 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
                         options.append({"index": idx, "label": name, "unique_id": str(cam.get("spcamera_unique-id") or "")})
             except Exception:
                 pass
+    if not options and sys.platform == "win32":
+        options = _list_windows_webcams(max_count)
     if not options:
         for idx in range(max_count):
             options.append({"index": idx, "label": f"Camera {idx}", "unique_id": ""})
+    return options
+
+
+def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
+    """Windows camera friendly names (cv2 has no name API on Windows).
+
+    Preferred: ffmpeg -list_devices (DirectShow) — its device order matches
+    the order cv2 opens with CAP_DSHOW, so the label at dropdown index N is
+    the camera that actually opens at index N (the probe in
+    _open_working_camera tries CAP_DSHOW first on Windows).
+
+    Fallback: PowerShell PnP camera friendly names (best-effort order).
+    Returns [] when neither works — the caller then uses generic labels.
+    """
+
+    def _ffmpeg_dshow_names() -> List[str]:
+        ffmpeg = None
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+        if not ffmpeg:
+            ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return []
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+        except Exception:
+            return []
+        out: List[str] = []
+        in_video_section = False
+        for line in (proc.stderr or "").splitlines():
+            if "DirectShow video devices" in line:
+                in_video_section = True
+                continue
+            if "DirectShow audio devices" in line:
+                break
+            if not in_video_section:
+                continue
+            line = line.strip()
+            # Lines look like:  [dshow @ 000...]  "Camera Name" (video)
+            # Skip the "Alternative name" entries (PnP paths, not friendly).
+            if line.startswith("[dshow @") and '"' in line:
+                name = line.split('"', 2)[1] if line.count('"') >= 2 else ""
+                if name and not name.startswith("@"):
+                    out.append(name)
+        return out
+
+    def _powershell_names() -> List[str]:
+        try:
+            proc = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' } | ForEach-Object { $_.Name }",
+                ],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+        except Exception:
+            return []
+        return [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+
+    names = _ffmpeg_dshow_names() or _powershell_names()
+    options: List[Dict[str, str]] = []
+    for idx, name in enumerate(names[:max_count]):
+        options.append({"index": idx, "label": str(name), "unique_id": ""})
     return options
 
 
@@ -4111,26 +4183,43 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
                     return None, CameraOpenInfo("failed", idx, derived, "", str(e)[:220])
                 if cap is not None and cap.isOpened():
                     return cap, CameraOpenInfo("unique_id", idx, derived, "", "")
+    # Windows probe order matters: try DirectShow first so the index matches
+    # the ffmpeg -list_devices (dshow) order the dropdown labels come from
+    # (_list_windows_webcams), then MSMF, then the default backend.
+    backends = [None]
+    if sys.platform == "win32":
+        backends = []
+        dshow = getattr(cv2, "CAP_DSHOW", None)
+        msmf = getattr(cv2, "CAP_MSMF", None)
+        if dshow is not None:
+            backends.append(dshow)
+        if msmf is not None:
+            backends.append(msmf)
+        backends.append(None)
     candidates = [idx] + [i for i in range(max_probe_index + 1) if i != idx]
     for i in candidates:
-        try:
-            cap = cv2.VideoCapture(int(i))
-        except Exception:
-            continue
-        opened = bool(cap.isOpened())
-        ok = False
-        frame = None
-        if opened:
+        for backend in backends:
             try:
-                ok, frame = cap.read()
+                cap = cv2.VideoCapture(int(i)) if backend is None else cv2.VideoCapture(int(i), backend)
             except Exception:
-                ok = False
-        if opened and ok and frame is not None:
-            return cap, CameraOpenInfo("cv2_index", int(i), "", "", "")
-        try:
-            cap.release()
-        except Exception:
-            pass
+                continue
+            opened = bool(cap.isOpened())
+            ok = False
+            frame = None
+            if opened:
+                try:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        time.sleep(0.1)  # dshow/msmf cold-start warmup
+                        ok, frame = cap.read()
+                except Exception:
+                    ok = False
+            if opened and ok and frame is not None:
+                return cap, CameraOpenInfo("cv2_index", int(i), "", "", "")
+            try:
+                cap.release()
+            except Exception:
+                pass
     return None, CameraOpenInfo("failed", idx, uid, "", "No camera opened at any probed index.")
 
 

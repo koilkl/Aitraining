@@ -8,3 +8,4 @@ streamlit-drawable-canvas
 pyserial
 opencv-python
 pyobjc-framework-AVFoundation; sys_platform == "darwin"
+imageio-ffmpeg
