@@ -3217,13 +3217,19 @@ function syncFrameHeight() {{
       classCount: Array.isArray(STATE.classes) ? STATE.classes.length : 0,
     }};
   }} catch (e) {{}}
-  if (!nextHeight || !Number.isFinite(nextHeight)) return;
+  if (!nextHeight || !Number.isFinite(nextHeight)) {{
+    reportLayoutDiag(Object.assign({{failed: 'measure'}}, metrics));
+    return;
+  }}
   const now = Date.now();
   const clampedH = Math.round(nextHeight);
   let sendH = clampedH;
   if (_lastFrameHeight > 0) {{
     const diff = sendH - _lastFrameHeight;
-    if (diff > 0 && diff < 4) return; // ignore tiny growth jitter
+    if (diff > 0 && diff < 4) {{
+      reportLayoutDiag(Object.assign({{failed: 'jitter'}}, metrics));
+      return; // ignore tiny growth jitter
+    }}
   }}
   try {{
     const frame = window.frameElement;
