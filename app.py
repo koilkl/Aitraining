@@ -3304,6 +3304,13 @@ function syncFrameHeight() {{
     }}
     // Notify Streamlit AFTER we've restored scroll so it doesn't override.
     sendStreamlitMessage('streamlit:setFrameHeight', {{height: sendH}});
+    // Windows/WebView2 has no js_api shell nudge (the macOS launcher resizes
+    // the native window to force a relayout) — dispatch synthetic resize
+    // events into the PARENT Streamlit document instead (same-origin) so its
+    // layout engine reflows after our frame grew.  Without this the
+    // container grows but the visible canvas stays clipped ("expanding
+    // settings unreachable").
+    nudgeParentLayout();
   }} catch (e) {{}}
   // #region debug-point A:sync-frame-height
   dbgEvent('A', 'app.py:syncFrameHeight', '[DEBUG] syncFrameHeight posting iframe height', metrics);
@@ -3371,6 +3378,22 @@ function bindLayoutImageObservers(scope) {{
     img.addEventListener('error', onDone, {{once: true}});
   }});
 }}
+function nudgeParentLayout() {{
+  try {{
+    const p = window.parent;
+    if (p && p !== window) {{
+      p.dispatchEvent(new Event('resize'));
+      p.dispatchEvent(new Event('orientationchange'));
+      // The height is applied asynchronously by Streamlit's message
+      // handler — a second kick after a tick covers that.
+      window.setTimeout(() => {{
+        try {{
+          p.dispatchEvent(new Event('resize'));
+        }} catch (e) {{}}
+      }}, 60);
+    }}
+  }} catch (e) {{}}
+}}
 function requestShellLayoutRefresh(reason) {{
   if (window.__tmNavigatingAway) return;
   // #region debug-point C:request-shell-layout-refresh
@@ -3392,6 +3415,9 @@ function requestShellLayoutRefresh(reason) {{
       }}
     }}
   }} catch (e) {{}}
+  // No shell bridge (Windows): the macOS shell performs a native-window
+  // resize nudge here — approximate it with a parent-document resize kick.
+  nudgeParentLayout();
 }}
 let openSourceClass = STATE.initial_open_source_class || '';
 let openSourceKind = STATE.initial_open_source_kind || '';
