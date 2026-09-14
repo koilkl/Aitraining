@@ -6300,6 +6300,20 @@ function toggleSourceSettings(className) {{
   if (openSourceClass !== className || !openSourceKind || openSourceKind === 'upload') return;
   sourceSettingsOpen = !sourceSettingsOpen;
   render();
+  if (sourceSettingsOpen) scrollSettingsIntoView(`sourceSettingsPanel-${{cssSafe(className)}}`);
+}}
+function scrollSettingsIntoView(panelId) {{
+  // If any layer (iframe height sync, parent layout) lags behind the
+  // expanded panel, programmatically scroll it into the SPA viewport so
+  // the controls are always reachable.
+  window.setTimeout(() => {{
+    try {{
+      const panel = document.getElementById(panelId);
+      if (panel && typeof panel.scrollIntoView === 'function') {{
+        panel.scrollIntoView({{block: 'nearest', behavior: 'smooth'}});
+      }}
+    }} catch (e) {{}}
+  }}, 60);
 }}
 async function applySourceSettings(className) {{
   if (openSourceClass !== className) return;
@@ -7373,6 +7387,7 @@ function bindPreviewControls() {{
     settings.onclick = () => {{
       previewSettingsOpen = !previewSettingsOpen;
       renderPreviewSettings();
+      if (previewSettingsOpen) scrollSettingsIntoView('previewSettingsPanel');
     }};
   }}
   modeTabs.forEach((btn) => {{
