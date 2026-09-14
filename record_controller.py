@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import shutil
 import socket
 import subprocess
@@ -3921,6 +3922,14 @@ _WIN_WEBCAM_CACHE: Dict[str, Any] = {"options": [], "at": 0.0}
 _WIN_WEBCAM_CACHE_TTL_S = 4.0
 
 
+def _no_console_kwargs() -> Dict[str, Any]:
+    """Suppress the black console flash when a windowed (frozen) app spawns
+    console programs (ffmpeg.exe / powershell.exe) on Windows."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
 def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
     """Windows camera friendly names (cv2 has no name API on Windows).
 
@@ -3956,7 +3965,7 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
             proc = subprocess.run(
                 [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                check=False, timeout=10,
+                check=False, timeout=6, **_no_console_kwargs(),
             )
         except Exception:
             return []
@@ -3990,7 +3999,7 @@ def _list_windows_webcams(max_count: int = 6) -> List[Dict[str, str]]:
                     "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' } | ForEach-Object { $_.Name }",
                 ],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                check=False, timeout=10,
+                check=False, timeout=6, **_no_console_kwargs(),
             )
         except Exception:
             return []
