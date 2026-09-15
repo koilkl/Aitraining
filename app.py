@@ -1712,6 +1712,8 @@ def _render_tm_old_frontend_html(
       display: inline-flex;
       align-items: center;
       gap: 10px;
+      flex: 1 1 auto;
+      min-width: 0;
       font-size: 16px;
       font-weight: 600;
     }}
@@ -1729,9 +1731,7 @@ def _render_tm_old_frontend_html(
     }}
     .iconbtn:hover {{ background: rgba(0,0,0,0.05); color: var(--text); }}
     .more {{
-      position: absolute;
-      top: 8px;
-      right: 8px;
+      flex: 0 0 auto;
     }}
     .divider {{ height: 1px; background: rgba(0,0,0,0.08); margin: 0; }}
     .subhead {{ font-size: 12px; color: var(--muted); margin: 0 0 10px 0; }}
@@ -8103,7 +8103,7 @@ function render() {{
         }}
         await deleteClass(name);
       }};
-      card.appendChild(more);
+      head.appendChild(more);  // delete ⋮ sits at the head's right end
       card.appendChild(head);
       const div = document.createElement('div');
       div.className = 'divider';
