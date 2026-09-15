@@ -1683,6 +1683,19 @@ def _render_tm_old_frontend_html(
       padding: 12px 16px;
       border-bottom: 1px solid rgba(0,0,0,0.08);
     }}
+    .class-drag-handle {{
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+      font-size: 15px;
+      color: var(--text);
+      opacity: 0.45;
+      padding: 2px 6px 2px 2px;
+      flex: 0 0 auto;
+    }}
+    .class-drag-handle:hover {{
+      opacity: 0.9;
+    }}
     .class-title {{
       display: inline-flex;
       align-items: center;
@@ -7894,6 +7907,75 @@ function resetTrainCfg() {{
   renderTrainStatus();
   toast('Advanced settings reset.');
 }}
+let classDragState = null;
+function bindClassDragHandle(handle, index) {{
+  handle.addEventListener('pointerdown', (e) => {{
+    if (e.button !== 0) return;
+    const card = handle.closest('.card.class-card');
+    if (!card) return;
+    classDragState = {{index, card, startY: e.clientY, target: index, moved: false}};
+    try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
+    try {{ document.body.style.userSelect = 'none'; }} catch (err) {{}}
+    e.preventDefault();
+  }});
+  handle.addEventListener('pointermove', (e) => {{
+    const s = classDragState;
+    if (!s || s.index !== index) return;
+    const dy = e.clientY - s.startY;
+    if (!s.moved && Math.abs(dy) < 5) return;
+    s.moved = true;
+    s.card.style.transform = `translateY(${{dy}}px)`;
+    s.card.style.zIndex = '40';
+    s.card.style.opacity = '0.9';
+    const cards = Array.from(document.querySelectorAll('#classes .card.class-card'));
+    let target = s.index;
+    for (let i = 0; i < cards.length; i++) {{
+      const r = cards[i].getBoundingClientRect();
+      if (e.clientY > r.top + r.height / 2) target = i;
+    }}
+    if (cards.length && e.clientY > cards[cards.length - 1].getBoundingClientRect().bottom) {{
+      target = cards.length;
+    }}
+    s.target = target;
+  }});
+  const finishDrag = () => {{
+    const s = classDragState;
+    if (!s || s.index !== index) return;
+    classDragState = null;
+    try {{ s.card.style.transform = ''; s.card.style.zIndex = ''; s.card.style.opacity = ''; }} catch (err) {{}}
+    try {{ document.body.style.userSelect = ''; }} catch (err) {{}}
+    if (s.moved && s.target !== s.index) moveClass(s.index, s.target);
+  }};
+  handle.addEventListener('pointerup', finishDrag);
+  handle.addEventListener('pointercancel', finishDrag);
+}}
+async function moveClass(fromIndex, toIndex) {{
+  const classes = Array.isArray(STATE.classes) ? STATE.classes.slice() : [];
+  if (fromIndex < 0 || fromIndex >= classes.length || toIndex < 0 || toIndex > classes.length) return;
+  if (fromIndex === toIndex) return;
+  const prev = classes.slice();
+  const [moved] = classes.splice(fromIndex, 1);
+  classes.splice(toIndex, 0, moved);
+  STATE.classes = classes;
+  render();
+  scheduleLayoutResync();
+  try {{
+    const res = await fetch(`${{baseUrl}}/classes/reorder`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{session: STATE.session, classes: classes}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to reorder classes.');
+    syncTrainUi();
+    refreshTrainRec();
+  }} catch (err) {{
+    STATE.classes = prev;
+    render();
+    scheduleLayoutResync();
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 function render() {{
   // #region debug-point B:render-entry
   dbgEvent('B', 'app.py:render', '[DEBUG] render start', {{classes: STATE.classes, openSourceClass, openSourceKind, initial_open_source_class: STATE.initial_open_source_class, initial_open_source_kind: STATE.initial_open_source_kind}});
@@ -7907,6 +7989,12 @@ function render() {{
       card.className = 'card class-card';
       const head = document.createElement('div');
       head.className = 'class-head';
+      const dragHandle = document.createElement('span');
+      dragHandle.className = 'class-drag-handle';
+      dragHandle.textContent = '⠿';
+      dragHandle.title = 'Drag to reorder classes';
+      bindClassDragHandle(dragHandle, i);
+      head.appendChild(dragHandle);
       const title = document.createElement('div');
       title.className = 'class-title';
       title.textContent = name;
