@@ -923,6 +923,7 @@ class RecordController:
             "/preprocess/preview",
             "/preview/predict_upload",
             "/classes/save_config",
+            "/classes/reorder",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
             return
@@ -1062,6 +1063,19 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1", **preview}, cors=True)
+            return
+        if path == "/classes/reorder":
+            session_id = str(payload.get("session") or "").strip()
+            ordered = payload.get("classes")
+            if not session_id or not isinstance(ordered, list) or not ordered:
+                _send_json(req, {"ok": "0", "error": "missing classes"}, status=400, cors=True)
+                return
+            try:
+                result = self._classes_reorder(session_id, [str(x) for x in ordered])
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "classes": result}, cors=True)
             return
         if path == "/classes/save_config":
             session_id = str(payload.get("session") or "").strip()
@@ -1386,6 +1400,20 @@ class RecordController:
         if merged_sample:
             payload["sample_preprocess"] = merged_sample
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _classes_reorder(self, session_id: str, ordered_classes: List[str]) -> List[str]:
+        """Persist a new class ORDER.  The class list order defines the
+        model's label indices (training + export read _classes_load), so
+        drag-reordering the class cards remaps the model's class index."""
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        current = self._classes_load(cfg.dataset_root)
+        if len(ordered_classes) != len(current) or set(ordered_classes) != set(current):
+            raise ValueError("class list mismatch")
+        self._classes_save(cfg.dataset_root, ordered_classes)
+        return list(ordered_classes)
 
     def _next_class_name(self, existing: List[str]) -> str:
         s = set([str(x).strip() for x in existing if str(x).strip()])
