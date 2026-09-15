@@ -1696,6 +1696,18 @@ def _render_tm_old_frontend_html(
     .class-drag-handle:hover {{
       opacity: 0.9;
     }}
+    .card.class-card {{
+      transition: transform 0.16s ease;
+    }}
+    .card.class-card.drag-live {{
+      transition: none;
+    }}
+    body.class-dragging {{
+      /* Headroom while dragging: the translated card must never be clipped
+         by the iframe bottom — the extra padding grows the SPA content and
+         the frame-height sync follows it. */
+      padding-bottom: 360px;
+    }}
     .class-title {{
       display: inline-flex;
       align-items: center;
@@ -7913,9 +7925,17 @@ function bindClassDragHandle(handle, index) {{
     if (e.button !== 0) return;
     const card = handle.closest('.card.class-card');
     if (!card) return;
-    classDragState = {{index, card, startY: e.clientY, target: index, moved: false}};
+    const col = document.getElementById('classes');
+    const gap = col ? (parseFloat(getComputedStyle(col).gap) || 24) : 24;
+    classDragState = {{
+      index, card, startY: e.clientY, target: index, moved: false,
+      step: card.offsetHeight + gap,
+    }};
+    card.classList.add('drag-live');
+    document.body.classList.add('class-dragging');
     try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
     try {{ document.body.style.userSelect = 'none'; }} catch (err) {{}}
+    queueFrameHeightSync();  // padding headroom grows the frame
     e.preventDefault();
   }});
   handle.addEventListener('pointermove', (e) => {{
@@ -7937,14 +7957,43 @@ function bindClassDragHandle(handle, index) {{
       target = cards.length;
     }}
     s.target = target;
+    // Squeeze: cards between the dragged slot and the target slot slide out
+    // of the way (animated by the .card transition), leaving a visible gap
+    // where the card will land.
+    for (let i = 0; i < cards.length; i++) {{
+      if (i === s.index) continue;
+      let shift = 0;
+      if (target > s.index && i > s.index && i <= target) shift = -s.step;
+      else if (target < s.index && i >= target && i < s.index) shift = s.step;
+      cards[i].style.transform = shift ? `translateY(${{shift}}px)` : '';
+    }}
+    queueFrameHeightSync();
   }});
   const finishDrag = () => {{
     const s = classDragState;
     if (!s || s.index !== index) return;
     classDragState = null;
-    try {{ s.card.style.transform = ''; s.card.style.zIndex = ''; s.card.style.opacity = ''; }} catch (err) {{}}
+    try {{
+      s.card.style.transform = '';
+      s.card.style.zIndex = '';
+      s.card.style.opacity = '';
+      s.card.classList.remove('drag-live');
+    }} catch (err) {{}}
     try {{ document.body.style.userSelect = ''; }} catch (err) {{}}
-    if (s.moved && s.target !== s.index) moveClass(s.index, s.target);
+    if (s.moved && s.target !== s.index) {{
+      // render() rebuilds the column in the new order — no need to animate
+      // the others back; just release the headroom padding.
+      document.body.classList.remove('class-dragging');
+      moveClass(s.index, s.target);
+    }} else {{
+      // Canceled or dropped in place: animate the squeeze back, then shrink
+      // the frame again.
+      document.querySelectorAll('#classes .card.class-card').forEach((c) => {{
+        c.style.transform = '';
+      }});
+      document.body.classList.remove('class-dragging');
+      queueFrameHeightSync();
+    }}
   }};
   handle.addEventListener('pointerup', finishDrag);
   handle.addEventListener('pointercancel', finishDrag);
