@@ -8055,6 +8055,28 @@ function bindClassDragHandle(handle, index) {{
     }}
     updateFlow();  // class→training connector curves follow the cards live
     queueFrameHeightSync();
+    // Auto-scroll the PARENT Streamlit page while dragging near the
+    // viewport edges, so classes off-screen (5+ cards) stay reachable.
+    try {{
+      const pwin = window.parent;
+      const doc = pwin ? pwin.document : null;
+      if (doc) {{
+        let scroller = doc.scrollingElement || doc.documentElement;
+        if (!scroller || scroller.scrollHeight <= scroller.clientHeight) {{
+          const main = doc.querySelector('section.stMain, main');
+          if (main && main.scrollHeight > main.clientHeight) scroller = main;
+        }}
+        if (scroller) {{
+          const edge = 70;
+          const speed = 20;
+          if (e.clientY > window.innerHeight - edge) {{
+            scroller.scrollTop += Math.min(speed, Math.max(1, (e.clientY - (window.innerHeight - edge)) / 2));
+          }} else if (e.clientY < edge) {{
+            scroller.scrollTop -= Math.min(speed, Math.max(1, (edge - e.clientY) / 2));
+          }}
+        }}
+      }}
+    }} catch (err) {{}}
   }});
   const finishDrag = () => {{
     const s = classDragState;
