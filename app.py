@@ -7967,6 +7967,7 @@ function bindClassDragHandle(handle, index) {{
       else if (target < s.index && i >= target && i < s.index) shift = s.step;
       cards[i].style.transform = shift ? `translateY(${{shift}}px)` : '';
     }}
+    updateFlow();  // class→training connector curves follow the cards live
     queueFrameHeightSync();
   }});
   const finishDrag = () => {{
@@ -7985,14 +7986,19 @@ function bindClassDragHandle(handle, index) {{
       // the others back; just release the headroom padding.
       document.body.classList.remove('class-dragging');
       moveClass(s.index, s.target);
+      updateFlow();
     }} else {{
       // Canceled or dropped in place: animate the squeeze back, then shrink
-      // the frame again.
+      // the frame again.  The 0.16s card transition means the connector
+      // curves must be re-drawn a few times to follow the return animation.
       document.querySelectorAll('#classes .card.class-card').forEach((c) => {{
         c.style.transform = '';
       }});
       document.body.classList.remove('class-dragging');
       queueFrameHeightSync();
+      updateFlow();
+      window.setTimeout(() => updateFlow(), 80);
+      window.setTimeout(() => updateFlow(), 200);
     }}
   }};
   handle.addEventListener('pointerup', finishDrag);
