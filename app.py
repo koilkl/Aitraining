@@ -7497,6 +7497,52 @@ function applyClassesState(nextClasses, oldClasses) {{
   STATE.class_preprocess = nextClassPreprocess;
   STATE.sample_preprocess = nextSamplePreprocess;
 }}
+async function clearSamples(className) {{
+  if (!className) return;
+  const currentCount = Number(STATE.counts[className] || 0);
+  if (currentCount <= 0) {{
+    toast('This class has no samples to clear.');
+    return;
+  }}
+  const ok = await showConfirmDialog(
+    'Clear all samples?',
+    `All ${{currentCount}} samples in "${{String(className || '')}}" will be deleted. This cannot be undone.`,
+    'Clear All'
+  );
+  if (!ok) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/samples/clear`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        class: className
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to clear samples.');
+    const next = data.state || {{}};
+    STATE.counts[className] = Number(next.count || 0);
+    STATE.sample_previews[className] = normalizePreviewList(next.previews);
+    STATE.processed_previews[className] = [];
+    if (STATE.sample_preprocess && typeof STATE.sample_preprocess === 'object') {{
+      try {{ delete STATE.sample_preprocess[className]; }} catch (err) {{}}
+    }}
+    if (classPreprocessOpen && classPreprocessClass === className) {{
+      classPreprocessSamples = [];
+      classPreprocessSampleIndex = 0;
+      classPreprocessProcessedSrc = '';
+      renderClassPreprocessModal();
+    }}
+    if (openSourceClass === className) updateOpenSamplesPanel(className);
+    recomputeTrainEnabled();
+    refreshTrainRec();
+    syncTrainUi();
+    toast('All samples cleared.');
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 async function deleteSample(className, filename) {{
   if (!className || !filename) return;
   try {{
@@ -7609,7 +7655,10 @@ async function addClass() {{
   }}
 }}
 async function deleteClass(name) {{
-  if (STATE.classes.length <= 2) return;
+  if (STATE.classes.length <= 2) {{
+    showTrainWarningModal('Cannot delete class.|At least two classes are required — a project cannot have fewer than 2 classes.');
+    return;
+  }}
   const ok = await showConfirmDialog(
     'Delete this class?',
     `Class "${{String(name || '')}}" and all of its samples will be removed.`,
@@ -8103,6 +8152,18 @@ function render() {{
         }}
         await deleteClass(name);
       }};
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'iconbtn clear-samples';
+      clearBtn.title = 'Clear all samples in this class';
+      clearBtn.textContent = '⌫';
+      clearBtn.onclick = async (e) => {{
+        if (e) {{
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        await clearSamples(name);
+      }};
+      head.appendChild(clearBtn);
       head.appendChild(more);  // delete ⋮ sits at the head's right end
       card.appendChild(head);
       const div = document.createElement('div');

@@ -968,6 +968,7 @@ class RecordController:
             "/classes/add",
             "/classes/delete",
             "/samples/delete",
+            "/samples/clear",
             "/preprocess/preview",
             "/preview/predict_upload",
             "/classes/save_config",
@@ -1322,6 +1323,19 @@ class RecordController:
                 return
             try:
                 state = self._sample_delete(session_id=session_id, class_name=class_name, filename=filename)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "state": state}, cors=True)
+            return
+        if path == "/samples/clear":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            if not session_id or not class_name:
+                _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
+                return
+            try:
+                state = self._samples_clear(session_id=session_id, class_name=class_name)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -2249,6 +2263,38 @@ class RecordController:
             class_map.pop(Path(filename).name, None)
             if not class_map:
                 sample_preprocess.pop(class_name, None)
+            self._classes_save(
+                cfg.dataset_root,
+                self._classes_load(cfg.dataset_root),
+                class_preprocess=self._class_preprocess_load(cfg.dataset_root),
+                sample_preprocess=sample_preprocess,
+            )
+        return self._class_state_payload(cfg.dataset_root, class_name)
+
+    def _samples_clear(self, session_id: str, class_name: str) -> Dict[str, Any]:
+        """Delete ALL samples of one class (the class itself stays)."""
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        class_dir = cfg.dataset_root / sanitize_class_name(class_name)
+        if not class_dir.exists():
+            raise FileNotFoundError("class not found")
+        for p in list(class_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(class_name)
+        if processed_dir.exists():
+            try:
+                shutil.rmtree(processed_dir)
+            except Exception:
+                pass
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        if isinstance(sample_preprocess, dict) and class_name in sample_preprocess:
+            sample_preprocess.pop(class_name, None)
             self._classes_save(
                 cfg.dataset_root,
                 self._classes_load(cfg.dataset_root),
