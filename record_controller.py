@@ -1852,6 +1852,15 @@ class RecordController:
         if processed_cache_dir.exists():
             manifest["processed_cache_dir"] = "processed_cache"
 
+        # Record the display order (newest-first) of every class's samples so
+        # project-open can reproduce it — zip round-trips lose sub-second
+        # mtimes, which scrambled the sample strip order after reopen.
+        sample_order: Dict[str, List[str]] = {}
+        if dataset_root.exists():
+            for class_dir in sorted([d for d in dataset_root.iterdir() if d.is_dir()]):
+                sample_order[str(class_dir.name)] = [p.name for p in _list_class_image_files(class_dir)]
+        manifest["sample_order"] = sample_order
+
         tmp_path = save_path.with_suffix(".tmproj.tmp")
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -1921,6 +1930,15 @@ class RecordController:
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info, "r") as src, out.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
+                    try:
+                        # Restore the original mtime from the zip entry so
+                        # copy2 below carries it into the dataset (fresh
+                        # extraction-time mtimes scrambled the order).
+                        _dt = info.date_time
+                        _ts = time.mktime(_dt + (0, 0, -1))
+                        os.utime(out, (_ts, _ts))
+                    except Exception:
+                        pass
 
             manifest_path = tmp_dir / "manifest.json"
             if not manifest_path.exists():
@@ -1940,6 +1958,29 @@ class RecordController:
                 out = dataset_root / rel
                 out.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(p, out)
+
+            # Authoritative sample order: zip mtimes only have 2-second
+            # resolution, so burst captures (several samples per second)
+            # would still shuffle — stamp monotonic mtimes in the saved
+            # display order (newest-first → largest mtime).
+            sample_order = manifest.get("sample_order") or {}
+            if isinstance(sample_order, dict):
+                _base_t = time.time()
+                for _cls_name, _ordered in sample_order.items():
+                    if not isinstance(_ordered, list) or not _ordered:
+                        continue
+                    _cls_dir = dataset_root / sanitize_class_name(str(_cls_name))
+                    if not _cls_dir.exists():
+                        continue
+                    _t = _base_t
+                    for _name in _ordered:
+                        _p = _cls_dir / Path(str(_name)).name
+                        if _p.exists():
+                            try:
+                                os.utime(_p, (_t, _t))
+                            except Exception:
+                                pass
+                        _t -= 0.01
 
             classes_meta_in = tmp_dir / "tm_classes.json"
             classes_meta_out = self._classes_meta_path(dataset_root)
