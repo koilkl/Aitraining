@@ -7081,10 +7081,11 @@ function renderPreviewSettings() {{
   host.innerHTML = buildPreviewSettingsMarkup();
   updateFlow();
   if (previewSource === 'device') {{
-    const currentPorts = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
-    if (!currentPorts.length) {{
-      refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
-    }}
+    // Re-query the serial port list EVERY time the settings panel opens —
+    // a port plugged in after page load must appear (same query path as
+    // the class-area device dropdown).  The old guard only refreshed when
+    // the list was empty, so a newly connected port never showed up.
+    refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
   }}
   const cancel = document.getElementById('previewSettingsCancel');
   const save = document.getElementById('previewSettingsSave');
