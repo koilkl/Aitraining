@@ -5831,7 +5831,14 @@ async function startTrain() {{
       const p = Number(stData.progress || 0);
       const msg = String(stData.message || '');
       if (stData.class_accuracies) {{
-        STATE.trainClassAccuracies = stData.class_accuracies;
+        if (stData.class_accuracies && Object.keys(stData.class_accuracies).length > 0 &&
+            (!STATE.trainClassAccuracies ||
+             JSON.stringify(stData.class_accuracies) !== JSON.stringify(STATE.trainClassAccuracies))) {{
+          STATE.trainClassAccuracies = stData.class_accuracies;
+          showClassAccuracyModal();  // 提示出现: auto-pop, click Close to dismiss
+        }} else if (stData.class_accuracies) {{
+          STATE.trainClassAccuracies = stData.class_accuracies;
+        }}
       }}
       showTrainProgress(true, p, msg);
       if (String(stData.done || '0') === '1') {{
@@ -7225,21 +7232,41 @@ function showTrainWarningModal(text) {{
     lines.map((l) => '<div style="margin-bottom:6px;">' + String(l).replace(/</g, '&lt;') + '</div>').join('') +
     '<button style="margin-top:12px;padding:8px 18px;border:0;border-radius:8px;background:#c62828;color:#fff;cursor:pointer;font-weight:600;" onclick="this.parentNode.remove()">Close</button>';
 }}
+function classAccuracyLines() {{
+  const accs = STATE.trainClassAccuracies || null;
+  if (!accs || Object.keys(accs).length === 0) return null;
+  const lines = [];
+  for (const k of Object.keys(accs)) {{
+    const v = Number(accs[k]);
+    lines.push(`${{k}}: ${{Math.round(v * 100)}}%`);
+  }}
+  return lines;
+}}
+function showClassAccuracyModal() {{
+  const lines = classAccuracyLines();
+  if (!lines) return;
+  showTrainWarningModal('Model Trained — per-class accuracy|' + lines.join('|'));
+}}
 function renderTrainStatus() {{
   const el = document.getElementById('trainStatus');
   if (!el) return;
-  el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
-  const accs = STATE.trainClassAccuracies || null;
-  if (STATE.export_enabled && accs && Object.keys(accs).length > 0) {{
-    const parts = [];
-    for (const k of Object.keys(accs)) {{
-      const v = Number(accs[k]);
-      parts.push(`${{k}} ${{Math.round(v * 100)}}%`);
-    }}
-    el.textContent = 'Model Trained — ' + parts.join(', ');
-    el.style.color = parts.some((t) => Number(t.split(' ').pop().replace('%','')) < 80) ? '#c62828' : '#2e7d32';
+  const lines = classAccuracyLines();
+  if (STATE.export_enabled && lines) {{
+    // Keep the inline text SHORT (the training column is narrow — the full
+    // per-class list used to get cut off here).  Hover shows a native
+    // tooltip; clicking opens the dismissible accuracy box (same style as
+    // the "cannot delete class" warning).
+    el.textContent = 'Model Trained · tap for accuracy';
+    el.title = lines.join(' · ');
+    el.style.cursor = 'pointer';
+    el.style.color = lines.some((t) => Number(t.split(': ')[1].replace('%','')) < 80) ? '#c62828' : '#2e7d32';
+    el.onclick = () => showClassAccuracyModal();
   }} else {{
+    el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
+    el.title = '';
+    el.style.cursor = '';
     el.style.color = '';
+    el.onclick = null;
   }}
 }}
 function bindPreviewThreshBar() {{
