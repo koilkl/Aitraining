@@ -93,11 +93,12 @@ class SessionConfig:
     fps: float
     crop_box: Optional[Tuple[int, int, int, int]]
     # When True, a 1-channel device stream is fed STRAIGHT to the model
-    # (the firmware already streams the preprocessed tensor — TFLite.ino
-    # kCaptureGray/kInferGray).  Default False: the stream is a RAW frame
-    # (IMX219_Grayscale_Serial example firmware) and must go through the
-    # full crop pipeline like the training data did.  Direct-feeding a raw
-    # frame into a crop-trained model was the "model always wrong" bug.
+    # Legacy: older firmware (kCaptureGray/kInferGray) streamed the
+    # preprocessed TENSOR.  Current firmware streams the RAW library gray
+    # (BT.601, uncropped) in ALL capture modes, so this must stay False —
+    # the host runs the full crop pipeline exactly like training did.
+    # Direct-feeding a raw frame into a crop-trained model was the
+    # "model always wrong" bug.
     direct_tensor_stream: bool = False
     # macOS AVCaptureDevice uniqueID of the selected camera.  On macOS this
     # is AUTHORITATIVE: the camera is opened by uniqueID (mac_camera bridge),
