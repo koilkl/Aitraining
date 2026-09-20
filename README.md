@@ -25,7 +25,7 @@ Goal: students should not need to install Python. Double-click to launch.
   - Training input is normalized to grayscale for all sample sources, so webcam/upload/device are trained consistently
 - Device source:
       - Open the `Device` card and use the `⚙` settings panel to configure `Image Size`, `Color Mode`, `Baud Rate`, and `Sync Header`
-      - `Image Size` selects the frame resolution sent by the firmware: 96×96, 160×160, or 384×384 — must match the firmware output exactly.  On the firmware side this is the `IMG_SIZE` value in `TFLite/user_config.h` (the single user-config knob; the camera libraries follow it at runtime via the unified `set_frame_side()` API).  `CAMERA_FLIP_180` in the same file controls the 180° rotation for the upside-down camera mount — keep it `true` for the standard board.
+      - `Image Size` selects the frame resolution sent by the firmware: 96×96, 160×160, or 384×384 — must match the firmware output exactly.  On the firmware side this is the `FRAME_SIDE` value in the USER CONFIG block at the top of `TFLite/TFLite.ino` (the camera libraries follow it at runtime via the unified `set_frame_side()` API).  `CAMERA_FLIP_180` right below it controls the 180° rotation for the upside-down camera mount — keep it `true` for the standard board.
       - `Color Mode` selects Grayscale (1 channel) or RGB (3 channels) depending on the firmware sketch
       - `Sync Header` is the hex frame marker used to detect the start of each image packet, for example `AA 55 AA`
       - Change the sync value if your firmware uses a different frame prefix
