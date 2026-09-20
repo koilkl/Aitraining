@@ -1191,7 +1191,8 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "export_dir": str(out_dir)}, cors=True)
+            out_dir, legacy_removed = out_dir
+            _send_json(req, {"ok": "1", "export_dir": str(out_dir), "legacy_removed": legacy_removed}, cors=True)
             return
         if path == "/project/save":
             session_id = str(payload.get("session") or "").strip()
@@ -1722,8 +1723,6 @@ class RecordController:
             export_dir / cpp_name,
             export_dir / "model_settings.h",
             export_dir / "model_settings.cpp",
-            export_dir / "model.h",
-            export_dir / "model.cpp",
             export_dir / "model_resolver.h",
             export_dir / "labels.txt",
         ]
@@ -1743,8 +1742,6 @@ class RecordController:
         (export_dir / f"{safe_base}.tflite").write_bytes(source_bytes)
         (export_dir / h_name).write_text(hdr, encoding="utf-8")
         (export_dir / cpp_name).write_text(f'#include "{h_name}"\n\n' + src, encoding="utf-8")
-        (export_dir / "model.h").write_text(hdr, encoding="utf-8")
-        (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
         (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
         # Generate model_resolver.h from the actual ops in the exported model
         resolver_h = _generate_model_resolver_h(source_bytes)
@@ -1802,7 +1799,27 @@ class RecordController:
                 shutil.copyfile(latest_meta, cfg.dataset_root.parent / "deployed.json")
         except Exception:
             pass
-        return export_dir
+        # Fool-proofing: older versions exported model.h / model.cpp as
+        # duplicates of {base}_model_data.* — including BOTH in a firmware
+        # project causes duplicate-symbol link errors.  We no longer
+        # generate them; remove legacy copies left by previous exports
+        # (only files recognisably ours, so user files are never touched).
+        legacy_removed: List[str] = []
+        for _name in ("model.h", "model.cpp"):
+            _p = export_dir / _name
+            if not _p.exists():
+                continue
+            try:
+                _text = _p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "model_data" in _text and ("unsigned char" in _text or "#include" in _text):
+                try:
+                    _p.unlink()
+                    legacy_removed.append(_name)
+                except Exception:
+                    pass
+        return export_dir, legacy_removed
 
     def _dataset_export(self, session_id: str, export_dir: Path) -> Path:
         with self._lock:
