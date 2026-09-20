@@ -5629,7 +5629,12 @@ async function exportRunWithOverwriteConfirm(exportDirValue, modelNameValue, arr
     body: JSON.stringify(payload)
   }});
   let data = await res.json().catch(() => ({{ok:'0'}}));
-  if (res.ok && data.ok === '1') return data;
+  if (res.ok && data.ok === '1') {{
+    if (Array.isArray(data.legacy_removed) && data.legacy_removed.length) {{
+      toast(`Cleaned up legacy duplicates: ${{data.legacy_removed.join(', ')}}`);
+    }}
+    return data;
+  }}
   if (data && data.needs_confirm === '1') {{
     const files = Array.isArray(data.conflicts) ? data.conflicts.slice(0, 8) : [];
     const confirmed = await showOverwriteConfirmDialog(files);
@@ -5652,6 +5657,9 @@ async function exportRunWithOverwriteConfirm(exportDirValue, modelNameValue, arr
     data = await res.json().catch(() => ({{ok:'0'}}));
     if (res.ok && data.ok === '1') {{
       toast('Existing export files were overwritten.');
+      if (Array.isArray(data.legacy_removed) && data.legacy_removed.length) {{
+        toast(`Cleaned up legacy duplicates: ${{data.legacy_removed.join(', ')}}`);
+      }}
       return data;
     }}
   }}
