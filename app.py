@@ -1690,10 +1690,37 @@ def _render_tm_old_frontend_html(
       padding: 12px 16px;
       border-bottom: 1px solid rgba(0,0,0,0.08);
     }}
+    .class-drag-handle {{
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+      font-size: 15px;
+      color: var(--text);
+      opacity: 0.45;
+      padding: 2px 6px 2px 2px;
+      flex: 0 0 auto;
+    }}
+    .class-drag-handle:hover {{
+      opacity: 0.9;
+    }}
+    .card.class-card {{
+      transition: transform 0.16s ease;
+    }}
+    .card.class-card.drag-live {{
+      transition: none;
+    }}
+    body.class-dragging {{
+      /* Headroom while dragging: the translated card must never be clipped
+         by the iframe bottom — the extra padding grows the SPA content and
+         the frame-height sync follows it. */
+      padding-bottom: 360px;
+    }}
     .class-title {{
       display: inline-flex;
       align-items: center;
       gap: 10px;
+      flex: 1 1 auto;
+      min-width: 0;
       font-size: 16px;
       font-weight: 600;
     }}
@@ -1711,9 +1738,7 @@ def _render_tm_old_frontend_html(
     }}
     .iconbtn:hover {{ background: rgba(0,0,0,0.05); color: var(--text); }}
     .more {{
-      position: absolute;
-      top: 8px;
-      right: 8px;
+      flex: 0 0 auto;
     }}
     .divider {{ height: 1px; background: rgba(0,0,0,0.08); margin: 0; }}
     .subhead {{ font-size: 12px; color: var(--muted); margin: 0 0 10px 0; }}
@@ -5611,7 +5636,12 @@ async function exportRunWithOverwriteConfirm(exportDirValue, modelNameValue, arr
     body: JSON.stringify(payload)
   }});
   let data = await res.json().catch(() => ({{ok:'0'}}));
-  if (res.ok && data.ok === '1') return data;
+  if (res.ok && data.ok === '1') {{
+    if (Array.isArray(data.legacy_removed) && data.legacy_removed.length) {{
+      toast(`Cleaned up legacy duplicates: ${{data.legacy_removed.join(', ')}}`);
+    }}
+    return data;
+  }}
   if (data && data.needs_confirm === '1') {{
     const files = Array.isArray(data.conflicts) ? data.conflicts.slice(0, 8) : [];
     const confirmed = await showOverwriteConfirmDialog(files);
@@ -5634,6 +5664,9 @@ async function exportRunWithOverwriteConfirm(exportDirValue, modelNameValue, arr
     data = await res.json().catch(() => ({{ok:'0'}}));
     if (res.ok && data.ok === '1') {{
       toast('Existing export files were overwritten.');
+      if (Array.isArray(data.legacy_removed) && data.legacy_removed.length) {{
+        toast(`Cleaned up legacy duplicates: ${{data.legacy_removed.join(', ')}}`);
+      }}
       return data;
     }}
   }}
@@ -5704,7 +5737,14 @@ async function startTrain() {{
       const p = Number(stData.progress || 0);
       const msg = String(stData.message || '');
       if (stData.class_accuracies) {{
-        STATE.trainClassAccuracies = stData.class_accuracies;
+        if (stData.class_accuracies && Object.keys(stData.class_accuracies).length > 0 &&
+            (!STATE.trainClassAccuracies ||
+             JSON.stringify(stData.class_accuracies) !== JSON.stringify(STATE.trainClassAccuracies))) {{
+          STATE.trainClassAccuracies = stData.class_accuracies;
+          showClassAccuracyModal();  // 提示出现: auto-pop, click Close to dismiss
+        }} else if (stData.class_accuracies) {{
+          STATE.trainClassAccuracies = stData.class_accuracies;
+        }}
       }}
       showTrainProgress(true, p, msg);
       if (String(stData.done || '0') === '1') {{
@@ -6968,10 +7008,11 @@ function renderPreviewSettings() {{
   host.innerHTML = buildPreviewSettingsMarkup();
   updateFlow();
   if (previewSource === 'device') {{
-    const currentPorts = Array.isArray(STATE.serial_ports) ? STATE.serial_ports : [];
-    if (!currentPorts.length) {{
-      refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
-    }}
+    // Re-query the serial port list EVERY time the settings panel opens —
+    // a port plugged in after page load must appear (same query path as
+    // the class-area device dropdown).  The old guard only refreshed when
+    // the list was empty, so a newly connected port never showed up.
+    refreshSerialPorts(false, 'previewDevicePort').catch(() => {{}});
   }}
   const cancel = document.getElementById('previewSettingsCancel');
   const save = document.getElementById('previewSettingsSave');
@@ -7111,21 +7152,41 @@ function showTrainWarningModal(text) {{
     lines.map((l) => '<div style="margin-bottom:6px;">' + String(l).replace(/</g, '&lt;') + '</div>').join('') +
     '<button style="margin-top:12px;padding:8px 18px;border:0;border-radius:8px;background:#c62828;color:#fff;cursor:pointer;font-weight:600;" onclick="this.parentNode.remove()">Close</button>';
 }}
+function classAccuracyLines() {{
+  const accs = STATE.trainClassAccuracies || null;
+  if (!accs || Object.keys(accs).length === 0) return null;
+  const lines = [];
+  for (const k of Object.keys(accs)) {{
+    const v = Number(accs[k]);
+    lines.push(`${{k}}: ${{Math.round(v * 100)}}%`);
+  }}
+  return lines;
+}}
+function showClassAccuracyModal() {{
+  const lines = classAccuracyLines();
+  if (!lines) return;
+  showTrainWarningModal('Model Trained — per-class accuracy|' + lines.join('|'));
+}}
 function renderTrainStatus() {{
   const el = document.getElementById('trainStatus');
   if (!el) return;
-  el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
-  const accs = STATE.trainClassAccuracies || null;
-  if (STATE.export_enabled && accs && Object.keys(accs).length > 0) {{
-    const parts = [];
-    for (const k of Object.keys(accs)) {{
-      const v = Number(accs[k]);
-      parts.push(`${{k}} ${{Math.round(v * 100)}}%`);
-    }}
-    el.textContent = 'Model Trained — ' + parts.join(', ');
-    el.style.color = parts.some((t) => Number(t.split(' ').pop().replace('%','')) < 80) ? '#c62828' : '#2e7d32';
+  const lines = classAccuracyLines();
+  if (STATE.export_enabled && lines) {{
+    // Keep the inline text SHORT (the training column is narrow — the full
+    // per-class list used to get cut off here).  Hover shows a native
+    // tooltip; clicking opens the dismissible accuracy box (same style as
+    // the "cannot delete class" warning).
+    el.textContent = 'Model Trained · tap for accuracy';
+    el.title = lines.join(' · ');
+    el.style.cursor = 'pointer';
+    el.style.color = lines.some((t) => Number(t.split(': ')[1].replace('%','')) < 80) ? '#c62828' : '#2e7d32';
+    el.onclick = () => showClassAccuracyModal();
   }} else {{
+    el.textContent = STATE.export_enabled ? 'Model Trained' : 'Not trained';
+    el.title = '';
+    el.style.cursor = '';
     el.style.color = '';
+    el.onclick = null;
   }}
 }}
 function bindPreviewThreshBar() {{
@@ -7479,6 +7540,52 @@ function applyClassesState(nextClasses, oldClasses) {{
   STATE.class_preprocess = nextClassPreprocess;
   STATE.sample_preprocess = nextSamplePreprocess;
 }}
+async function clearSamples(className) {{
+  if (!className) return;
+  const currentCount = Number(STATE.counts[className] || 0);
+  if (currentCount <= 0) {{
+    toast('This class has no samples to clear.');
+    return;
+  }}
+  const ok = await showConfirmDialog(
+    'Clear all samples?',
+    `All ${{currentCount}} samples in "${{String(className || '')}}" will be deleted. This cannot be undone.`,
+    'Clear All'
+  );
+  if (!ok) return;
+  try {{
+    const res = await fetch(`${{baseUrl}}/samples/clear`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        session: STATE.session,
+        class: className
+      }})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to clear samples.');
+    const next = data.state || {{}};
+    STATE.counts[className] = Number(next.count || 0);
+    STATE.sample_previews[className] = normalizePreviewList(next.previews);
+    STATE.processed_previews[className] = [];
+    if (STATE.sample_preprocess && typeof STATE.sample_preprocess === 'object') {{
+      try {{ delete STATE.sample_preprocess[className]; }} catch (err) {{}}
+    }}
+    if (classPreprocessOpen && classPreprocessClass === className) {{
+      classPreprocessSamples = [];
+      classPreprocessSampleIndex = 0;
+      classPreprocessProcessedSrc = '';
+      renderClassPreprocessModal();
+    }}
+    if (openSourceClass === className) updateOpenSamplesPanel(className);
+    recomputeTrainEnabled();
+    refreshTrainRec();
+    syncTrainUi();
+    toast('All samples cleared.');
+  }} catch (err) {{
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 async function deleteSample(className, filename) {{
   if (!className || !filename) return;
   try {{
@@ -7591,7 +7698,10 @@ async function addClass() {{
   }}
 }}
 async function deleteClass(name) {{
-  if (STATE.classes.length <= 2) return;
+  if (STATE.classes.length <= 2) {{
+    showTrainWarningModal('Cannot delete class.|At least two classes are required — a project cannot have fewer than 2 classes.');
+    return;
+  }}
   const ok = await showConfirmDialog(
     'Delete this class?',
     `Class "${{String(name || '')}}" and all of its samples will be removed.`,
@@ -7901,6 +8011,140 @@ function resetTrainCfg() {{
   renderTrainStatus();
   toast('Advanced settings reset.');
 }}
+let classDragState = null;
+function bindClassDragHandle(handle, index) {{
+  handle.addEventListener('pointerdown', (e) => {{
+    if (e.button !== 0) return;
+    const card = handle.closest('.card.class-card');
+    if (!card) return;
+    const col = document.getElementById('classes');
+    const gap = col ? (parseFloat(getComputedStyle(col).gap) || 24) : 24;
+    classDragState = {{
+      index, card, startY: e.clientY, target: index, moved: false,
+      step: card.offsetHeight + gap,
+    }};
+    card.classList.add('drag-live');
+    document.body.classList.add('class-dragging');
+    try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
+    try {{ document.body.style.userSelect = 'none'; }} catch (err) {{}}
+    queueFrameHeightSync();  // padding headroom grows the frame
+    e.preventDefault();
+  }});
+  handle.addEventListener('pointermove', (e) => {{
+    const s = classDragState;
+    if (!s || s.index !== index) return;
+    const dy = e.clientY - s.startY;
+    if (!s.moved && Math.abs(dy) < 5) return;
+    s.moved = true;
+    s.card.style.transform = `translateY(${{dy}}px)`;
+    s.card.style.zIndex = '40';
+    s.card.style.opacity = '0.9';
+    const cards = Array.from(document.querySelectorAll('#classes .card.class-card'));
+    let target = s.index;
+    for (let i = 0; i < cards.length; i++) {{
+      const r = cards[i].getBoundingClientRect();
+      if (e.clientY > r.top + r.height / 2) target = i;
+    }}
+    if (cards.length && e.clientY > cards[cards.length - 1].getBoundingClientRect().bottom) {{
+      target = cards.length;
+    }}
+    s.target = target;
+    // Squeeze: cards between the dragged slot and the target slot slide out
+    // of the way (animated by the .card transition), leaving a visible gap
+    // where the card will land.
+    for (let i = 0; i < cards.length; i++) {{
+      if (i === s.index) continue;
+      let shift = 0;
+      if (target > s.index && i > s.index && i <= target) shift = -s.step;
+      else if (target < s.index && i >= target && i < s.index) shift = s.step;
+      cards[i].style.transform = shift ? `translateY(${{shift}}px)` : '';
+    }}
+    updateFlow();  // class→training connector curves follow the cards live
+    queueFrameHeightSync();
+    // Auto-scroll the PARENT Streamlit page while dragging near the
+    // viewport edges, so classes off-screen (5+ cards) stay reachable.
+    try {{
+      const pwin = window.parent;
+      const doc = pwin ? pwin.document : null;
+      if (doc) {{
+        let scroller = doc.scrollingElement || doc.documentElement;
+        if (!scroller || scroller.scrollHeight <= scroller.clientHeight) {{
+          const main = doc.querySelector('section.stMain, main');
+          if (main && main.scrollHeight > main.clientHeight) scroller = main;
+        }}
+        if (scroller) {{
+          const edge = 70;
+          const speed = 20;
+          if (e.clientY > window.innerHeight - edge) {{
+            scroller.scrollTop += Math.min(speed, Math.max(1, (e.clientY - (window.innerHeight - edge)) / 2));
+          }} else if (e.clientY < edge) {{
+            scroller.scrollTop -= Math.min(speed, Math.max(1, (edge - e.clientY) / 2));
+          }}
+        }}
+      }}
+    }} catch (err) {{}}
+  }});
+  const finishDrag = () => {{
+    const s = classDragState;
+    if (!s || s.index !== index) return;
+    classDragState = null;
+    try {{
+      s.card.style.transform = '';
+      s.card.style.zIndex = '';
+      s.card.style.opacity = '';
+      s.card.classList.remove('drag-live');
+    }} catch (err) {{}}
+    try {{ document.body.style.userSelect = ''; }} catch (err) {{}}
+    if (s.moved && s.target !== s.index) {{
+      // render() rebuilds the column in the new order — no need to animate
+      // the others back; just release the headroom padding.
+      document.body.classList.remove('class-dragging');
+      moveClass(s.index, s.target);
+      updateFlow();
+    }} else {{
+      // Canceled or dropped in place: animate the squeeze back, then shrink
+      // the frame again.  The 0.16s card transition means the connector
+      // curves must be re-drawn a few times to follow the return animation.
+      document.querySelectorAll('#classes .card.class-card').forEach((c) => {{
+        c.style.transform = '';
+      }});
+      document.body.classList.remove('class-dragging');
+      queueFrameHeightSync();
+      updateFlow();
+      window.setTimeout(() => updateFlow(), 80);
+      window.setTimeout(() => updateFlow(), 200);
+    }}
+  }};
+  handle.addEventListener('pointerup', finishDrag);
+  handle.addEventListener('pointercancel', finishDrag);
+}}
+async function moveClass(fromIndex, toIndex) {{
+  const classes = Array.isArray(STATE.classes) ? STATE.classes.slice() : [];
+  if (fromIndex < 0 || fromIndex >= classes.length || toIndex < 0 || toIndex > classes.length) return;
+  if (fromIndex === toIndex) return;
+  const prev = classes.slice();
+  const [moved] = classes.splice(fromIndex, 1);
+  classes.splice(toIndex, 0, moved);
+  STATE.classes = classes;
+  render();
+  scheduleLayoutResync();
+  try {{
+    const res = await fetch(`${{baseUrl}}/classes/reorder`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{session: STATE.session, classes: classes}})
+    }});
+    const data = await res.json().catch(() => ({{ok:'0'}}));
+    if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Unable to reorder classes.');
+    syncTrainUi();
+    refreshTrainRec();
+  }} catch (err) {{
+    STATE.classes = prev;
+    render();
+    scheduleLayoutResync();
+    toast(String(err && err.message ? err.message : err));
+  }}
+}}
 function render() {{
   // #region debug-point B:render-entry
   dbgEvent('B', 'app.py:render', '[DEBUG] render start', {{classes: STATE.classes, openSourceClass, openSourceKind, initial_open_source_class: STATE.initial_open_source_class, initial_open_source_kind: STATE.initial_open_source_kind}});
@@ -7914,6 +8158,12 @@ function render() {{
       card.className = 'card class-card';
       const head = document.createElement('div');
       head.className = 'class-head';
+      const dragHandle = document.createElement('span');
+      dragHandle.className = 'class-drag-handle';
+      dragHandle.textContent = '⠿';
+      dragHandle.title = 'Drag to reorder classes';
+      bindClassDragHandle(dragHandle, i);
+      head.appendChild(dragHandle);
       const title = document.createElement('div');
       title.className = 'class-title';
       title.textContent = name;
@@ -7945,7 +8195,19 @@ function render() {{
         }}
         await deleteClass(name);
       }};
-      card.appendChild(more);
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'iconbtn clear-samples';
+      clearBtn.title = 'Clear all samples in this class';
+      clearBtn.textContent = '⌫';
+      clearBtn.onclick = async (e) => {{
+        if (e) {{
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        await clearSamples(name);
+      }};
+      head.appendChild(clearBtn);
+      head.appendChild(more);  // delete ⋮ sits at the head's right end
       card.appendChild(head);
       const div = document.createElement('div');
       div.className = 'divider';

@@ -94,11 +94,12 @@ class SessionConfig:
     fps: float
     crop_box: Optional[Tuple[int, int, int, int]]
     # When True, a 1-channel device stream is fed STRAIGHT to the model
-    # (the firmware already streams the preprocessed tensor — TFLite.ino
-    # kCaptureGray/kInferGray).  Default False: the stream is a RAW frame
-    # (IMX219_Grayscale_Serial example firmware) and must go through the
-    # full crop pipeline like the training data did.  Direct-feeding a raw
-    # frame into a crop-trained model was the "model always wrong" bug.
+    # Legacy: older firmware (kCaptureGray/kInferGray) streamed the
+    # preprocessed TENSOR.  Current firmware streams the RAW library gray
+    # (BT.601, uncropped) in ALL capture modes, so this must stay False —
+    # the host runs the full crop pipeline exactly like training did.
+    # Direct-feeding a raw frame into a crop-trained model was the
+    # "model always wrong" bug.
     direct_tensor_stream: bool = False
     # macOS AVCaptureDevice uniqueID of the selected camera.  On macOS this
     # is AUTHORITATIVE: the camera is opened by uniqueID (mac_camera bridge),
@@ -968,9 +969,11 @@ class RecordController:
             "/classes/add",
             "/classes/delete",
             "/samples/delete",
+            "/samples/clear",
             "/preprocess/preview",
             "/preview/predict_upload",
             "/classes/save_config",
+            "/classes/reorder",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
             return
@@ -1112,6 +1115,19 @@ class RecordController:
                 return
             _send_json(req, {"ok": "1", **preview}, cors=True)
             return
+        if path == "/classes/reorder":
+            session_id = str(payload.get("session") or "").strip()
+            ordered = payload.get("classes")
+            if not session_id or not isinstance(ordered, list) or not ordered:
+                _send_json(req, {"ok": "0", "error": "missing classes"}, status=400, cors=True)
+                return
+            try:
+                result = self._classes_reorder(session_id, [str(x) for x in ordered])
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "classes": result}, cors=True)
+            return
         if path == "/classes/save_config":
             session_id = str(payload.get("session") or "").strip()
             class_preprocess = payload.get("class_preprocess")
@@ -1225,7 +1241,8 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "export_dir": str(out_dir)}, cors=True)
+            out_dir, legacy_removed = out_dir
+            _send_json(req, {"ok": "1", "export_dir": str(out_dir), "legacy_removed": legacy_removed}, cors=True)
             return
         if path == "/project/save":
             session_id = str(payload.get("session") or "").strip()
@@ -1308,6 +1325,19 @@ class RecordController:
                 return
             try:
                 state = self._sample_delete(session_id=session_id, class_name=class_name, filename=filename)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "state": state}, cors=True)
+            return
+        if path == "/samples/clear":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            if not session_id or not class_name:
+                _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
+                return
+            try:
+                state = self._samples_clear(session_id=session_id, class_name=class_name)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -1435,6 +1465,20 @@ class RecordController:
         if merged_sample:
             payload["sample_preprocess"] = merged_sample
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _classes_reorder(self, session_id: str, ordered_classes: List[str]) -> List[str]:
+        """Persist a new class ORDER.  The class list order defines the
+        model's label indices (training + export read _classes_load), so
+        drag-reordering the class cards remaps the model's class index."""
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        current = self._classes_load(cfg.dataset_root)
+        if len(ordered_classes) != len(current) or set(ordered_classes) != set(current):
+            raise ValueError("class list mismatch")
+        self._classes_save(cfg.dataset_root, ordered_classes)
+        return list(ordered_classes)
 
     def _next_class_name(self, existing: List[str]) -> str:
         s = set([str(x).strip() for x in existing if str(x).strip()])
@@ -1729,8 +1773,6 @@ class RecordController:
             export_dir / cpp_name,
             export_dir / "model_settings.h",
             export_dir / "model_settings.cpp",
-            export_dir / "model.h",
-            export_dir / "model.cpp",
             export_dir / "model_resolver.h",
             export_dir / "labels.txt",
         ]
@@ -1750,8 +1792,6 @@ class RecordController:
         (export_dir / f"{safe_base}.tflite").write_bytes(source_bytes)
         (export_dir / h_name).write_text(hdr, encoding="utf-8")
         (export_dir / cpp_name).write_text(f'#include "{h_name}"\n\n' + src, encoding="utf-8")
-        (export_dir / "model.h").write_text(hdr, encoding="utf-8")
-        (export_dir / "model.cpp").write_text('#include "model.h"\n\n' + src, encoding="utf-8")
         (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
         # Generate model_resolver.h from the actual ops in the exported model
         resolver_h = _generate_model_resolver_h(source_bytes)
@@ -1809,7 +1849,27 @@ class RecordController:
                 shutil.copyfile(latest_meta, cfg.dataset_root.parent / "deployed.json")
         except Exception:
             pass
-        return export_dir
+        # Fool-proofing: older versions exported model.h / model.cpp as
+        # duplicates of {base}_model_data.* — including BOTH in a firmware
+        # project causes duplicate-symbol link errors.  We no longer
+        # generate them; remove legacy copies left by previous exports
+        # (only files recognisably ours, so user files are never touched).
+        legacy_removed: List[str] = []
+        for _name in ("model.h", "model.cpp"):
+            _p = export_dir / _name
+            if not _p.exists():
+                continue
+            try:
+                _text = _p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if "model_data" in _text and ("unsigned char" in _text or "#include" in _text):
+                try:
+                    _p.unlink()
+                    legacy_removed.append(_name)
+                except Exception:
+                    pass
+        return export_dir, legacy_removed
 
     def _dataset_export(self, session_id: str, export_dir: Path) -> Path:
         with self._lock:
@@ -1901,6 +1961,15 @@ class RecordController:
         if processed_cache_dir.exists():
             manifest["processed_cache_dir"] = "processed_cache"
 
+        # Record the display order (newest-first) of every class's samples so
+        # project-open can reproduce it — zip round-trips lose sub-second
+        # mtimes, which scrambled the sample strip order after reopen.
+        sample_order: Dict[str, List[str]] = {}
+        if dataset_root.exists():
+            for class_dir in sorted([d for d in dataset_root.iterdir() if d.is_dir()]):
+                sample_order[str(class_dir.name)] = [p.name for p in _list_class_image_files(class_dir)]
+        manifest["sample_order"] = sample_order
+
         tmp_path = save_path.with_suffix(".tmproj.tmp")
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -1970,6 +2039,15 @@ class RecordController:
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(info, "r") as src, out.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
+                    try:
+                        # Restore the original mtime from the zip entry so
+                        # copy2 below carries it into the dataset (fresh
+                        # extraction-time mtimes scrambled the order).
+                        _dt = info.date_time
+                        _ts = time.mktime(_dt + (0, 0, -1))
+                        os.utime(out, (_ts, _ts))
+                    except Exception:
+                        pass
 
             manifest_path = tmp_dir / "manifest.json"
             if not manifest_path.exists():
@@ -1989,6 +2067,29 @@ class RecordController:
                 out = dataset_root / rel
                 out.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(p, out)
+
+            # Authoritative sample order: zip mtimes only have 2-second
+            # resolution, so burst captures (several samples per second)
+            # would still shuffle — stamp monotonic mtimes in the saved
+            # display order (newest-first → largest mtime).
+            sample_order = manifest.get("sample_order") or {}
+            if isinstance(sample_order, dict):
+                _base_t = time.time()
+                for _cls_name, _ordered in sample_order.items():
+                    if not isinstance(_ordered, list) or not _ordered:
+                        continue
+                    _cls_dir = dataset_root / sanitize_class_name(str(_cls_name))
+                    if not _cls_dir.exists():
+                        continue
+                    _t = _base_t
+                    for _name in _ordered:
+                        _p = _cls_dir / Path(str(_name)).name
+                        if _p.exists():
+                            try:
+                                os.utime(_p, (_t, _t))
+                            except Exception:
+                                pass
+                        _t -= 0.01
 
             classes_meta_in = tmp_dir / "tm_classes.json"
             classes_meta_out = self._classes_meta_path(dataset_root)
@@ -2180,6 +2281,38 @@ class RecordController:
             class_map.pop(Path(filename).name, None)
             if not class_map:
                 sample_preprocess.pop(class_name, None)
+            self._classes_save(
+                cfg.dataset_root,
+                self._classes_load(cfg.dataset_root),
+                class_preprocess=self._class_preprocess_load(cfg.dataset_root),
+                sample_preprocess=sample_preprocess,
+            )
+        return self._class_state_payload(cfg.dataset_root, class_name)
+
+    def _samples_clear(self, session_id: str, class_name: str) -> Dict[str, Any]:
+        """Delete ALL samples of one class (the class itself stays)."""
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        class_dir = cfg.dataset_root / sanitize_class_name(class_name)
+        if not class_dir.exists():
+            raise FileNotFoundError("class not found")
+        for p in list(class_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        processed_dir = self._processed_cache_dir(cfg.dataset_root) / sanitize_class_name(class_name)
+        if processed_dir.exists():
+            try:
+                shutil.rmtree(processed_dir)
+            except Exception:
+                pass
+        sample_preprocess = self._sample_preprocess_load(cfg.dataset_root)
+        if isinstance(sample_preprocess, dict) and class_name in sample_preprocess:
+            sample_preprocess.pop(class_name, None)
             self._classes_save(
                 cfg.dataset_root,
                 self._classes_load(cfg.dataset_root),

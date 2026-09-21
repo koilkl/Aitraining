@@ -891,10 +891,11 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # Simple dark/lum mask: keep only mid-brightness pixels (the sign).
     # Too dark (below dark_thresh) → shadow/noise → white.
     # Too bright (above lum_thresh) → paper/background → white.
-    # The mask drives the PREVIEWS and the sign_pct OOD stat only — the
-    # model-input crop below uses the raw G channel with the exposure-
-    # adaptive band search (_focus_bbox_adaptive), so it keeps working when
-    # auto-exposure shifts the ink's absolute gray with framing.
+    # The mask drives the PREVIEWS and the sign_pct OOD stat; it also drives
+    # the crop search box when the user has TUNED this class's thresholds
+    # (see the crop branches below — the Edit-view sliders exist to move
+    # the ROI).  At default thresholds the crop keeps the exposure-adaptive
+    # band search so auto-exposure shifts don't move the box.
     is_sign = (gray > bg_dark_thresh) & (gray < bg_lum_thresh)
     sign_pct = is_sign.mean() * 100
     too_dark_pct = (gray <= bg_dark_thresh).mean() * 100
@@ -912,8 +913,15 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     elif fast_mode:
         # Fast: simple center crop (for batch cache rebuild)
         x1, y1, x2, y2 = _center_bbox(h_orig, w_orig, frac=0.60)
+    elif bg_dark_thresh != 0 or bg_lum_thresh != 100:
+        # Tuned thresholds: the ROI must follow the mask — that is what the
+        # Edit-view dark/lum sliders are for (and what training ingests for
+        # this class via preprocess_for_label).
+        x1, y1, x2, y2 = _focus_bbox(gray)
     else:
-        # Live: exposure-adaptive band search on the RAW G channel
+        # Default thresholds: exposure-adaptive band search on the RAW G
+        # channel (mirrored by find_search_box_adaptive() in
+        # TFLite/image_provider.cpp — keep in lockstep).
         x1, y1, x2, y2 = _focus_bbox_adaptive(np.asarray(src[:, :, 1], dtype=np.uint8))
 
     # Save normalized crop box for ROI overlay display
