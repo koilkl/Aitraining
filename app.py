@@ -7656,7 +7656,12 @@ async function clearSamples(className) {{
       classPreprocessProcessedSrc = '';
       renderClassPreprocessModal();
     }}
-    if (openSourceClass === className) updateOpenSamplesPanel(className);
+    const openHost = document.getElementById(`samplesHost-${{cssSafe(className)}}`);
+    if (openHost) {{
+      updateOpenSamplesPanel(className);
+    }} else {{
+      render();  // collapsed card: rebuild the summary strip + count
+    }}
     recomputeTrainEnabled();
     refreshTrainRec();
     syncTrainUi();
