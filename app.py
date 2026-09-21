@@ -1549,19 +1549,26 @@ def _render_tm_old_frontend_html(
       }}
     }}
     html, body {{
-      height: 100%;
+      min-height: 100%;
+      height: auto;
       margin: 0;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
       color: var(--text);
       background: transparent;
+      overflow: visible;
     }}
+    html {{ height: 100%; }}
+    body {{ display: block; min-width: 1000px; width: 1000px; }}
     .wrap {{
       position: relative;
       background: var(--bg);
       border-radius: 12px;
       padding: 72px 16px 92px 16px;
       min-height: 620px;
+      min-width: 1000px;
+      width: 1000px;
       overflow: visible;
+      box-sizing: border-box;
     }}
     .topnav {{
       position: absolute;
@@ -1627,7 +1634,7 @@ def _render_tm_old_frontend_html(
       width: 100%;
       box-sizing: border-box;
       justify-content: space-between;
-      align-items: center;
+      align-items: flex-start;
       gap: 28px;
       z-index: 2;
     }}
@@ -8378,8 +8385,8 @@ mountReflowTimers.push(window.setTimeout(() => {{
 </body>
 </html>
         ''',
-        height=1600,
-        scrolling=False,
+        height=2000,
+        scrolling=True,
     )
 
 

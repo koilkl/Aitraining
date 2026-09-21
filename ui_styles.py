@@ -35,7 +35,37 @@ def inject_teachable_style() -> None:
   .block-container {
     width: 100%;
     max-width: none !important;
+    max-height: none !important;
     box-sizing: border-box;
+  }
+  [data-testid="stAppViewContainer"],
+  [data-testid="stAppViewContainer"] > .main,
+  [data-testid="stAppViewContainer"] > section.main {
+    min-height: 100vh;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  [data-testid="stMainBlockContainer"],
+  [data-testid="stVerticalBlock"],
+  [data-testid="stHorizontalBlock"] > div,
+  div:has(> iframe[data-testid="stIFrame"]) {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  iframe[data-testid="stIFrame"].stIFrame {
+    width: 1000px !important;
+    max-width: none !important;
+    min-width: 1000px !important;
+    height: auto !important;
+    min-height: 2000px !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border: 0;
   }
   .block-container {
     padding-top: 0.65rem;
@@ -783,7 +813,7 @@ def inject_teachable_style() -> None:
   div[data-testid="stHorizontalBlock"]:has(.tm-layout-row-marker) {
     position: relative;
     z-index: 1;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     gap: 64px !important;
   }
