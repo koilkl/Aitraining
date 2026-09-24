@@ -12,14 +12,27 @@
 #       CODESIGN_IDENTITY="Developer ID Application: ..." \
 #       APPLE_ID=you@example.com APP_PASSWORD=xxxx \
 #       ./build_macos.sh
+#   - Intel Mac distribution: the bundle arch = the BUILDING Python's arch.
+#     On Apple Silicon, build x86_64 with a Rosetta venv:
+#       softwareupdate --install-rosetta
+#       arch -x86_64 /usr/bin/python3 -m venv .venv-x86
+#       arch -x86_64 .venv-x86/bin/pip install -r requirements.txt -r requirements-dev.txt
+#       arch -x86_64 .venv-x86/bin/python -m PyInstaller TFLiteTraining.spec \
+#           --noconfirm --target-arch x86_64
+#     or on any machine: TARGET_ARCH=x86_64 ./build_macos.sh (the active
+#     python must be an x86_64 interpreter running under Rosetta).
 set -e
 cd "$(dirname "$0")"
 
-echo "== host arch: $(uname -m) =="
-[ "$(uname -m)" = "arm64" ] && echo "   -> this DMG will run natively on Apple Silicon"
+echo "== host arch: $(uname -m)  (TARGET_ARCH=${TARGET_ARCH:-native}) =="
+[ "$(uname -m)" = "arm64" ] && [ -z "${TARGET_ARCH:-}" ] && echo "   -> this DMG will run natively on Apple Silicon"
 [ "$(uname -m)" = "x86_64" ] && echo "   -> WARNING: x86_64 DMG — M1/M2 users will need Rosetta (macOS auto-prompts)"
 
-python -m PyInstaller TFLiteTraining.spec --noconfirm
+PYINSTALLER_ARGS=(--noconfirm)
+if [ -n "${TARGET_ARCH:-}" ]; then
+  PYINSTALLER_ARGS+=(--target-arch "$TARGET_ARCH")
+fi
+python -m PyInstaller TFLiteTraining.spec "${PYINSTALLER_ARGS[@]}"
 
 APP="dist/TFLiteTraining.app"
 [ -d "$APP" ] || { echo "ERROR: bundle not found at $APP"; exit 1; }
@@ -47,5 +60,9 @@ else
 fi
 
 echo "== building dmg =="
-python -m dmgbuild -s dmg_settings.py "TFLiteTraining" "dist/TFLiteTraining.dmg"
-echo "== done: dist/TFLiteTraining.dmg =="
+DMG_OUT="dist/TFLiteTraining.dmg"
+if [ -n "${TARGET_ARCH:-}" ]; then
+  DMG_OUT="dist/TFLiteTraining-${TARGET_ARCH}.dmg"
+fi
+python -m dmgbuild -s dmg_settings.py "TFLiteTraining" "$DMG_OUT"
+echo "== done: $DMG_OUT =="
