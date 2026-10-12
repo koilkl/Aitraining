@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,6 +80,24 @@ from image_preprocess import (
     preprocess_blue_diff_array,
     prepare_inference_inputs,
 )
+
+_APP_NAME = "TFLiteTraining"
+
+
+def _app_data_dir() -> Path:
+    """Same resolution logic as app.py/desktop_launcher.py (kept in sync)."""
+    import os
+
+    env_override = os.getenv("TFLITE_TRAINING_DATA_DIR")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif os.name == "nt":
+        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    return (base / _APP_NAME).resolve()
 
 
 @dataclass
@@ -312,6 +331,14 @@ class RecordController:
             t = threading.Thread(target=server.serve_forever, daemon=True)
             self._thread = t
             t.start()
+            # Publish the port so the embedding desktop app can reach this
+            # API directly (the Streamlit port it knows is a different server).
+            try:
+                port_file = _app_data_dir() / "record_controller_port.json"
+                port_file.parent.mkdir(parents=True, exist_ok=True)
+                port_file.write_text(json.dumps({"port": self._port}), encoding="utf-8")
+            except Exception:
+                pass
 
     def set_config(self, session_id: str, cfg: SessionConfig) -> None:
         with self._lock:
@@ -968,6 +995,13 @@ class RecordController:
             self._stop_live(session_id=session_id, source=source if source else None, wait=True, timeout_s=2.0)
             _send_json(req, {"ok": "1"}, cors=True)
             return
+        if path == "/live/close-all":
+            # Release every live device session — the desktop shell calls this
+            # when the user switches away from the training page, so the block
+            # editor can upload to the same board.
+            self._stop_live_all()
+            _send_json(req, {"ok": "1", "closed": 1}, cors=True)
+            return
         if path == "/shutdown":
             # Graceful app-close path: release cameras/serial/server AFTER the
             # response is flushed (release_all_resources stops the HTTP
@@ -998,6 +1032,7 @@ class RecordController:
             "/train/config",
             "/train/recommend",
             "/export/run",
+            "/blockcoding-export",
             "/dataset/export",
             "/project/save",
             "/project/open",
@@ -1021,6 +1056,18 @@ class RecordController:
             return
         raw = req.rfile.read(content_len)
         payload = json.loads(raw.decode("utf-8"))
+        if path == "/blockcoding-export":
+            session_id = str(payload.get("session") or "").strip()
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                result = self._blockcoding_export(session_id=session_id)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", **result}, cors=True)
+            return
         if path == "/upload":
             session_id = str(payload.get("session") or "").strip()
             class_name = str(payload.get("class") or "").strip()
@@ -1764,6 +1811,39 @@ class RecordController:
                 }
             with cond:
                 cond.wait(timeout=min(remaining, 1.0))
+
+    def _blockcoding_export(self, session_id: str) -> Dict[str, Any]:
+        """Copy the latest trained model into the block-coding outbox.
+
+        The AIoScout desktop app watches <app data>/blockcoding_outbox/ and
+        imports each complete sub-directory into its persistent model library,
+        which the block-coding editor picks up for AI Vision blocks. Output is
+        model.tflite + labels.txt (one label per line — the format the mixly
+        server's convertTfliteToHeader expects).
+        """
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        latest = self._train_result_path(cfg.dataset_root)
+        if not latest.exists():
+            raise RuntimeError("no trained model yet — train first, then export")
+        meta = json.loads(latest.read_text(encoding="utf-8"))
+        tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser().resolve()
+        if not tflite_path.exists():
+            raise RuntimeError("missing .tflite file")
+        labels = [str(x).strip() for x in (meta.get("labels") or []) if str(x).strip()]
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        outbox = _app_data_dir() / "blockcoding_outbox" / f"{stamp}_{uuid.uuid4().hex[:6]}"
+        outbox.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(tflite_path, outbox / "model.tflite")
+        (outbox / "labels.txt").write_text(("\n".join(labels) + "\n") if labels else "", encoding="utf-8")
+        return {
+            "outbox_dir": str(outbox),
+            "labels": labels,
+            "model_bytes": tflite_path.stat().st_size,
+        }
 
     def _train_result_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_train_latest.json"
