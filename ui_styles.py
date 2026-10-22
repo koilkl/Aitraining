@@ -68,11 +68,45 @@ def inject_teachable_style() -> None:
     border: 0;
   }
   .block-container {
-    padding-top: 0.65rem;
-    padding-bottom: 2rem;
+    max-width: 1100px !important;
+    margin: 0 auto !important;
+    padding-top: 3rem !important;
+    padding-bottom: 4rem !important;
     padding-left: 18px;
     padding-right: 18px;
   }
+
+  /* ── Workspace mode: full-viewport escape hatch ──────────────────────
+     The Start / Import pages render only Streamlit widgets, so they keep
+     the centered 1100px dashboard above.  The Workspace SPA, however, is
+     a single st.components.v1.html iframe — and that iframe was being
+     boxed by the very same .block-container rule, leaving huge grey
+     margins all round (and clipping the tutorial's fixed dim backdrop).
+     `:has(iframe)` matches ONLY the page that mounts the component, so we
+     can drop the outer container to a true 100vw × 100vh canvas without
+     disturbing the Start page. ───────────────────────────────────────── */
+  .block-container:has(iframe),
+  [data-testid="stMainBlockContainer"]:has(iframe),
+  section[data-testid="stMain"]:has(iframe),
+  [data-testid="stAppViewContainer"] > .main:has(iframe),
+  [data-testid="stAppViewContainer"] > .main > div:has(iframe) {
+    max-width: 100vw !important;
+    width: 100vw !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  .stApp:has(iframe) [data-testid="stHeader"],
+  [data-testid="stAppViewContainer"]:has(iframe) [data-testid="stHeader"] {
+    display: none !important;
+  }
+  iframe[title="st.iframe"],
+  [data-testid="stCustomComponentV1"] > iframe {
+    width: 100vw !important;
+    min-height: 100vh !important;
+    border: none !important;
+    display: block !important;
+  }
+
   .tm-top-brand-marker {
     display: none;
   }
@@ -141,6 +175,25 @@ def inject_teachable_style() -> None:
   }
 
   .tm-title { font-size: 44px; font-weight: 800; margin: 0 0 10px 0; letter-spacing: -0.03em; }
+  .tm-hero-main-title {
+    font-size: 56px;
+    font-weight: 900;
+    margin: 0 0 14px 0;
+    letter-spacing: -0.04em;
+    line-height: 1.05;
+  }
+  .tm-hero, .tm-hero-main-sub, .tm-chip-row, .tm-flow-lane {
+    text-align: left !important;
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+  }
+  .tm-hero-main-sub {
+    font-size: 19px;
+    line-height: 1.5;
+    color: var(--tm-muted);
+    margin: 0 0 2rem 0 !important;
+    max-width: 540px !important;
+  }
   .tm-sub { color: var(--tm-muted); margin: 0 0 20px 0; font-size: 16px; line-height: 1.6; }
   .tm-eyebrow {
     display: inline-flex;
@@ -151,15 +204,270 @@ def inject_teachable_style() -> None:
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: var(--tm-primary);
-    margin-bottom: 8px;
+    margin-bottom: 4px;
+  }
+  .tm-section-head-lg {
+    font-size: 30px;
+    font-weight: 900;
+    letter-spacing: -0.03em;
+    color: var(--tm-text);
+    margin: 0 0 4px 0;
+  }
+  .tm-section-sub {
+    color: var(--tm-muted);
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0 0 18px 0;
+  }
+  /* ── Linear horizontal workflow stepper (bulletproof against Streamlit wrappers) ── */
+  [data-testid="stMarkdownContainer"] > .tm-hero .tm-flow-lane,
+  .tm-flow-lane {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    justify-content: flex-start;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 0 10px 0;
+  }
+  .tm-flow-lane-step {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 18px;
+    background: rgba(255,255,255,0.98);
+    border: 1px solid rgba(16, 35, 63, 0.08);
+    box-shadow: var(--tm-shadow-soft);
+    border-radius: 16px;
+  }
+  .tm-flow-arrow {
+    flex: 0 0 auto;
+    margin: 0 12px;
+    font-size: 22px;
+    font-weight: 900;
+    color: #888;
+    line-height: 1;
+  }
+  .tm-flow-lane-step .num {
+    flex: 0 0 auto;
+    width: 44px;
+    height: 44px;
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--tm-primary) 12%, transparent);
+    color: var(--tm-primary-strong);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 900;
+    letter-spacing: -0.02em;
+  }
+  .tm-flow-lane-step .text strong {
+    display: block;
+    font-size: 16px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    color: var(--tm-text);
+    margin-bottom: 3px;
+  }
+  .tm-flow-lane-step .text small {
+    display: block;
+    color: var(--tm-muted);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  /* ── Image project card (expanded, visual-weight dominant) ── */
+  .tm-image-project-hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.85fr);
+    gap: 24px;
+    align-items: center;
+    padding: 28px 30px;
+    border-radius: 22px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--tm-primary) 6%, var(--tm-surface)) 0%, var(--tm-surface) 60%);
+    border: 1px solid color-mix(in srgb, var(--tm-primary) 22%, var(--tm-border));
+    box-shadow: var(--tm-shadow);
+  }
+  .tm-image-project-hero .left h3 {
+    font-size: 30px;
+    font-weight: 900;
+    letter-spacing: -0.03em;
+    margin: 0 0 8px 0;
+  }
+  .tm-image-project-hero .left p {
+    color: var(--tm-muted);
+    font-size: 15px;
+    line-height: 1.7;
+    margin: 0 0 18px 0;
+  }
+  .tm-image-project-hero .left .tm-eyebrow {
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .tm-image-project-hero .right {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .tm-image-project-hero .right .stButton > button,
+  .tm-image-project-hero .right [data-testid="stPopoverButton"] button,
+  .tm-hero-action-stack + div [data-testid="stPopoverButton"] button {
+    min-height: 52px !important;
+    font-size: 15px !important;
+    font-weight: 700 !important;
+  }
+  .tm-image-project-hero-single {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .tm-image-project-hero .left h3 .tm-badge {
+    vertical-align: middle;
+    margin-top: -3px;
+  }
+  .tm-badge-primary {
+    background: rgba(34, 197, 94, 0.13) !important;
+    color: rgb(21, 128, 61) !important;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    border: 1px solid rgba(34, 197, 94, 0.32);
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    vertical-align: middle;
+    margin-left: 8px;
+  }
+  /* ── Compact centered Image Project card (CTA lives inside) ── */
+  [data-testid="stContainer"]:has(> div > .tm-start-card),
+  [data-testid="stContainer"]:has(.tm-start-card),
+  [data-testid="stColumn"]:has(.tm-start-card) {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 0 2rem 0;
+    padding: 20px !important;
+    background: #FFFFFF !important;
+    border: 1px solid #E5E7EB !important;
+    border-radius: 12px !important;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
+    text-align: left;
+    height: fit-content;
+  }
+  .tm-start-card-head h3 {
+    font-size: 22px;
+    font-weight: 800;
+    margin: 0;
+  }
+  .tm-start-card-head p {
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--tm-muted);
+    margin: 4px 0 16px 0;
+  }
+  [data-testid="stContainer"]:has(.tm-start-card) .stButton > button,
+  [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stPopoverButton"] > button,
+  [data-testid="stColumn"]:has(.tm-start-card) .stButton > button,
+  [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stPopoverButton"] > button {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    line-height: normal !important;
+    width: 100% !important;
+    margin-bottom: 8px !important;
+    padding-top: 0.5rem !important;
+    padding-bottom: 0.5rem !important;
+  }
+  /* Refine Text Input borders */
+  [data-testid="stTextInput"] input {
+    border-radius: 8px !important;
+    border: 1px solid #CBD5E1 !important;
+    padding: 12px 16px !important;
+  }
+  [data-testid="stTextInput"] input:focus {
+    border-color: #3169FF !important;
+    box-shadow: 0 0 0 1px #3169FF !important;
+  }
+  /* Refine File Uploader */
+  [data-testid="stFileUploader"] section {
+    border-radius: 12px !important;
+    background-color: #F8FAFC !important;
+    border: 2px dashed #CBD5E1 !important;
+  }
+  /* Primary button: override Streamlit red/orange default (must come after tertiary to win) */
+  [data-testid="stButton"] button[kind="primary"],
+  [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stButton"] button[kind="primary"],
+  [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stButton"] button[kind="primary"] {
+    background-color: #3169FF !important;
+    border-color: #3169FF !important;
+    color: white !important;
+    text-decoration: none !important;
+  }
+  /* Secondary button: kill Streamlit's jarring red/pink border, use neutral gray + brand blue on hover */
+  [data-testid="stButton"] button[kind="secondary"],
+  [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"],
+  [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"] {
+    border-color: #94A3B8 !important;
+    color: #334155 !important;
+    background: #FFFFFF !important;
+    transition: all 0.2s ease-in-out !important;
+  }
+  [data-testid="stButton"] button[kind="secondary"]:hover,
+  [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"]:hover,
+  [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"]:hover {
+    border-color: #3169FF !important;
+    color: #3169FF !important;
+    background: #FFFFFF !important;
+  }
+  @media (max-width: 960px) {
+    .tm-image-project-hero {
+      grid-template-columns: 1fr;
+      gap: 18px;
+    }
+    .tm-flow-lane {
+      flex-direction: column;
+      gap: 12px;
+    }
+    .tm-flow-arrow {
+      transform: rotate(90deg);
+    }
+  }
+  @media (prefers-color-scheme: dark) {
+    .tm-flow-lane-step {
+      background: #18202a;
+      border-color: rgba(255,255,255,0.1);
+    }
+    .tm-image-project-hero {
+      background: linear-gradient(135deg, color-mix(in srgb, var(--tm-primary) 14%, var(--tm-surface)) 0%, var(--tm-surface) 60%);
+      border-color: rgba(255,255,255,0.14);
+    }
+    .tm-badge-primary {
+      background: rgba(52, 211, 153, 0.16) !important;
+      color: rgb(110, 231, 183) !important;
+      border-color: rgba(52, 211, 153, 0.34);
+    }
+    [data-testid="stContainer"]:has(.tm-start-card) {
+      background: linear-gradient(160deg, rgba(49, 105, 255, 0.14) 0%, #18202a 100%);
+      border-color: rgba(138, 180, 248, 0.22);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.2);
+    }
+    [data-testid="stColumn"]:has(.tm-start-card) {
+      background: linear-gradient(160deg, rgba(49, 105, 255, 0.14) 0%, #18202a 100%);
+      border-color: rgba(138, 180, 248, 0.22);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.2);
+    }
   }
   .tm-hero {
-    border: 1px solid rgba(16, 35, 63, 0.08);
-    border-radius: 20px;
-    padding: 20px 24px;
-    background: var(--tm-surface);
-    box-shadow: var(--tm-shadow);
-    margin-bottom: 16px;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    text-align: left;
+  }
+  .tm-hero-main-sub {
+    margin-left: 0;
+    margin-right: 0;
   }
   .tm-hero-grid {
     display: grid;
@@ -290,20 +598,24 @@ def inject_teachable_style() -> None:
     color: var(--tm-muted);
   }
   .tm-chip-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 16px;
+    display: flex !important;
+    flex-wrap: wrap !important;
+    justify-content: flex-start;
+    gap: 8px !important;
+    margin-top: 0;
+    margin-bottom: 1.5rem !important;
+    padding-left: 0 !important;
   }
   .tm-chip {
-    display: inline-flex;
-    align-items: center;
-    padding: 6px 10px;
-    border-radius: 999px;
-    background: rgba(49, 105, 255, 0.08);
-    color: var(--tm-primary-strong);
-    font-size: 12px;
-    font-weight: 600;
+    display: inline-block;
+    padding: 4px 12px !important;
+    border-radius: 100px !important;
+    background-color: #F1F5F9 !important;
+    border: 1px solid #E2E8F0 !important;
+    color: #475569 !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    cursor: default;
   }
   .tm-card {
     border: 1px solid rgba(16, 35, 63, 0.08);
@@ -1129,6 +1441,95 @@ def inject_teachable_style() -> None:
     [data-baseweb="select"] p {
       color: #e8eaed !important;
       -webkit-text-fill-color: #e8eaed !important;
+    }
+
+    /* ── Start Page / Import Page: hero panel, workflow bar, section bridge,
+       project cards and outline buttons. These elements carry hardcoded
+       light-mode hex colors in their inline style attribute, so the dark
+       overrides below need !important to win over the element style. ── */
+    .tm-start-hero,
+    .tm-start-panel {
+      background-color: #161b22 !important;
+      border-color: #2a3442 !important;
+    }
+    .tm-start-hero-eyebrow,
+    .tm-start-hero-sub,
+    .tm-start-hero-workflow-label,
+    .tm-start-panel-sub {
+      color: #94a3b8 !important;
+    }
+    .tm-start-hero-title,
+    .tm-start-panel-title,
+    .tm-start-section-title,
+    .tm-start-card-title {
+      color: #f8fafc !important;
+    }
+    .tm-start-hero-workflow {
+      border-top-color: #2a3442 !important;
+    }
+    .tm-start-hero-step-num {
+      background: rgba(138, 180, 248, 0.18) !important;
+      color: #aecbfa !important;
+    }
+    .tm-start-hero-step-label {
+      color: #e2e8f0 !important;
+    }
+    .tm-start-hero-arrow {
+      color: #475569 !important;
+    }
+    .tm-start-hero-watermark {
+      opacity: 0.10 !important;
+      filter: invert(1);
+    }
+    /* Capability chips on the hero. */
+    .tm-chip {
+      background-color: #1e293b !important;
+      border-color: #2a3442 !important;
+      color: #94a3b8 !important;
+    }
+    /* "READY NOW" badge — dark-friendly green tint. */
+    .tm-start-ready-badge {
+      background: rgba(52, 211, 153, 0.16) !important;
+      color: #6ee7b7 !important;
+    }
+    /* Project cards: beat the base `background:#FFFFFF !important` rule so the
+       card title (which inherits the light dark-mode text color) is not
+       white-on-white. */
+    [data-testid="stContainer"]:has(> div > .tm-start-card),
+    [data-testid="stContainer"]:has(.tm-start-card),
+    [data-testid="stColumn"]:has(.tm-start-card) {
+      background-color: #1a212b !important;
+      border-color: #2a3442 !important;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.40) !important;
+    }
+    .tm-start-card-head p {
+      color: #94a3b8 !important;
+    }
+    /* Streamlit secondary (outline) buttons: Open Project / Import / Back. */
+    [data-testid="stButton"] button[kind="secondary"],
+    [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"],
+    [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"] {
+      background-color: rgba(255, 255, 255, 0.04) !important;
+      border-color: #475569 !important;
+      color: #e2e8f0 !important;
+    }
+    [data-testid="stButton"] button[kind="secondary"]:hover,
+    [data-testid="stColumn"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"]:hover,
+    [data-testid="stContainer"]:has(.tm-start-card) [data-testid="stButton"] button[kind="secondary"]:hover,
+    [data-testid="stButton"] button[kind="secondary"]:active {
+      background-color: rgba(138, 180, 248, 0.14) !important;
+      border-color: #8ab4f8 !important;
+      color: #aecbfa !important;
+    }
+    /* Dark-friendly text inputs + file uploader used across the outer views. */
+    [data-testid="stTextInput"] input {
+      background-color: #111821 !important;
+      border-color: #475569 !important;
+      color: #e8eaed !important;
+    }
+    [data-testid="stFileUploader"] section {
+      background-color: #111821 !important;
+      border-color: #475569 !important;
     }
   }
 
