@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,11 +83,13 @@ from dataset_io import (
 from image_preprocess import (
     CROP_MODE_AUTO_SEARCH,
     CROP_MODE_CENTER,
+    CLIP_MODE_JUNCTION,
     PREPROCESS_MODE_AUTO_BY_LABEL,
     PREPROCESS_MODE_MANUAL_ROI,
     PREPROCESS_MODE_NONE,
     _BG_LUM_THRESH,
     _BG_DIFF_MIN,
+    class_clip_mode,
     normalize_class_preprocess,
     normalize_class_preprocess_map,
     normalize_sample_preprocess_map,
@@ -145,6 +148,24 @@ def sign_ocr_payload_extras(pred: Any) -> Dict[str, Any]:
     if not src.get("sign_ocr"):
         return {}
     return {k: src.get(k) for k in _SIGN_OCR_PAYLOAD_KEYS if k in src}
+
+_APP_NAME = "TFLiteTraining"
+
+
+def _app_data_dir() -> Path:
+    """Same resolution logic as app.py/desktop_launcher.py (kept in sync)."""
+    import os
+
+    env_override = os.getenv("TFLITE_TRAINING_DATA_DIR")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    elif os.name == "nt":
+        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    return (base / _APP_NAME).resolve()
 
 
 @dataclass
@@ -644,6 +665,14 @@ class RecordController:
             t = threading.Thread(target=server.serve_forever, daemon=True)
             self._thread = t
             t.start()
+            # Publish the port so the embedding desktop app can reach this
+            # API directly (the Streamlit port it knows is a different server).
+            try:
+                port_file = _app_data_dir() / "record_controller_port.json"
+                port_file.parent.mkdir(parents=True, exist_ok=True)
+                port_file.write_text(json.dumps({"port": self._port}), encoding="utf-8")
+            except Exception:
+                pass
 
     def set_config(self, session_id: str, cfg: SessionConfig) -> None:
         with self._lock:
@@ -1383,6 +1412,13 @@ class RecordController:
             self._stop_live(session_id=session_id, source=source if source else None, wait=True, timeout_s=2.0)
             _send_json(req, {"ok": "1"}, cors=True)
             return
+        if path == "/live/close-all":
+            # Release every live device session — the desktop shell calls this
+            # when the user switches away from the training page, so the block
+            # editor can upload to the same board.
+            self._stop_live_all()
+            _send_json(req, {"ok": "1", "closed": 1}, cors=True)
+            return
         if path == "/shutdown":
             # Graceful app-close path: release cameras/serial/server AFTER the
             # response is flushed (release_all_resources stops the HTTP
@@ -1413,6 +1449,7 @@ class RecordController:
             "/train/config",
             "/train/recommend",
             "/export/run",
+            "/blockcoding-export",
             "/dataset/export",
             "/project/save",
             "/project/open",
@@ -1470,6 +1507,18 @@ class RecordController:
                     payload[key] = (qs_params[key] or [""])[0]
         else:
             payload = json.loads(raw.decode("utf-8"))
+        if path == "/blockcoding-export":
+            session_id = str(payload.get("session") or "").strip()
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                result = self._blockcoding_export(session_id=session_id)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", **result}, cors=True)
+            return
         if path == "/upload":
             session_id = str(payload.get("session") or "").strip()
             class_name = str(payload.get("class") or "").strip()
@@ -2960,6 +3009,86 @@ class RecordController:
                 }
             with cond:
                 cond.wait(timeout=min(remaining, 1.0))
+
+    def _blockcoding_export(self, session_id: str) -> Dict[str, Any]:
+        """Copy the latest trained model into the block-coding outbox.
+
+        The AIoScout desktop app watches <app data>/blockcoding_outbox/ and
+        imports each complete sub-directory into its persistent model library,
+        which the block-coding editor picks up for AI Vision blocks. Output is
+        model.tflite + labels.txt (one label per line — the format the mixly
+        server's convertTfliteToHeader expects).
+        """
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        if str(getattr(cfg, "project_type", "") or "").strip().lower() in (
+            PROJECT_TYPE_OCR,
+            PROJECT_TYPE_SIGN_OCR,
+        ):
+            raise RuntimeError(
+                "OCR and Road Sign (3-Char) models deploy to their own sketch "
+                "(TFLite_OCR / TFLite_Sign), not Block Coding — use Export Model"
+            )
+        latest = self._train_result_path(cfg.dataset_root)
+        if not latest.exists():
+            raise RuntimeError("no trained model yet — train first, then export")
+        meta = json.loads(latest.read_text(encoding="utf-8"))
+        tflite_path = Path(str(meta.get("tflite_path") or "")).expanduser().resolve()
+        if not tflite_path.exists():
+            raise RuntimeError("missing .tflite file")
+        labels = [str(x).strip() for x in (meta.get("labels") or []) if str(x).strip()]
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        outbox = _app_data_dir() / "blockcoding_outbox" / f"{stamp}_{uuid.uuid4().hex[:6]}"
+        outbox.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(tflite_path, outbox / "model.tflite")
+        (outbox / "labels.txt").write_text(("\n".join(labels) + "\n") if labels else "", encoding="utf-8")
+        preprocess_info = self._blockcoding_preprocess_info(cfg.dataset_root, labels)
+        (outbox / "preprocess.json").write_text(json.dumps(preprocess_info, indent=2), encoding="utf-8")
+        return {
+            "outbox_dir": str(outbox),
+            "labels": labels,
+            "model_bytes": tflite_path.stat().st_size,
+            "preprocess": {"mode": preprocess_info["mode"], "uniform": preprocess_info["uniform"]},
+        }
+
+    def _blockcoding_preprocess_info(self, dataset_root: Path, labels: List[str]) -> Dict[str, Any]:
+        """Bake the class filter (preprocess) settings into the block-coding export.
+
+        The block-coding compiler turns this into the on-device crop pipeline:
+        dark/lum thresholds drive the sign search box (mirroring
+        preprocess_blue_diff_array in image_preprocess.py), so the deployed
+        model sees the same input distribution it was trained on.  Runtime
+        inference cannot know the class before predicting, so a single device
+        pipeline requires uniform settings — mixed configs export mode
+        "none" (legacy full-frame) with uniform=False.
+        """
+        class_pre = self._class_preprocess_load(dataset_root)
+        per_class: Dict[str, Any] = {}
+        for name in labels:
+            cfg = normalize_class_preprocess(class_pre.get(name) or {})
+            if cfg.get("mode") == PREPROCESS_MODE_MANUAL_ROI and cfg.get("manual_roi"):
+                eff = {"mode": "manual", "roi": [float(v) for v in cfg["manual_roi"]]}
+            elif class_clip_mode(name) == CLIP_MODE_JUNCTION:
+                eff = {"mode": "junction"}
+            else:
+                eff = {"mode": "sign", "dark": int(cfg.get("bg_dark_thresh", 0)), "lum": int(cfg.get("bg_lum_thresh", 100))}
+            per_class[name] = eff
+        if not per_class:
+            per_class = {"": {"mode": "sign", "dark": 0, "lum": 100}}
+        distinct = {json.dumps(v, sort_keys=True) for v in per_class.values()}
+        uniform = len(distinct) == 1
+        effective = next(iter(per_class.values())) if uniform else {"mode": "none"}
+        info: Dict[str, Any] = {"version": 1, "mode": effective["mode"], "uniform": uniform}
+        if effective["mode"] == "sign":
+            info["dark"] = int(effective["dark"])
+            info["lum"] = int(effective["lum"])
+        elif effective["mode"] == "manual":
+            info["roi"] = [float(v) for v in effective["roi"]]
+        info["classes"] = per_class
+        return info
 
     def _train_result_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_train_latest.json"

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import multiprocessing
 import os
+import signal
 import socket
 import sys
 import tempfile
@@ -11,6 +13,10 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+
+# Cold start of the packaged app measured ~80 s on arm64 (TF + streamlit
+# imports from the onedir bundle); leave generous headroom for slower Macs.
+_SERVER_READY_TIMEOUT_S = 180.0
 
 
 def _resource_path(rel_path: str) -> Path:
@@ -25,7 +31,7 @@ def _find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _wait_http_ready(url: str, timeout_s: float = 25.0) -> None:
+def _wait_http_ready(url: str, timeout_s: float = _SERVER_READY_TIMEOUT_S) -> None:
     deadline = time.time() + timeout_s
     last_err: Exception | None = None
     while time.time() < deadline:
@@ -119,12 +125,30 @@ def _raise_fd_limit() -> None:
         return
 
 
+def _exit_when_parent_dies() -> None:
+    # daemon=True only reaps the child on a clean parent exit; Force Quit
+    # (SIGKILL), crashes and pkill leave the streamlit server running as an
+    # orphan holding ~1 GB of TF memory. When the parent dies the child gets
+    # reparented (ppid changes), so poll for that and self-exit.
+    parent_pid = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            if os.getppid() != parent_pid:
+                os._exit(1)
+            time.sleep(1.0)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
 def _run_streamlit_server(port: int, log_path: str) -> None:
     import traceback
 
     _raise_fd_limit()
 
     from streamlit.web import bootstrap
+
+    _exit_when_parent_dies()
 
     try:
         base_dir = _app_data_dir()
@@ -407,6 +431,23 @@ def _startup_window_logic(window: "webview.Window") -> None:
     _maybe_native_resize_nudge(window, reason="startup")
 
 
+def _run_headless(port: int, proc: multiprocessing.Process) -> None:
+    # Announce readiness to the embedding supervisor (the AIoScout desktop app
+    # reads stdout line-by-line). Everything the Streamlit server prints goes to
+    # the log file, so this is the only line on our stdout.
+    print(json.dumps({"type": "aioscout:ready", "port": int(port), "pid": os.getpid()}), flush=True)
+    # If the embedding app is SIGKILLed we never see a signal — watch for
+    # reparenting and self-exit (same watchdog the streamlit child uses).
+    _exit_when_parent_dies()
+    try:
+        proc.join()  # blocks until the Streamlit child exits
+    except KeyboardInterrupt:
+        _shutdown_and_exit(proc)
+    # If the child died on its own, exit with its code so a supervisor can
+    # detect the crash and restart us.
+    os._exit(proc.exitcode if proc.exitcode is not None else 1)
+
+
 def main() -> None:
     _configure_multiprocessing_executable()
     try:
@@ -414,14 +455,37 @@ def main() -> None:
     except Exception:
         pass
     _raise_fd_limit()
+
+    parser = argparse.ArgumentParser(description="TF Lite Training app launcher")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run the Streamlit server without a native window; prints a JSON line "
+        '{"type": "aioscout:ready", "port": ..., "pid": ...} to stdout once ready '
+        "(for embedding in the AIoScout desktop app)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="fixed port for the Streamlit server (default: pick a free ephemeral port)",
+    )
+    args = parser.parse_args()
+
     multiprocessing.freeze_support()
-    port = _find_free_port()
+    port = args.port if args.port > 0 else _find_free_port()
     url = f"http://127.0.0.1:{port}"
     log_path = _prepare_log_file()
     proc = multiprocessing.Process(target=_run_streamlit_server, args=(port, log_path), daemon=True)
     proc.start()
+    # Catch SIGTERM (pkill, shutdown) so the streamlit child is reaped even
+    # outside the window-close path. SIGKILL (Force Quit) cannot be caught;
+    # the child-side watchdog in _exit_when_parent_dies covers that case.
+    signal.signal(signal.SIGTERM, lambda *_: _shutdown_and_exit(proc))
+    # Ctrl-C during development: reap the child the same way.
+    signal.signal(signal.SIGINT, lambda *_: _shutdown_and_exit(proc))
     try:
-        deadline = time.time() + 25.0
+        deadline = time.time() + _SERVER_READY_TIMEOUT_S
         last_err: Exception | None = None
         while time.time() < deadline:
             if not proc.is_alive():
@@ -439,6 +503,10 @@ def main() -> None:
             raise RuntimeError(f"Streamlit not ready: {url} ({last_err}). Log: {log_path}")
         if not proc.is_alive():
             raise RuntimeError(f"Streamlit process exited. Log: {log_path}")
+
+        if args.headless:
+            _run_headless(port, proc)
+            return
 
         import webview
 

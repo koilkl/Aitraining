@@ -2,7 +2,7 @@
 import sys
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('mac_camera.py', '.')]
+datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('mac_camera.py', '.'), ('templates', 'templates')]
 binaries = []
 hiddenimports = []
 
@@ -124,13 +124,17 @@ coll = COLLECT(
     upx_exclude=[],
     name='TFLiteTraining',
 )
-app = BUNDLE(
-    coll,
-    name='TFLiteTraining.app',
-    icon='AIoScouts.icns' if sys.platform == 'darwin' else None,
-    bundle_identifier='ai.tflite.training',
-    info_plist={
-        'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
-        'NSHighResolutionCapable': True,
-    },
-)
+# The .app bundle is macOS-only — on Windows this would raise and abort the
+# build (the COLLECT onedir above is what Windows ships).
+import sys
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='TFLiteTraining.app',
+        icon='AIoScouts.icns',
+        bundle_identifier='ai.tflite.training',
+        info_plist={
+            'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
+            'NSHighResolutionCapable': True,
+        },
+    )
