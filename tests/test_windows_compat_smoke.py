@@ -176,19 +176,20 @@ def _check_launcher() -> None:
 # ── 6. SPA Windows layout fixes (embedded in app.py) ──────────────────────
 def _check_spa() -> None:
     app = _text("app.py")
-    _check("spa: fixed 1000px canvas", "min-width: 1000px" in app and "width: 1000px" in app)
-    _check("spa: iframe mount keeps height=2000 + scrolling=True",
-           "height=2000" in app and "scrolling=True" in app)
-    _check("spa: reportLayoutDiag machinery", "function reportLayoutDiag" in app and "/diag" in app)
-    _check("spa: measure/jitter failure diagnostics", "failed: 'measure'" in app and "failed: 'jitter'" in app)
-    _check("spa: nudgeParentLayout parent resize kick",
-           "function nudgeParentLayout" in app and "nudgeParentLayout();" in app)
-    _check("spa: dbgEvent Windows latch + Mac url init",
-           "if (!DEBUG_ENABLED || debugEventDisabled) return;" in app and "debug_server_url" in app)
-    _check("spa: scrollSettingsIntoView kept", "function scrollSettingsIntoView" in app)
-    _check("spa: settings open re-queries serial ports", "refreshSerialPorts(false, 'settingsSerialPort')" in app)
-    _check("spa: no fluid full-bleed width regression", "max-width: min(1680px" not in app)
-    _check("spa: no 100vh iframe height regression", "min-height: 100vh" not in app)
+    # The browser frontend (HTML/CSS/JS) is OS-independent and is kept
+    # byte-for-byte identical to the Mac line.  A fixed 1000px body and the
+    # Windows-only layout machinery (nudgeParentLayout / reportLayoutDiag /
+    # scrollSettingsIntoView / DEBUG_ENABLED latch) were reverted after they
+    # froze scrolling and mis-placed cards under Windows DPI scaling.  These
+    # guards stop that divergence from silently returning.
+    _check("spa: Mac centred canvas present", "max-width: min(1680px" in app)
+    _check("spa: no fixed 1000px body regression", "min-width: 1000px" not in app)
+    _check("spa: no Windows layout machinery regression",
+           "nudgeParentLayout" not in app and "reportLayoutDiag" not in app
+           and "scrollSettingsIntoView" not in app)
+    _check("spa: no Windows debug latch regression", "DEBUG_ENABLED" not in app)
+    _check("spa: iframe mount keeps height=1600 + scrolling=False (Mac)",
+           "height=1600" in app and "scrolling=False" in app)
 
 
 # ── 7. PyInstaller spec + packaging scripts ───────────────────────────────
