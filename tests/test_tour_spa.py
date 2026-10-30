@@ -79,6 +79,8 @@ from test_tm_tour_refactored import (
     check_instant_training_completion,
     check_ocr_collection_gate,
     check_ocr_end_to_end,
+    check_brand_logo,
+    check_no_cjk_in_legal_texts,
     check_preview_payload_compaction,
     check_preview_performance,
     check_workspace_alignment,
@@ -2041,6 +2043,8 @@ def main() -> int:
     check_hero_description_width()
     check_ocr_end_to_end()
     check_ocr_collection_gate()
+    check_no_cjk_in_legal_texts()
+    check_brand_logo()
     check_preview_payload_compaction()
     check_preview_performance()
     print("ALL PASS: tests/test_tour_spa.py")
