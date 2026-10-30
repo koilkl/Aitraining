@@ -15,3 +15,7 @@ AI training.docx
 *.pdf
 
 docs/manual_assets/sign_ocr/*.log
+/tests
+/tests
+/docs
+/docs
