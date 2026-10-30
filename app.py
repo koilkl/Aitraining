@@ -1272,7 +1272,7 @@ def _tm_notice_opened_project(path: Path, state: Any, project_type: str) -> None
 
 
 _TM_PROJECT_TYPE_LABELS = {
-    "image": "Image Project",
+    "image": "● Image Project",
     "ocr": "OCR / Character Project",
     "sign_ocr": "● Car License Project",
     "image_classified_import": "Classified Import",
@@ -1496,7 +1496,7 @@ def _render_new_project() -> None:
             <div class="tm-start-card">
             <div class="tm-start-card-head">
             <div class="tm-start-card-headrow">
-            <h3 class="tm-start-card-title" style="margin:0;padding:0;font-size:17px;font-weight:800;">Image Project</h3>
+            <h3 class="tm-start-card-title" style="margin:0;padding:0;font-size:17px;font-weight:800;">● Image Project</h3>
             <span class="tm-start-ready-badge" style="background:#E8F5E9;color:#2E7D32;padding:2px 6px;border-radius:8px;font-size:9px;font-weight:800;letter-spacing:0.5px;">READY NOW</span>
             </div>
             <p>Build an image classification model from images, webcam, or ESP32-P4 device stream. Great for classroom demos and local training for tinyML MCU deployment.</p>
@@ -1528,7 +1528,7 @@ def _render_new_project() -> None:
             <div class="tm-start-card">
             <div class="tm-start-card-head">
             <div class="tm-start-card-headrow">
-            <h3 class="tm-start-card-title" style="margin:0;padding:0;font-size:17px;font-weight:800;">🔤 OCR Character</h3>
+            <h3 class="tm-start-card-title" style="margin:0;padding:0;font-size:17px;font-weight:800;">● OCR Character</h3>
             <span class="tm-start-ready-badge" style="background:#E8F5E9;color:#2E7D32;padding:2px 6px;border-radius:8px;font-size:9px;font-weight:800;letter-spacing:0.5px;">READY NOW</span>
             </div>
             <p>Train a highly optimized INT8 character recognition model for ESP32. Features EMNIST dataset mixing, bit-exact Vertical Projection, and OOD rejection.</p>
@@ -20890,7 +20890,7 @@ def _render_ocr_project_page() -> None:
     st.markdown(
         '''
         <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px 32px;margin-bottom:1.5rem;margin-top:1rem;width:min(1648px, calc(100% - 80px));max-width:100%;margin-left:auto;margin-right:auto;box-sizing:border-box;">
-            <h1 class="tm-start-panel-title" style="margin:0 0 10px 0;font-size:2.2rem;font-weight:800;color:#0F172A;">🔠 OCR / Character Project</h1>
+            <h1 class="tm-start-panel-title" style="margin:0 0 10px 0;font-size:2.2rem;font-weight:800;color:#0F172A;">● OCR / Character Project</h1>
             <p class="tm-start-panel-sub" style="margin:0;max-width:100%;width:100%;line-height:1.6;color:#475569;font-size:15px;">
                 Character recognition for the ESP32-P4. Samples are captured exactly like the image project,
                 then each one is reduced to a glyph tensor by an integer-exact pipeline whose Python and C
