@@ -8231,9 +8231,12 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
                     return None, CameraOpenInfo("failed", idx, derived, "", str(e)[:220])
                 if cap is not None and cap.isOpened():
                     return cap, CameraOpenInfo("unique_id", idx, derived, "", "")
-    # Windows probe order matters: try DirectShow first so the index matches
-    # the ffmpeg -list_devices (dshow) order the dropdown labels come from
-    # (_list_windows_webcams), then MSMF, then the default backend.
+    # Windows probe order matters: try the SELECTED index against DirectShow
+    # first so the dropdown and the actual open both speak the same backend,
+    # then MSMF, then the default backend.  Do NOT walk other indices here:
+    # the user's complaint is exactly "I picked Camera N but another one
+    # opened".  If the selected slot cannot be opened, fail visibly instead
+    # of silently substituting a different camera.
     backends = [None]
     if sys.platform == "win32":
         backends = []
@@ -8244,31 +8247,29 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
         if msmf is not None:
             backends.append(msmf)
         backends.append(None)
-    candidates = [idx] + [i for i in range(max_probe_index + 1) if i != idx]
-    for i in candidates:
-        for backend in backends:
+    for backend in backends:
+        try:
+            cap = cv2.VideoCapture(int(idx)) if backend is None else cv2.VideoCapture(int(idx), backend)
+        except Exception:
+            continue
+        opened = bool(cap.isOpened())
+        ok = False
+        frame = None
+        if opened:
             try:
-                cap = cv2.VideoCapture(int(i)) if backend is None else cv2.VideoCapture(int(i), backend)
-            except Exception:
-                continue
-            opened = bool(cap.isOpened())
-            ok = False
-            frame = None
-            if opened:
-                try:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.1)  # dshow/msmf cold-start warmup
                     ok, frame = cap.read()
-                    if not ok or frame is None:
-                        time.sleep(0.1)  # dshow/msmf cold-start warmup
-                        ok, frame = cap.read()
-                except Exception:
-                    ok = False
-            if opened and ok and frame is not None:
-                return cap, CameraOpenInfo("cv2_index", int(i), "", "", "")
-            try:
-                cap.release()
             except Exception:
-                pass
-    return None, CameraOpenInfo("failed", idx, uid, "", "No camera opened at any probed index.")
+                ok = False
+        if opened and ok and frame is not None:
+            return cap, CameraOpenInfo("cv2_index", int(idx), "", "", "")
+        try:
+            cap.release()
+        except Exception:
+            pass
+    return None, CameraOpenInfo("failed", idx, uid, "", f"Selected camera index {idx} could not be opened.")
 
 
 # Working resolution the glyph front-end uses on the MCU (captures are
