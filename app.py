@@ -16734,33 +16734,30 @@ mountReflowTimers.push(window.setTimeout(() => {{
     {{
       chapter: 2,
       mode: 'handson',
-      title: 'Settings ④: Zero-Hardware EMNIST Auto-Fill &amp; _background',
-      /* The sign project's two teaching points live far apart inside the
-         modal: the EMNIST auto-seed block sits at the bottom of Advanced,
-         while `_background` lives higher up in the OCR training rows.
-         On shorter Windows viewports a union target made the arrow aim at
-         one block while the spotlight cut out the other. Anchor the step
-         on the sign-specific `_background` row, and keep the EMNIST note in
-         the copy rather than trying to spotlight both distant controls at
-         once. */
-      target: '#advOcrBackgroundRow, #settingsEmnistGroup',
-      aimGroup: '#advOcrBackgroundRow, #advOcrBackgroundNRow',
-      arrowTarget: '#settingsUseBackgroundOod',
-      fallback: ['#advOcrBackgroundRow', '#settingsEmnistGroup', '.tm-settings-card'],
+      title: 'Settings ④: Developer EMNIST Template Samples',
+      /* This walkthrough step is about the Advanced > Developer EMNIST
+         template block, not the training hyperparameter rows above it.
+         Keep the spotlight tight on that single CSS block so the arrow,
+         dim layer, and card all agree on the same destination. */
+      target: '#settingsEmnistGroup',
+      aimGroup: '#settingsEmnistGroup',
+      arrowTarget: '#settingsAutoSeedEmnist',
+      fallback: ['#settingsEmnistGroup', '.tm-settings-card'],
       placement: 'left',
       onEnter: function () {{ openSettingsModal(); unfoldSettingsAdvanced(); }},
       advanceAlso: ['#settingsSave', '#settingsCancel'],
       keepCardOpenOnInteract: true,
       inSettings: true,
       settingsPhase: true,
+      noFooterNext: true,
       startLabel: '✓ Confirm Current Setting',
-      cue: 'Leave <b>Auto-fill 24 EMNIST</b> on for a no-camera rehearsal, then press <b>Next →</b>.',
-      orbPrompt: '[[settings]] EMNIST auto-fill & _background (Click Next → when done)',
+      cue: 'Leave <b>Auto-fill 24 EMNIST</b> on for a no-camera rehearsal, then click <b>Save changes</b>.',
+      orbPrompt: '[[settings]] Confirm EMNIST template auto-fill, then Save changes',
       body: '<p class="tm-tour-goal"><b>[[goal]] Goal:</b> Get usable training data even before your camera is wired up.</p>' +
         '<ul class="tm-tour-param-list">' +
         '<li><b>Auto-fill 24 EMNIST samples</b><span class="tm-tour-param-val">28×28</span>Seeds 24 standard character glyphs per class — perfect for a first rehearsal.</li>' +
-        '<li><b>Use _background noise class</b>Adds a “not a character” class trained on empty and noisy crops.</li>' +
-        '<li><b>Save changes</b>Keeps the choice for the next training run.</li>' +
+        '<li><b>Fill Empty Classes with EMNIST Samples Now</b>Immediately seeds every empty character class for a dry run.</li>' +
+        '<li><b>Save changes</b>Keeps the developer template setting for the next training run.</li>' +
         '</ul>'
     }},
     {{
@@ -18561,8 +18558,12 @@ mountReflowTimers.push(window.setTimeout(() => {{
     }}
     var readyNow = !!st.ready && !flashing;
     if (goNode) {{
-      var goHtml = readyNow ? '&#9989; Next Step &rarr;' : 'Next Step &rarr;';
-      if (goNode.innerHTML !== goHtml) goNode.innerHTML = goHtml;
+      var allowOrbNext = !step.noFooterNext;
+      goNode.style.display = allowOrbNext ? '' : 'none';
+      if (allowOrbNext) {{
+        var goHtml = readyNow ? '&#9989; Next Step &rarr;' : 'Next Step &rarr;';
+        if (goNode.innerHTML !== goHtml) goNode.innerHTML = goHtml;
+      }}
     }}
     if (!orb.classList.contains('on')) orb.classList.add('on');
     if (readyNow !== lastOrbReady) {{
@@ -19978,7 +19979,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
          optional) always show Next — even on the first visit — so the
          footer never contradicts the card.  The hard gate wins over all
          of them. */
-      var nextAlways = !!(step.nextAlways || step.settingsPhase ||
+      var nextAlways = !!(step.nextAlways || (step.settingsPhase && !step.noFooterNext) ||
         (step.keepCardOpenOnInteract && !step.live) || !!step.completeOn);
       /* A live scene whose criteria are ALREADY satisfied offers Next even
          on the first visit: an EMNIST-filled OCR project starts with every
@@ -19986,7 +19987,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
          Collect ② for work that is already done. */
       var sceneReadyNext = (step.live === 'samples' && allClassesCollected()) ||
         (step.live === 'thresholds' && tmAllTuned());
-      var showNext = !gatePending && (unlocked || nextAlways || sceneReadyNext);
+      var showNext = !step.noFooterNext && !gatePending && (unlocked || nextAlways || sceneReadyNext);
       if (step.mode === 'handson' && (step.target || step.phaseTarget)) {{
         html += '<div class="tm-tour-actions">';
         html += '<button type="button" class="tm-tour-btn primary wide" id="tmTourStart">' +
