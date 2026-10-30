@@ -2,7 +2,7 @@
 import sys
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('file_dialog.py', '.'), ('mac_camera.py', '.'),
+datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'), ('device_stream.py', '.'), ('trainer.py', '.'), ('ui_styles.py', '.'), ('serial_device.py', '.'), ('record_controller.py', '.'), ('image_preprocess.py', '.'), ('file_dialog.py', '.'), ('mac_camera.py', '.'),
          # OCR/sign runtime modules — imported by app.py, trainer.py and
          # record_controller.py (some lazily).  Missing these made the
          # packaged app die with ModuleNotFoundError: ocr_dataset.
