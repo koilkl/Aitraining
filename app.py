@@ -16735,10 +16735,18 @@ mountReflowTimers.push(window.setTimeout(() => {{
       chapter: 2,
       mode: 'handson',
       title: 'Settings ④: Zero-Hardware EMNIST Auto-Fill &amp; _background',
-      target: '#settingsEmnistGroup, #advOcrPanel',
-      aimGroup: '#settingsEmnistGroup, #advOcrPanel',
-      arrowTarget: '#settingsAutoSeedEmnist',
-      fallback: ['#settingsEmnistGroup', '#advOcrPanel', '.tm-settings-card'],
+      /* The sign project's two teaching points live far apart inside the
+         modal: the EMNIST auto-seed block sits at the bottom of Advanced,
+         while `_background` lives higher up in the OCR training rows.
+         On shorter Windows viewports a union target made the arrow aim at
+         one block while the spotlight cut out the other. Anchor the step
+         on the sign-specific `_background` row, and keep the EMNIST note in
+         the copy rather than trying to spotlight both distant controls at
+         once. */
+      target: '#advOcrBackgroundRow, #settingsEmnistGroup',
+      aimGroup: '#advOcrBackgroundRow, #advOcrBackgroundNRow',
+      arrowTarget: '#settingsUseBackgroundOod',
+      fallback: ['#advOcrBackgroundRow', '#settingsEmnistGroup', '.tm-settings-card'],
       placement: 'left',
       onEnter: function () {{ openSettingsModal(); unfoldSettingsAdvanced(); }},
       advanceAlso: ['#settingsSave', '#settingsCancel'],
