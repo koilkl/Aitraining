@@ -2262,19 +2262,16 @@ def _render_tm_old_frontend_html(
       position: relative;
       background: var(--bg);
       border-radius: 12px;
-      padding: 72px 0 92px 0;
+      padding: 72px 16px 92px 16px;
       min-height: 620px;
       overflow: visible;
-      /* FULL-BLEED canvas: the iframe is embedded directly under the
-         Streamlit hero banner, and Streamlit lays both blocks into the
-         same container.  A centred, capped canvas here made the toolbar
-         and workspace narrower than that hero — so the canvas now spans
-         the container exactly (edges = hero edges). */
+      /* CENTRED canvas: the workspace keeps its original compact
+         proportions.  The Streamlit hero card and `.topnav` are aligned to
+         THIS content box — the workspace is never stretched to the screen
+         edges. */
       width: 100%;
-      max-width: 100%;
-      margin: 0;
-      padding-left: 0;
-      padding-right: 0;
+      max-width: min(1680px, calc(100vw - 48px));
+      margin: 0 auto;
       box-sizing: border-box;
     }}
     .topnav {{
@@ -2343,13 +2340,14 @@ def _render_tm_old_frontend_html(
       position: absolute;
       top: 10px;
       /* `.topnav` is a SIBLING of `.wrap`, so it cannot inherit the wrap's
-         content box.  Both now span the iframe edge-to-edge (the same
-         container width Streamlit gives the hero banner): 0 … 100%. */
-      left: 0;
-      right: 0;
-      transform: none;
-      width: 100%;
-      max-width: 100%;
+         content box.  Centre it on the same axis and give it the content
+         width (`wrap width − 2×16px padding`) so its edges land exactly on
+         the centred workspace's edges — never on the screen edges. */
+      left: 50%;
+      right: auto;
+      transform: translateX(-50%);
+      width: calc(min(1680px, 100vw - 48px) - 32px);
+      max-width: calc(min(1680px, 100vw - 48px) - 32px);
       /* content-box (the default) made the 10px×2 padding + 1px×2 border
          push the toolbar 6px past the right edge, which showed up as a
          hairline horizontal overflow once the workspace went full-bleed. */
@@ -2747,7 +2745,7 @@ def _render_tm_old_frontend_html(
     }}
     @media (max-width: 1320px) {{
       .wrap {{
-        padding: 72px 0 92px 0;
+        padding: 72px 16px 92px 16px;
       }}
       .layout {{
         /* One responsive step down from the desktop 60px, still inside the
@@ -2779,7 +2777,7 @@ def _render_tm_old_frontend_html(
     }}
     @media (max-width: 860px) {{
       .wrap {{
-        padding: 72px 0 92px 0;
+        padding: 72px 12px 92px 12px;
       }}
       /* Three nowrap columns already out-run this viewport; a 56px gutter on
          top of that would push the preview card off the edge, so the gap
@@ -3217,6 +3215,17 @@ def _render_tm_old_frontend_html(
     }}
     .charsel-btn:hover:not(:disabled) {{ border-color: #3169FF; color: #3169FF; background: #F0F4FF; }}
     .charsel-btn:disabled {{ opacity: 0.45; cursor: default; }}
+    .charsel-btn.primary {{
+      background: #3169FF; border-color: #3169FF; color: #fff; font-weight: 700;
+    }}
+    .charsel-btn.primary:hover:not(:disabled) {{ background: #1d4ed8; color: #fff; }}
+    /* Picker footer: the explicit "I am done picking" action. */
+    .charsel-footer {{
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; margin-top: 12px; padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }}
+    .charsel-footer-note {{ font-size: 12px; color: var(--muted); font-weight: 600; }}
     .charsel-input {{
       flex: 1 1 120px;
       min-width: 110px;
@@ -4752,6 +4761,13 @@ def _render_tm_old_frontend_html(
       width: min(1120px, calc(100vw - 470px));
       margin-left: auto;
       margin-right: 14px;
+    }}
+    /* OCR character picker: the card needs its own lane too, or a wide
+       modal plus a clamped card overlap on 1440x900 screens. */
+    body.tm-tour-dock-left #ocrCharModal .ocr-char-modal {{
+      width: min(820px, calc(100vw - 470px));
+      margin-left: 14px;
+      margin-right: auto;
     }}
     #tmTourCard {{
       position: fixed;
@@ -9131,6 +9147,7 @@ function applyProjectState(state) {{
      (Preview tuning and tour navigation never call this.) */
   clearTrainingWarning();
   try {{ if (typeof tmResetTunedSet === 'function') tmResetTunedSet(); }} catch (e) {{}}
+  try {{ window.__tmOcrPickerUsed = false; }} catch (e) {{}}
   if ('current_project_path' in s) {{
     if (typeof s.current_project_path === 'string' && s.current_project_path) {{
       STATE.currentProjectPath = s.current_project_path;
@@ -9832,14 +9849,21 @@ function tmIsUserClassIndex(i) {{
 }}
 function sampledClassIndices() {{
   const n = (STATE.classes || []).length;
+  /* A class that has no rendered card (the hidden `_background`, an
+     auto-managed rejector, or an OCR placeholder while the picker is
+     open) can never be opened or tuned.  Counting it would leave Collect
+     and Preprocess permanently locked. */
+  let anyCards = false;
+  try {{ anyCards = !!document.querySelector('#classes .class-card'); }} catch (e) {{}}
   const out = [];
+  const all = [];
   for (let i = 0; i < n; i += 1) {{
     if (!tmIsUserClassIndex(i)) continue;
+    if (anyCards && !document.getElementById('editClass-' + i)) continue;
+    all.push(i);
     if (tmClassCountByIndex(i) > 0) out.push(i);
   }}
   if (out.length) return out;
-  const all = [];
-  for (let i = 0; i < n; i += 1) {{ if (tmIsUserClassIndex(i)) all.push(i); }}
   return all;
 }}
 function tmClassIsTuned(i) {{
@@ -10076,10 +10100,16 @@ async function syncClassState(className) {{
 // restore can run before this block is evaluated.)
 
 function restoreAutoSeedEmnist() {{
+  /* OCR projects default this ON: a freshly picked character class starts
+     with 24 EMNIST glyphs, so collecting can begin even without a camera.
+     An explicit stored choice (on OR off) always wins. */
   try {{
-    autoSeedEmnistSamples = window.localStorage.getItem(AUTO_SEED_EMNIST_STORAGE_KEY) === '1';
+    var raw = window.localStorage.getItem(AUTO_SEED_EMNIST_STORAGE_KEY);
+    if (raw === '0') autoSeedEmnistSamples = false;
+    else if (raw === '1') autoSeedEmnistSamples = true;
+    else autoSeedEmnistSamples = isOcrProject();
   }} catch (e) {{
-    autoSeedEmnistSamples = false;
+    autoSeedEmnistSamples = isOcrProject();
   }}
 }}
 function setAutoSeedEmnistEnabled(on) {{
@@ -11062,11 +11092,16 @@ function renderOutputBars(labels, probs) {{
   const ls = Array.isArray(labels) ? labels : [];
   const ps = Array.isArray(probs) ? probs : [];
   if (!ls.length || !ps.length) {{
-    host.innerHTML = '';
+    if (host._barsSig !== '') {{
+      host.innerHTML = '';
+      host._barsSig = '';
+      host._barRefs = [];
+    }}
     return;
   }}
-  // Build persistent structure ONCE — the toggle button must never be
-  // destroyed by the prediction loop, or clicks get lost mid-press.
+  // Build the row structure ONCE per label list — the toggle button must
+  // never be destroyed by the prediction loop, and rebuilding 36 rows via
+  // innerHTML at 12 fps is what made OCR/image previews stutter.
   let rows = host.querySelector('.out-rows');
   let btn = host.querySelector('.out-toggle');
   if (!rows || !btn) {{
@@ -11081,23 +11116,43 @@ function renderOutputBars(labels, probs) {{
       renderOutputBars(host._lastLabels || [], host._lastProbs || []);
     }});
     host.appendChild(btn);
+    host._barsSig = '';
+  }}
+  const sig = ls.join('\\u0001');
+  if (host._barsSig !== sig) {{
+    rows.innerHTML = '';
+    host._barRefs = [];
+    for (let i = 0; i < ls.length; i++) {{
+      const row = document.createElement('div');
+      row.className = 'out-row';
+      const name = document.createElement('div');
+      name.textContent = String(ls[i]);
+      const bar = document.createElement('div');
+      bar.className = 'out-bar';
+      const fill = document.createElement('div');
+      fill.className = 'out-fill';
+      const pct = document.createElement('div');
+      pct.className = 'out-pct';
+      bar.appendChild(fill);
+      bar.appendChild(pct);
+      row.appendChild(name);
+      row.appendChild(bar);
+      rows.appendChild(row);
+      host._barRefs.push({{ fill: fill, pct: pct }});
+    }}
+    host._barsSig = sig;
+  }}
+  // Per tick: O(1) style/text writes on the SAME nodes — no DOM churn.
+  const refs = host._barRefs || [];
+  const n = Math.min(ls.length, ps.length, refs.length);
+  for (let i = 0; i < n; i++) {{
+    const p = Math.max(0, Math.min(1, Number(ps[i] || 0)));
+    const pct = Math.round(p * 1000) / 10;
+    refs[i].fill.style.width = pct + '%';
+    refs[i].pct.textContent = previewShowScore ? p.toFixed(3) : pct + '%';
   }}
   host._lastLabels = ls;
   host._lastProbs = ps;
-  rows.innerHTML = ls.map((label, idx) => {{
-    const p = Math.max(0, Math.min(1, Number(ps[idx] || 0)));
-    const pct = Math.round(p * 1000) / 10;
-    const disp = previewShowScore ? p.toFixed(3) : `${{pct}}%`;
-    return `
-      <div class="out-row">
-        <div>${{String(label)}}</div>
-        <div class="out-bar">
-          <div class="out-fill" style="width:${{pct}}%"></div>
-          <div class="out-pct">${{disp}}</div>
-        </div>
-      </div>
-    `;
-  }}).join('');
   btn.textContent = previewShowScore ? 'Show %' : 'Show Score';
 }}
 
@@ -11109,7 +11164,7 @@ async function refreshPreviewPrediction(token) {{
   previewPredictController = new AbortController();
   const note = document.getElementById('previewNote');
   try {{
-    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(previewThreshUserModified ? String(previewDarkThresh ?? '') : '')}}&bg_lum=${{encodeURIComponent(previewThreshUserModified ? String(previewLumThresh ?? '') : '')}}&ood_sign_min=${{encodeURIComponent(String(previewOodSignPctMin ?? 0.3))}}&ood_sign_max=${{encodeURIComponent(String(previewOodSignPctMax ?? 70.0))}}&ood_max_prob=${{encodeURIComponent(String(previewOodMaxProbMin ?? 0.40))}}&ood_entropy_max=${{encodeURIComponent(String(previewOodEntropyRatioMax ?? 0.85))}}&sign_seq=${{encodeURIComponent(signSequence().join(''))}}&sign_seqs=${{encodeURIComponent(signSequences().join(','))}}&reading=${{encodeURIComponent(String(nullish((STATE.train_cfg || {{}}).reading_order, 'ltr')))}}&_ts=${{Date.now()}}`, {{ signal: previewPredictController.signal }});
+    const res = await fetch(`${{baseUrl}}/preview/predict?session=${{encodeURIComponent(STATE.session)}}&source=${{encodeURIComponent(previewSource)}}&preprocess=${{encodeURIComponent(previewPreprocessMode)}}&bg_dark=${{encodeURIComponent(previewThreshUserModified ? String(previewDarkThresh ?? '') : '')}}&bg_lum=${{encodeURIComponent(previewThreshUserModified ? String(previewLumThresh ?? '') : '')}}&ood_sign_min=${{encodeURIComponent(String(previewOodSignPctMin ?? 0.3))}}&ood_sign_max=${{encodeURIComponent(String(previewOodSignPctMax ?? 70.0))}}&ood_max_prob=${{encodeURIComponent(String(previewOodMaxProbMin ?? 0.40))}}&ood_entropy_max=${{encodeURIComponent(String(previewOodEntropyRatioMax ?? 0.85))}}&sign_seq=${{encodeURIComponent(signSequence().join(''))}}&sign_seqs=${{encodeURIComponent(signSequences().join(','))}}&reading=${{encodeURIComponent(String(nullish((STATE.train_cfg || {{}}).reading_order, 'ltr')))}}&compact=1&_ts=${{Date.now()}}`, {{ signal: previewPredictController.signal }});
     const data = await res.json().catch(() => ({{ok:'0'}}));
     if (!res.ok || data.ok !== '1') throw new Error(data.error || 'Preview failed.');
     previewLastPredictData = data;
@@ -12113,7 +12168,7 @@ function applyPreviewSrcToPane(data) {{
   // the FIRST prediction (including a synth plate clicked before any image
   // was selected) must be able to replace that placeholder with a stage.
   if (!pane.dataset.ready || (src && !document.getElementById('previewImage'))) {{
-    pane.innerHTML = `<div class="preview-stage"><img id="previewImage" alt="Preview"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`;
+    pane.innerHTML = `<div class="preview-stage"><img id="previewImage" alt="Preview" decoding="async"/><div class="roi-overlay" id="previewRoiOverlay" style="display:none"></div></div>`;
     pane.dataset.ready = '1';
   }}
   const img = document.getElementById('previewImage');
@@ -12684,11 +12739,17 @@ let ocrCharModalOpen = false;
 
 function openOcrCharModal() {{
   ocrCharModalOpen = true;
+  /* Remember that this project's picker was actually used, so a ← Back /
+     Next → round-trip can restore the screen the student was working in
+     instead of dropping them on a blank empty state. */
+  try {{ window.__tmOcrPickerUsed = true; }} catch (e) {{}}
   renderOcrCharModal();
+  try {{ if (window.tmTour && window.tmTour.sync) window.tmTour.sync(); }} catch (e) {{}}
 }}
 function closeOcrCharModal() {{
   ocrCharModalOpen = false;
   renderOcrCharModal();
+  try {{ if (window.tmTour && window.tmTour.sync) window.tmTour.sync(); }} catch (e) {{}}
 }}
 
 function renderOcrCharModal() {{
@@ -12733,6 +12794,41 @@ function renderOcrCharModal() {{
   // applyClassesState() exactly as before.  Only its parent moved.
   renderOcrCharacterSelector(body);
   card.appendChild(body);
+
+  /* Footer with the explicit Apply action the tour (and a first-time user)
+     needs: the tiles add classes immediately, but "I am done picking" is a
+     separate decision.  Applying closes the picker and moves the guide on
+     to Sample Collection. */
+  const picked = Math.max(0, (Array.isArray(STATE.classes) ? STATE.classes.length : 0) - ocrPlaceholderClasses().length);
+  const foot = document.createElement('div');
+  foot.className = 'charsel-footer ocr-char-apply-row';
+  const note = document.createElement('span');
+  note.className = 'charsel-footer-note';
+  note.textContent = picked
+    ? `${{picked}} character${{picked === 1 ? '' : 's'}} selected`
+    : 'Pick at least 2 characters to train.';
+  foot.appendChild(note);
+  const apply = document.createElement('button');
+  apply.type = 'button';
+  apply.id = 'ocrCharModalApply';
+  apply.className = 'charsel-btn primary';
+  apply.textContent = 'Apply Characters';
+  apply.disabled = picked < 2;
+  apply.title = picked < 2
+    ? 'Pick at least 2 characters — a model needs two classes.'
+    : 'Use these characters and continue';
+  apply.onclick = (e) => {{
+    if (e) e.stopPropagation();
+    if (apply.disabled) return;
+    closeOcrCharModal();
+    try {{
+      if (window.tmTour && typeof window.tmTour.__onOcrCharsApplied === 'function') {{
+        window.tmTour.__onOcrCharsApplied();
+      }}
+    }} catch (err) {{}}
+  }};
+  foot.appendChild(apply);
+  card.appendChild(foot);
 
   host.appendChild(card);
   // Backdrop closes; the card swallows its own clicks so one that lands on the
@@ -15406,6 +15502,9 @@ mountReflowTimers.push(window.setTimeout(() => {{
   var WELCOME_DELAY_MS = 1200;
   var TOUR_TYPE = 'image';
   var PHASES = [];
+  /* OCR's walkthrough is strictly linear: every step is either explained
+     (Next suffices) or a hard-gated action.  No "Skip step" escape. */
+  var STRICT_NO_SKIP = false;
   var STEPS = [];
 
   function byId(id) {{ return document.getElementById(id); }}
@@ -16231,17 +16330,39 @@ mountReflowTimers.push(window.setTimeout(() => {{
       chapter: 3,
       mode: 'handson',
       title: 'Select &amp; Organize Character Classes',
-      target: '.col-classes',
-      aimGroup: '.addclass, .tm-rename-btn',
-      arrowTarget: '.addclass, .tm-rename-btn',
+      /* Empty project → the empty-state CTA; after picking → the cards.
+         While the picker is open the engine re-targets the modal (see
+         `ocrPickerTarget`), so one step covers "Classes ①" and "Classes ②". */
+      target: '#ocrEmptyCta, .col-classes',
+      aimGroup: '#ocrEmptyCta',
+      arrowTarget: '#ocrEmptyCta, .tm-rename-btn, .tm-action-toolbar',
       fallback: ['.class-card', '.col-classes'],
       placement: 'right',
-      onEnter: closeCharOverlays,
+      ocrPick: true,
+      onEnter: function () {{
+        closeMenus();
+        if (typeof closeOcrGlyphModal === 'function') {{ try {{ closeOcrGlyphModal(); }} catch (err) {{}} }}
+        /* Forward re-entry (← Back then Next →) restores the picker the
+           student was working in; the very first visit keeps the empty
+           state visible so «Select Characters to Train» is the lesson. */
+        try {{
+          if (window.__tmOcrPickerUsed && typeof openOcrCharModal === 'function') {{
+            openOcrCharModal();
+          }}
+        }} catch (err) {{}}
+      }},
       onLeave: closeCharOverlays,
+      /* Tiles inside #ocrCharModal must never collapse the card into the
+         pill. */
       keepCardOpenOnInteract: true,
       afterSettings: true,
+      gate: function () {{
+        try {{ return (typeof ocrIsFreshProject === 'function') ? !!ocrIsFreshProject() : false; }}
+        catch (err) {{ return false; }}
+      }},
+      gateHint: function () {{ return 'Select at least 2 characters to unlock Next →'; }},
       startLabel: '[[minimize]] Minimize to Corner Orb',
-      cue: 'Use <b>Edit ▾ → Edit characters</b> or <b>+ Add a class</b> to set your character set, then press <b>Next →</b>.',
+      cue: 'Click <b>Select Characters to Train</b>, pick the characters, then click <b>Apply Characters</b>.',
       orbPrompt: '[[rename]] Pick characters & organize cards — Click Next → when done',
       body: '<p class="tm-tour-goal"><b>[[goal]] Goal:</b> Choose only the characters the device must read, then tidy the cards.</p>' +
         '<ul class="tm-tour-param-list">' +
@@ -16259,6 +16380,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
       arrowTarget: '.tm-action-toolbar button.sample',
       fallback: ['.class-card', '.col-classes'],
       placement: 'right',
+      ocrSourceOpen: true,
       advanceWhen: function () {{ return drawerOpen(); }},
       checkpoint: 'Click Webcam, Upload or Device on the first character card.',
       cue: 'Click <b>Webcam</b> (or Upload / Device) on the first character card to open its capture drawer.',
@@ -16396,13 +16518,13 @@ mountReflowTimers.push(window.setTimeout(() => {{
       completeOn: 'previewButtons',
       title: 'Preview ①: Turn On Preview &amp; Test Controls',
       target: '.preview-card, .col-preview',
-      aimGroup: '.preview-controls, .preview-synth-group, .preview-context-row, .preview-card button',
-      arrowTarget: '.preview-controls input, #previewSynthMatchBtn, .preview-card button',
+      aimGroup: '.preview-controls, .preview-context-row',
+      arrowTarget: '.preview-controls input, .preview-context-row select',
       fallback: ['.preview-card', '.col-preview'],
       placement: 'left',
       startLabel: '[[minimize]] Test Preview Buttons',
-      cue: 'Now that your model is trained, turn on the <b>Input</b> / <b>ROI</b> preview buttons (or click <b>Synth Match</b>) to start live testing!',
-      orbPrompt: '[[search]] Turn on Input / ROI or click Synth Match',
+      cue: 'Now that your model is trained, turn on the <b>Input</b> / <b>ROI</b> preview buttons to start live recognition!',
+      orbPrompt: '[[search]] Turn on the Input / ROI preview to test the model',
       body: '<p class="tm-tour-goal"><b>[[goal]] Goal:</b> Switch the preview on and watch the model answer live.</p>' +
         '<ul class="tm-tour-param-list">' +
         '<li><b>Live Preview · Input toggle</b>Turns on the real-time camera or MCU feed for inference.</li>' +
@@ -16983,6 +17105,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
     TOUR_TYPE = activeProjectType();
     STEPS = CURRICULA[TOUR_TYPE] || IMAGE_STEPS;
     PHASES = PHASES_BY_TYPE[TOUR_TYPE] || PHASES_BY_TYPE.image;
+    STRICT_NO_SKIP = (TOUR_TYPE === 'ocr');
     SEEN_KEY = 'tm_tour_seen_' + TOUR_TYPE + '_v1';
     AUTOSKIP_KEY = 'tm_tour_autoskip_' + TOUR_TYPE + '_v1';
     /* Re-entrant by design (boot, start, project switch).  Load the saved
@@ -17228,6 +17351,9 @@ mountReflowTimers.push(window.setTimeout(() => {{
   /* Last "pending/open" verdict of the Collect / Preprocess hard gate, so
      a progress change re-renders the footer exactly once. */
   var lastGateState = '';
+  /* Cached "all classes have ≥20 samples" for OCR's Sample Collection ①
+     EMNIST note, so the cue refreshes once when seeding lands. */
+  var lastOcrReady = null;
 
   function autoskipOn() {{
     try {{ return window.localStorage.getItem(AUTOSKIP_KEY) === '1'; }} catch (err) {{ return false; }}
@@ -17458,6 +17584,40 @@ mountReflowTimers.push(window.setTimeout(() => {{
     return false;
   }}
 
+  /* ── OCR character picker (Class ① empty state → Class ② modal) ──────
+     The picker lives INSIDE the same curriculum step; while it is open
+     the spotlight moves from the empty-state CTA to the modal card and
+     the arrow/aim box wrap the tile grid + Apply footer. */
+  function ocrPickerOpen() {{
+    try {{ return !!charModalOpen(); }} catch (err) {{ return false; }}
+  }}
+
+  function ocrPickerModalSelector() {{
+    if (!tourOpen || !ocrPickerOpen()) return '';
+    var step = STEPS[tourIndex] || {{}};
+    if (!step.ocrPick) return '';
+    var el = null;
+    try {{ el = document.querySelector('#ocrCharModal .ocr-char-modal'); }} catch (err) {{ el = null; }}
+    return (el && isVisibleNode(el)) ? '#ocrCharModal .ocr-char-modal' : '';
+  }}
+
+  function ocrPickAimSelector() {{
+    if (!ocrPickerOpen()) return '';
+    var step = STEPS[tourIndex] || {{}};
+    if (!step.ocrPick) return '';
+    var apply = byId('ocrCharModalApply');
+    return (apply && isVisibleNode(apply)) ? '#ocrCharModalApply' : '';
+  }}
+
+  /* ← Back / ArrowLeft inside OCR Classes ② closes the picker and keeps
+     the tour on the same step.  Returns true when it consumed the action. */
+  function closeOcrPickerOnBack() {{
+    var step = STEPS[tourIndex] || {{}};
+    if (!step.ocrPick || !ocrPickerOpen()) return false;
+    try {{ closeOcrCharModal(); }} catch (err) {{}}
+    return true;
+  }}
+
   /* Inside the open worktable, once at least one class is tuned, the next
      action is «Next Class ("…") ▶» — aim the arrow there instead of the
      Dark/Lum group the step opened with. */
@@ -17570,6 +17730,9 @@ mountReflowTimers.push(window.setTimeout(() => {{
 
   function stepGatePending(step) {{
     if (!step) return false;
+    if (typeof step.gate === 'function') {{
+      try {{ return !!step.gate(); }} catch (err) {{ return false; }}
+    }}
     if (step.live === 'samples') return !allClassesCollected();
     if (step.live === 'thresholds') return !tmAllTuned();
     return false;
@@ -17577,6 +17740,9 @@ mountReflowTimers.push(window.setTimeout(() => {{
 
   function stepGateHint(step) {{
     if (!step) return '';
+    if (typeof step.gateHint === 'function') {{
+      try {{ var custom = step.gateHint(); if (custom) return custom; }} catch (err) {{}}
+    }}
     if (step.live === 'samples') {{
       var sp = sceneProgress('samples');
       return 'Collect ≥20 in every class (' + sp.m + ' / ' + sp.n + ' ready)';
@@ -17781,6 +17947,18 @@ mountReflowTimers.push(window.setTimeout(() => {{
     orbMarkLastBox = box;
   }}
 
+  /* «Apply Characters» inside the OCR picker: the student has chosen the
+     character set, so the classes step is done and the guide walks on to
+     Sample Collection ①. */
+  function onOcrCharsApplied() {{
+    if (!tourOpen) return;
+    var step = STEPS[tourIndex] || {{}};
+    if (!step.ocrPick) return;
+    if (orbMode) leaveOrbMode();
+    if (!completedStepsSet.has(tourIndex)) markStepCompleted(tourIndex);
+    advanceQuietly(600);
+  }}
+
   /* A training run just finished in the workspace.  If the guide is on the
      Training scene (card docked or pill floating), the run IS the step:
      bring the card back, mark it complete, and land on Preview ①. */
@@ -17883,6 +18061,13 @@ mountReflowTimers.push(window.setTimeout(() => {{
       try {{ redir = document.querySelector(redirect); }} catch (err) {{ redir = null; }}
       if (redir) return {{ target: redir, control: redir, phase: false }};
     }}
+    /* OCR Classes ② — the picker is open: spotlight its modal card. */
+    var pickerRedirect = ocrPickerModalSelector();
+    if (pickerRedirect) {{
+      var picker = null;
+      try {{ picker = document.querySelector(pickerRedirect); }} catch (err) {{ picker = null; }}
+      if (picker) return {{ target: picker, control: picker, phase: false }};
+    }}
     var shut = (typeof step.phaseIf === 'function') && !!step.phaseIf();
     var el = shut ? null : firstVisible([step.target].concat(step.fallback || []));
     if (!el && step.phaseTarget) {{
@@ -17914,6 +18099,14 @@ mountReflowTimers.push(window.setTimeout(() => {{
   function resolveAimElement(step, resolved) {{
     if (!step || !resolved) return null;
     var i;
+    /* OCR picker open: after the tiles, the next click is «Apply». */
+    var ocrApply = ocrPickAimSelector();
+    if (ocrApply) {{
+      try {{
+        var applyEl = document.querySelector(ocrApply);
+        if (applyEl && isVisibleNode(applyEl)) return applyEl;
+      }} catch (err) {{}}
+    }}
     /* Preprocessing ②, mid-tuning: the next move is the in-modal class
        switcher, so the arrow leaves the Dark/Lum group and lands there. */
     var nextSel = preprocessPartialAimSelector();
@@ -17944,7 +18137,24 @@ mountReflowTimers.push(window.setTimeout(() => {{
      padded 5px, which `#tmTourAimBox` draws and the arrow aims at. */
   function resolveAimBoxRect(step) {{
     step = adaptedStep(step);
-    if (!step || !step.aimGroup) return null;
+    if (!step) return null;
+    /* OCR character step: the framed group is context-dependent —
+       empty-state CTA → tile grid + Apply footer → organizing chips. */
+    if (step.ocrPick) {{
+      var ocrAimGroup = '#ocrEmptyCta';
+      if (ocrPickerOpen()) {{
+        ocrAimGroup = '.charsel-grid, .charsel-footer';
+      }} else {{
+        var fresh = true;
+        try {{ fresh = (typeof ocrIsFreshProject === 'function') ? !!ocrIsFreshProject() : true; }}
+        catch (err) {{ fresh = true; }}
+        if (!fresh) {{
+          ocrAimGroup = 'first:.class-card .tm-rename-btn, first:.class-card .tm-action-toolbar';
+        }}
+      }}
+      step = Object.assign({{}}, step, {{ aimGroup: ocrAimGroup }});
+    }}
+    if (!step.aimGroup) return null;
     /* Mid-tuning the group frame gives way to the single class-switch chip. */
     if (preprocessPartialAimSelector()) return null;
     var parts = String(step.aimGroup).split(',');
@@ -18156,9 +18366,18 @@ mountReflowTimers.push(window.setTimeout(() => {{
   function activeClasses() {{
     var names = projectClasses();
     var out = [];
+    /* Only classes that really have a rendered card count.  `_background`
+       and any hidden/auto-managed class would otherwise hold every gate
+       shut with no Edit button the student could ever click.  When the
+       column is momentarily empty (a fresh OCR project, mid-render) fall
+       back to the state list so the scenes still render a sane count. */
+    var anyCards = false;
+    try {{ anyCards = !!document.querySelector('#classes .class-card'); }} catch (err) {{}}
     for (var i = 0; i < names.length; i++) {{
-      if (names[i] === '{BACKGROUND_CLASS_NAME}') continue;
-      out.push(String(names[i]));
+      var name = String(names[i]);
+      if (name === '{BACKGROUND_CLASS_NAME}') continue;
+      if (anyCards && !document.getElementById('editClass-' + i)) continue;
+      out.push(name);
     }}
     return out;
   }}
@@ -19213,6 +19432,34 @@ mountReflowTimers.push(window.setTimeout(() => {{
         return;
       }}
     }}
+    /* OCR Classes — the step has two phases: the empty-state CTA and the
+       open character picker. */
+    if (step.ocrPick) {{
+      var ocrFresh = true;
+      try {{ ocrFresh = (typeof ocrIsFreshProject === 'function') ? !!ocrIsFreshProject() : true; }}
+      catch (err) {{ ocrFresh = true; }}
+      if (ocrPickerOpen()) {{
+        banner('cue-handson', tourIcon('action'), 'PICK CHARACTERS',
+          'Tap the character tiles (<b>0–9</b>, <b>A–Z</b>) — repeated picks just toggle — then click <b>Apply Characters</b> to continue.');
+        box.style.display = 'flex';
+        return;
+      }}
+      if (ocrFresh) {{
+        banner('cue-handson', tourIcon('goal'), 'SELECT CHARACTERS',
+          '<b>No characters selected.</b> Click <b>Select Characters to Train</b> — the picker opens and this card follows you inside.');
+        box.style.display = 'flex';
+        return;
+      }}
+    }}
+    /* OCR Sample Collection ① on an EMNIST-filled project: every class is
+       already past the gate, so name the shortcut instead of pretending
+       the student must shoot 20 photos first. */
+    if (step.ocrSourceOpen && allClassesCollected()) {{
+      banner('cue-nav', tourIcon('goal'), 'EMNIST SAMPLES READY',
+        'Every character class already has ≥20 samples (24 EMNIST glyphs each). Click <b>Webcam</b> / <b>Upload</b> / <b>Device</b> on the first class card to test adding your own — or press <b>Next →</b>.');
+      box.style.display = 'flex';
+      return;
+    }}
     if (advState === 'disabled') {{
       banner('hint', tourIcon('alert'), 'ACTION BLOCKED', '<b>This button is disabled right now.</b> ' +
         (step.disabledHint || 'Complete the earlier steps first, or click <b>Next →</b> to continue the tour'));
@@ -19251,7 +19498,10 @@ mountReflowTimers.push(window.setTimeout(() => {{
      lane on the left by tightening the modal — see the
      `body.tm-tour-dock-left` rule in the tour stylesheet. */
   function syncDockClass(step) {{
-    var on = !!(step && (step.inWorktable || step.inSettings) && tourOpen && !orbMode);
+    /* The OCR picker is a wide modal too: while it is open it reserves the
+       same left lane, so the card never has to overlap it. */
+    var on = !!(step && (step.inWorktable || step.inSettings ||
+      (step.ocrPick && ocrPickerOpen())) && tourOpen && !orbMode);
     try {{ document.body.classList.toggle('tm-tour-dock-left', on); }} catch (err) {{}}
   }}
 
@@ -19525,7 +19775,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
   function tourLayerSignature() {{
     return [settingsOpen() ? 1 : 0, worktableOpen() ? 1 : 0,
       drawerOpen() ? 1 : 0, advancedOpen() ? 1 : 0,
-      licenseModalOpen() ? 1 : 0].join('');
+      licenseModalOpen() ? 1 : 0, charModalOpen() ? 1 : 0].join('');
   }}
 
   function licenseModalOpen() {{
@@ -19563,7 +19813,12 @@ mountReflowTimers.push(window.setTimeout(() => {{
       goStep(tourIndex + 1);
     }};
     var backBtn = byId('tmTourBack');
-    if (backBtn) backBtn.onclick = function () {{ goStep(tourIndex - 1); }};
+    if (backBtn) backBtn.onclick = function () {{
+      /* Inside the OCR Classes ② picker, ← Back means "close this modal",
+         not "leave the step" — the step is still the one being taught. */
+      if (closeOcrPickerOnBack()) return;
+      goStep(tourIndex - 1);
+    }};
     var startBtn = byId('tmTourStart');
     if (startBtn) startBtn.onclick = function () {{
       var step = STEPS[tourIndex] || {{}};
@@ -19718,9 +19973,15 @@ mountReflowTimers.push(window.setTimeout(() => {{
          of them. */
       var nextAlways = !!(step.nextAlways || step.settingsPhase ||
         (step.keepCardOpenOnInteract && !step.live) || !!step.completeOn);
-      var showNext = !gatePending && (unlocked || nextAlways);
-      var showSkip = !gatePending && (unlocked || step.mode === 'concept') &&
-        step.mode !== 'concept';
+      /* A live scene whose criteria are ALREADY satisfied offers Next even
+         on the first visit: an EMNIST-filled OCR project starts with every
+         class at 24 samples, and the student must never be trapped in
+         Collect ② for work that is already done. */
+      var sceneReadyNext = (step.live === 'samples' && allClassesCollected()) ||
+        (step.live === 'thresholds' && tmAllTuned());
+      var showNext = !gatePending && (unlocked || nextAlways || sceneReadyNext);
+      var showSkip = !gatePending && !STRICT_NO_SKIP &&
+        (unlocked || step.mode === 'concept') && step.mode !== 'concept';
       if (step.mode === 'handson' && (step.target || step.phaseTarget)) {{
         html += '<div class="tm-tour-actions">';
         html += '<button type="button" class="tm-tour-btn primary wide" id="tmTourStart">' +
@@ -19847,6 +20108,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
     tmTunedAdvancing = false;
     preprocessNextIdx = -1;
     lastGateState = stepGatePending(STEPS[tourIndex]) ? 'p' : 'o';
+    lastOcrReady = null;
     runHook(STEPS[tourIndex].onEnter, 'onEnter');
     /* Every step starts in Phase A.  Coming out of hands-on mode the card
        was taken off screen, so the next step's card has to be put back —
@@ -19913,6 +20175,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
        each guided run; classes tuned BEFORE the tour still count through
        their `STATE.sample_preprocess` entries. */
     try {{ if (typeof tmResetTunedSet === 'function') tmResetTunedSet(); else window.__tmTunedClasses = new Set(); }} catch (err) {{}}
+    try {{ window.__tmOcrPickerUsed = false; }} catch (err) {{}}
     var card = byId('tmTourCard');
     if (card) card.classList.add('on');
     unbindTargetAdvance();
@@ -20009,6 +20272,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
       if (tourIndex <= 0) return;
       e.preventDefault();
       e.stopImmediatePropagation();
+      if (closeOcrPickerOnBack()) return;
       goStep(tourIndex - 1);
       return;
     }}
@@ -20046,6 +20310,8 @@ mountReflowTimers.push(window.setTimeout(() => {{
     __onClassesTuned: function () {{ onClassesTuned(); }},
     /* Workspace → tour: the training run finished. */
     __onTrainingComplete: function () {{ onTrainingComplete(); }},
+    /* Workspace → tour: «Apply Characters» was pressed in the OCR picker. */
+    __onOcrCharsApplied: function () {{ onOcrCharsApplied(); }},
     /* Preprocessing progress, for the headless suites. */
     tunedClasses: function () {{
       var out = [];
@@ -20068,6 +20334,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
     __simulateNewProject: function (sessionId) {{
       tourSessionOverride = String(sessionId || ('proj-' + Date.now()));
       try {{ if (typeof tmResetTunedSet === 'function') tmResetTunedSet(); }} catch (err) {{}}
+      try {{ window.__tmOcrPickerUsed = false; }} catch (err) {{}}
       completedStepsSet = new Set();
       maxReachedIndex = 0;
       tourIndex = 0;
@@ -20081,6 +20348,7 @@ mountReflowTimers.push(window.setTimeout(() => {{
     __resetProgress: function () {{
       if (tourOpen) endTour('dismiss');
       try {{ if (typeof tmResetTunedSet === 'function') tmResetTunedSet(); }} catch (err) {{}}
+      try {{ window.__tmOcrPickerUsed = false; }} catch (err) {{}}
       completedStepsSet = new Set();
       maxReachedIndex = 0;
       tourIndex = 0;
@@ -20264,6 +20532,15 @@ mountReflowTimers.push(window.setTimeout(() => {{
           renderTourCard();
         }}
       }}
+      /* OCR Sample Collection ①: the EMNIST note appears once the seeded
+         counts land, and only when the scene really is satisfied. */
+      if (cur && cur.ocrSourceOpen) {{
+        var ocrReadyNow = allClassesCollected();
+        if (ocrReadyNow !== lastOcrReady) {{
+          lastOcrReady = ocrReadyNow;
+          updateTourCue();
+        }}
+      }}
       /* The last sample / last tuned class unlocks the footer: re-render
          the card the moment the hard gate flips open (and only then). */
       var gateNow = stepGatePending(cur) ? 'p' : 'o';
@@ -20281,10 +20558,13 @@ mountReflowTimers.push(window.setTimeout(() => {{
         return;
       }}
       /* Re-seat ONLY when the drawer/modal layer state changed.  Captures,
-         thumbnails and video frames never move the card. */
+         thumbnails and video frames never move the card.  The cue rides
+         along: a modal opening/closing changes what the card should say
+         (e.g. the OCR picker's tile/Apply prompt). */
       var sig = tourLayerSignature();
       if (sig !== lastLayerSig) {{
         lastLayerSig = sig;
+        updateTourCue();
         schedulePlace();
       }}
     }},
@@ -20733,7 +21013,7 @@ def _render_ocr_project_page() -> None:
     inject_teachable_style()
     st.markdown(
         '''
-        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px 32px;margin-bottom:1.5rem;margin-top:1rem;">
+        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px 32px;margin-bottom:1.5rem;margin-top:1rem;width:min(1648px, calc(100% - 80px));max-width:100%;margin-left:auto;margin-right:auto;box-sizing:border-box;">
             <h1 class="tm-start-panel-title" style="margin:0 0 10px 0;font-size:2.2rem;font-weight:800;color:#0F172A;">🔠 OCR / Character Project</h1>
             <p class="tm-start-panel-sub" style="margin:0;max-width:100%;width:100%;line-height:1.6;color:#475569;font-size:15px;">
                 Character recognition for the ESP32-P4. Samples are captured exactly like the image project,
@@ -20767,7 +21047,7 @@ def _render_sign_ocr_project_page() -> None:
     inject_teachable_style()
     st.markdown(
         '''
-        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px 32px;margin-bottom:1.5rem;margin-top:1rem;">
+        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:24px 32px;margin-bottom:1.5rem;margin-top:1rem;width:min(1648px, calc(100% - 80px));max-width:100%;margin-left:auto;margin-right:auto;box-sizing:border-box;">
             <h1 class="tm-start-panel-title" style="margin:0 0 10px 0;font-size:2.2rem;font-weight:800;color:#0F172A;">🚗 Car License Project</h1>
             <p class="tm-start-panel-sub" style="margin:0;max-width:100%;width:100%;line-height:1.6;color:#475569;font-size:15px;">
                 A license plate is one frame holding three characters in a fixed
@@ -20799,7 +21079,7 @@ def _render_classified_import_page() -> None:
     # Full-width header panel (matches Start Page design system)
     st.markdown(
         '''
-        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:32px 40px;margin-bottom:2.5rem;margin-top:1rem;">
+        <div class="tm-start-panel" style="background-color:#F8FAFC;border:1px solid #E2E8F0;border-radius:16px;padding:32px 40px;margin-bottom:2.5rem;margin-top:1rem;width:min(1648px, calc(100% - 80px));max-width:100%;margin-left:auto;margin-right:auto;box-sizing:border-box;">
             <h1 class="tm-start-panel-title" style="margin:0 0 12px 0;font-size:2.2rem;font-weight:800;color:#0F172A;">Import a classified image folder</h1>
             <p class="tm-start-panel-sub" style="margin:0;max-width:100%;width:100%;line-height:1.6;color:#475569;font-size:15px;">
                 Import pre-classified image folders. Supported layouts include <code>label/image</code> and common <code>train|val|test/label/image</code> datasets. Each folder name becomes a class label.

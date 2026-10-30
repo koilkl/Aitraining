@@ -74,7 +74,13 @@ from test_tm_tour_refactored import (
     _box_frames_toolbar,
     _home_fixture,
     _unescape_html,
+    check_hero_description_width,
+    check_hero_matches_workspace,
     check_instant_training_completion,
+    check_ocr_collection_gate,
+    check_ocr_end_to_end,
+    check_preview_payload_compaction,
+    check_preview_performance,
     check_workspace_alignment,
 )
 
@@ -2031,6 +2037,12 @@ def main() -> int:
     check_home_metrics()
     check_instant_training_completion()
     check_workspace_alignment()
+    check_hero_matches_workspace()
+    check_hero_description_width()
+    check_ocr_end_to_end()
+    check_ocr_collection_gate()
+    check_preview_payload_compaction()
+    check_preview_performance()
     print("ALL PASS: tests/test_tour_spa.py")
     return 0
 
