@@ -3,7 +3,6 @@ examples/
 datasets/
 dist/
 build/
-.venv/
 __pycache__/
 .DS_Store
 /.vscode
@@ -11,8 +10,6 @@ AItraining.code-workspace
 model.h
 model.cpp
 g_model.tflite
-/dist-packages
-TFLiteTraining.pdf
 AI training.docx
 *.docx
 *.pdf
@@ -22,3 +19,4 @@ docs/manual_assets/sign_ocr/*.log
 /tests
 /docs
 /docs
+/.venv

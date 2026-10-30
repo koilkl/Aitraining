@@ -54,18 +54,21 @@ def inject_teachable_style() -> None:
     width: 100% !important;
     max-width: none !important;
     min-width: 0;
+    display: flex;
+    justify-content: center;
     box-sizing: border-box;
   }
 
   iframe[data-testid="stIFrame"].stIFrame {
-    width: 1000px !important;
-    max-width: none !important;
-    min-width: 1000px !important;
+    width: min(1680px, 100%) !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
     height: auto !important;
     min-height: 2000px !important;
     max-height: none !important;
     overflow: visible !important;
     border: 0;
+    margin: 0 auto !important;
   }
   .block-container {
     max-width: 1100px !important;
@@ -101,10 +104,12 @@ def inject_teachable_style() -> None:
   }
   iframe[title="st.iframe"],
   [data-testid="stCustomComponentV1"] > iframe {
-    width: 100vw !important;
+    width: min(1680px, 100%) !important;
+    max-width: 100% !important;
     min-height: 100vh !important;
     border: none !important;
     display: block !important;
+    margin: 0 auto !important;
   }
 
   .tm-top-brand-marker {
