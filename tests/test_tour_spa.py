@@ -83,6 +83,7 @@ from test_tm_tour_refactored import (
     check_no_cjk_in_legal_texts,
     check_preview_payload_compaction,
     check_preview_performance,
+    check_pyinstaller_spec,
     check_workspace_alignment,
 )
 
@@ -2045,6 +2046,7 @@ def main() -> int:
     check_ocr_collection_gate()
     check_no_cjk_in_legal_texts()
     check_brand_logo()
+    check_pyinstaller_spec()
     check_preview_payload_compaction()
     check_preview_performance()
     print("ALL PASS: tests/test_tour_spa.py")
