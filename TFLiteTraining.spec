@@ -6,7 +6,11 @@ datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'),
          # OCR/sign runtime modules — imported by app.py, trainer.py and
          # record_controller.py (some lazily).  Missing these made the
          # packaged app die with ModuleNotFoundError: ocr_dataset.
-         ('ocr_dataset.py', '.'), ('ocr_preprocess.py', '.'), ('ocr_trainer.py', '.')]
+         ('ocr_dataset.py', '.'), ('ocr_preprocess.py', '.'), ('ocr_trainer.py', '.'),
+         # Workshop template projects (car_sign_template.tmproj etc.) — the
+         # Start Page "Workshop" buttons open these. Without the folder the
+         # buttons ship broken in the packaged app.
+         ('templates', 'templates')]
 # App resources that must ship INSIDE the bundle: the hero icon, the
 # licensing artifacts (first-launch EULA, third-party notices, Apache text)
 # and the optional EMNIST template bank.  Without these the packaged app
@@ -135,13 +139,17 @@ coll = COLLECT(
     upx_exclude=[],
     name='TFLiteTraining',
 )
-app = BUNDLE(
-    coll,
-    name='TFLiteTraining.app',
-    icon='AIoScouts.icns' if sys.platform == 'darwin' else None,
-    bundle_identifier='ai.tflite.training',
-    info_plist={
-        'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
-        'NSHighResolutionCapable': True,
-    },
-)
+# The .app bundle is macOS-only — on Windows this would raise and abort the
+# build (the COLLECT onedir above is what Windows ships).
+import sys
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='TFLiteTraining.app',
+        icon='AIoScouts.icns',
+        bundle_identifier='ai.tflite.training',
+        info_plist={
+            'NSCameraUsageDescription': 'TFLiteTraining needs camera access to capture training samples.',
+            'NSHighResolutionCapable': True,
+        },
+    )
