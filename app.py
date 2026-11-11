@@ -15013,7 +15013,7 @@ function render() {{
             throw new Error(data && data.error ? data.error : 'Export to Block Coding failed.');
           }}
           const labelCount = Array.isArray(data.labels) ? data.labels.length : 0;
-          toast(`Model sent to Block Coding (${{labelCount}} classes)`);
+          toast(`Saved to Block Coding (${{labelCount}} classes) — opening the AI Eye firmware program…`);
         }} catch (e) {{
           toast(String(e && e.message ? e.message : e));
         }} finally {{
