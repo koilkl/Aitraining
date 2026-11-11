@@ -232,6 +232,16 @@ def _documents_dir() -> Path:
 
 
 def _default_export_dir() -> Path:
+    # Under the AIoScout desktop app, default into the writable firmware
+    # sketch copies the app materializes (AIOSCOUT_FIRMWARE_EXPORT_DIR), so
+    # "Export Model" bakes straight into the sketch that Block Coding's
+    # Compile & Upload flashes to the AI Eye (P4). Sign/plate projects target
+    # the plate reader sketch; everything else the image firmware sketch.
+    root = os.environ.get("AIOSCOUT_FIRMWARE_EXPORT_DIR")
+    if root:
+        ptype = str(st.session_state.get("project_type") or "").strip().lower()
+        subdir = "TFLite_Car_License" if ptype == PROJECT_TYPE_SIGN_OCR else "TFLite"
+        return (Path(root) / subdir).resolve()
     return (_documents_dir() / APP_NAME / "exports").resolve()
 
 
@@ -501,7 +511,13 @@ def _init_session() -> None:
     if "class_rename" not in st.session_state:
         st.session_state.class_rename = {}
     if "last_export_dir" not in st.session_state:
-        st.session_state.last_export_dir = str(_default_export_dir())
+        if os.environ.get("AIOSCOUT_FIRMWARE_EXPORT_DIR"):
+            # Desktop mode: keep it empty so each export recomputes the
+            # default from the currently loaded project type until the user
+            # picks a custom directory.
+            st.session_state.last_export_dir = ""
+        else:
+            st.session_state.last_export_dir = str(_default_export_dir())
     if "train_cfg" not in st.session_state:
         st.session_state.train_cfg = TrainConfig()
     if "train_result" not in st.session_state:
