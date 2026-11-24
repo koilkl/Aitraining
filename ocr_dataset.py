@@ -69,6 +69,7 @@ from ocr_preprocess import (
     normalize_norm_convention,
     otsu_threshold_u8,
     preprocess_glyph,
+    preprocess_sign_sequence,
 )
 
 # ── The N+1 reject class ────────────────────────────────────────────────
@@ -767,7 +768,84 @@ def render_template_sign_frame(
 _DATASET_GLYPH_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
 
-def _dataset_glyph_alpha(char: str, dataset_root: Path, rng: np.random.Generator) -> Optional[np.ndarray]:
+def _segmented_sample_alpha(
+    gray: np.ndarray,
+    char: str,
+    sequences: Optional[Sequence[Sequence[str]]],
+    reading_order: str,
+) -> Optional[np.ndarray]:
+    """This class's glyph, segmented out of a full-scene sample frame.
+
+    Class samples are saved at CAPTURE resolution — a whole board with the
+    frame, the desk and whatever else the camera saw — not as 28x28
+    glyphs.  Pasting one into a synthetic slot put the entire scene in the
+    character cell.  The sample is therefore pushed through the same sign
+    front-end the device runs, and only the slot whose label matches this
+    class card is kept.
+    """
+    order = str(reading_order or "ltr").strip().lower()
+    if order not in ("ltr", "rtl"):
+        order = "ltr"
+    arr = np.asarray(gray, dtype=np.uint8)
+    for seq in sequences or []:
+        chars = [str(c).strip().upper()[:1] for c in (seq or []) if str(c).strip()]
+        if not chars:
+            continue
+        try:
+            reading = preprocess_sign_sequence(
+                arr,
+                sign_sequence=chars,
+                reading_order=order,
+                out_size=GLYPH_SIZE,
+                polarity=INK_DARK,
+                apply_segmentation=True,
+                convention=NORM_CANON,
+                find_roi=True,
+            )
+        except Exception:
+            continue
+        for slot in reading.get("slots") or []:
+            if str(slot.get("char") or "").upper()[:1] != char:
+                continue
+            if not slot.get("ok") or slot.get("empty"):
+                continue
+            display = np.asarray(slot.get("display", slot.get("glyph")), dtype=np.uint8)
+            if display.ndim != 2 or display.size == 0:
+                continue
+            alpha = np.clip((255.0 - display.astype(np.float32)) / 255.0, 0.0, 1.0)
+            ys, xs = np.where(alpha > 0.12)
+            if not ys.size:
+                continue
+            return np.ascontiguousarray(
+                alpha[int(ys.min()) : int(ys.max()) + 1, int(xs.min()) : int(xs.max()) + 1],
+                dtype=np.float32,
+            )
+    return None
+
+
+def _sample_run_count(gray: np.ndarray) -> int:
+    """How many glyph-like ink runs a sample frame holds (0 if unknown)."""
+    try:
+        from ocr_preprocess import segment_glyph_boxes
+
+        arr = np.asarray(gray, dtype=np.uint8)
+        threshold = int(otsu_threshold_u8(arr))
+        if threshold <= 0:
+            return 0
+        ink = binarize_ink(arr, threshold, polarity=INK_DARK)
+        return len(segment_glyph_boxes(ink))
+    except Exception:
+        return 0
+
+
+def _dataset_glyph_alpha(
+    char: str,
+    dataset_root: Path,
+    rng: np.random.Generator,
+    *,
+    sequences: Optional[Sequence[Sequence[str]]] = None,
+    reading_order: str = "ltr",
+) -> Optional[np.ndarray]:
     """One class sample -> a dark-ink alpha layer, or None when unavailable.
 
     A road sign carries three characters on ONE plate, so a preview that
@@ -775,9 +853,13 @@ def _dataset_glyph_alpha(char: str, dataset_root: Path, rng: np.random.Generator
     28x28 glyphs.  When the project already holds samples for the target
     character, reusing one is what makes the synthesized sign look like
     something the model was actually trained on (the EMNIST bank is only
-    the fallback).  The sample is binarised against its own Otsu split and
-    cropped to its ink box: the light page around the glyph is discarded so
-    pasting it onto the composite cannot leave a visible rectangle.
+    the fallback).
+
+    The sample may be a tight glyph capture OR a whole scene; the scene
+    case goes through `_segmented_sample_alpha` first so only the class's
+    own glyph is composited.  A multi-glyph scene that cannot be mapped
+    through the project's plate list is rejected outright rather than
+    pasted whole.
     """
     root = Path(dataset_root)
     if not root.exists():
@@ -807,6 +889,14 @@ def _dataset_glyph_alpha(char: str, dataset_root: Path, rng: np.random.Generator
         return None
     if gray.size == 0:
         return None
+    # A tight single-glyph sample is already the glyph: its own Otsu split
+    # below is the canonical alpha.  A sample with SEVERAL ink runs is a
+    # scene (a whole board, or a car with its plate) and must be segmented
+    # through the sign front-end — no plate sequence identifying this
+    # class's slot means the EMNIST bank is the honest fallback, never
+    # pasting the scene whole.
+    if _sample_run_count(gray) > 1:
+        return _segmented_sample_alpha(gray, char, sequences, reading_order)
     # The class samples are dark-ink-on-light captures by construction.  The
     # threshold is their own Otsu split, so a slightly dimmer page still
     # separates from the glyph; a frame with no usable split falls back to
@@ -924,6 +1014,8 @@ def synthesize_sign_preview_png(
     width: int = TEMPLATE_SIGN_PREVIEW_WIDTH,
     height: int = TEMPLATE_SIGN_PREVIEW_HEIGHT,
     seed: Optional[int] = None,
+    sample_sequences: Optional[Sequence[Sequence[str]]] = None,
+    sample_reading_order: str = "ltr",
 ) -> bytes:
     """A left-to-right multi-character sign plate, as PNG bytes.
 
@@ -951,7 +1043,17 @@ def synthesize_sign_preview_png(
         bank = load_emnist_template_bank()
     alphas: List[np.ndarray] = []
     for ch in order:
-        alpha = _dataset_glyph_alpha(ch, Path(dataset_root), rng) if dataset_root else None
+        alpha = (
+            _dataset_glyph_alpha(
+                ch,
+                Path(dataset_root),
+                rng,
+                sequences=sample_sequences,
+                reading_order=sample_reading_order,
+            )
+            if dataset_root
+            else None
+        )
         if alpha is None:
             alpha = _glyph_alpha_from_bank(ch, bank, rng)
         alphas.append(alpha)

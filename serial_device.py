@@ -181,8 +181,17 @@ def parse_sync_header(sync_header: bytes | str | None) -> bytes:
     raw = str(sync_header or "").strip()
     if not raw:
         return HEADER
-    cleaned = raw.replace(",", " ").replace("0x", "").replace("0X", "")
-    parts = [part.strip() for part in cleaned.split() if part.strip()]
+    cleaned = raw.replace(",", " ").replace("0x", "").replace("0X", "").strip()
+    if not cleaned:
+        return HEADER
+    # Accept both the spaced form ("AA 55 AA") and the compact form
+    # ("0xAA55" / "AA55AA").  The compact form is split into 2-digit bytes.
+    if any(ch.isspace() for ch in cleaned):
+        parts = [part.strip() for part in cleaned.split() if part.strip()]
+    else:
+        if len(cleaned) % 2 != 0:
+            raise ValueError("Sync header must use an even number of hex digits.")
+        parts = [cleaned[i:i + 2] for i in range(0, len(cleaned), 2)]
     if not parts:
         return HEADER
     values = []
@@ -192,7 +201,7 @@ def parse_sync_header(sync_header: bytes | str | None) -> bytes:
         try:
             value = int(part, 16)
         except Exception as e:
-            raise ValueError("Sync header must use hex bytes like AA 55 AA.") from e
+            raise ValueError("Sync header must use hex bytes like AA 55 AA or 0xAA55.") from e
         if value < 0 or value > 255:
             raise ValueError("Sync header byte out of range.")
         values.append(value)

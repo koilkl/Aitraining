@@ -13,7 +13,10 @@ datas = [('app.py', '.'), ('camera_permission.py', '.'), ('dataset_io.py', '.'),
 # silently falls back or loses its license declarations — a commercial
 # distribution must carry them.
 datas += [('AIoScouts.png', '.'), ('THIRD_PARTY_NOTICES.md', '.'),
-          ('LICENSE', '.'), ('EULA.md', '.'), ('models', 'models')]
+          ('LICENSE', '.'), ('EULA.md', '.'), ('models', 'models'),
+          # Phase 1 single-origin shell.  RecordController serves this at /;
+          # without it the direct pywebview window has nothing to load.
+          ('../AIoScout_UI_Shell.html', '.')]
 binaries = []
 hiddenimports = []
 

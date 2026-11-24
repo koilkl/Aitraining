@@ -313,7 +313,12 @@ def test_preview_upload_raw_bytes_and_reuse():
             )
             assert res2.get("ok") == "1", res2
             assert len(calls) == 2, calls
-            assert calls[1]["png"] == stored, "reuse did not forward the stored PNG"
+            # reuse forwards the ALREADY-DECODED frame from RAM (no second
+            # PNG decode); older builds forwarded the bytes.
+            forwarded = calls[1]["png"]
+            assert forwarded is ctrl._preview_uploads["s"].get("pil") or forwarded == stored, (
+                "reuse did not forward the cached upload"
+            )
             assert calls[1]["kwargs"].get("match_min_prob") == 0.7, calls[1]["kwargs"]
         finally:
             ctrl.stop()

@@ -197,9 +197,10 @@ def test_thin_one_sign_reads_a12_not_background():
     assert res.get("match") is True, res
     assert str(res.get("match_text") or "").startswith(rc.SIGN_MATCH_TEXT), res.get("match_text")
 
-    # ROI OFF loads full_image_b64 (frame-sized); ROI ON loads
-    # processed_image_b64 / crop_image_b64 (ROI-sized).  The JS test
-    # (tests/test_preview_roi_spa.py) asserts the toggle/overlay half.
+    # ROI OFF loads full_image_b64 (frame-sized); ROI ON loads the
+    # SEGMENTED 3-SLOT STRIP into processed_image_b64 (28x28 thresholded
+    # panels) / crop_image_b64 (raw slot crops).  The SPA hides the overlay
+    # while ROI is on (tests/test_preview_roi_spa.py asserts the JS half).
     import base64
     import io
 
@@ -208,7 +209,8 @@ def test_thin_one_sign_reads_a12_not_background():
             Image.open(io.BytesIO(base64.b64decode(res[key])))
         ).shape
 
-    roi_x1, roi_y1, roi_x2, roi_y2 = (int(v) for v in res["roi_box"])
     assert _shape("full_image_b64") == (160, 160), _shape("full_image_b64")
-    assert _shape("processed_image_b64") == (roi_y2 - roi_y1, roi_x2 - roi_x1)
-    assert _shape("crop_image_b64") == (roi_y2 - roi_y1, roi_x2 - roi_x1)
+    # Each panel is a 28x28 glyph drawn at 3x -> 84 px tall.
+    assert _shape("processed_image_b64")[0] == 84, _shape("processed_image_b64")
+    assert _shape("processed_image_b64")[1] >= 3 * 84, _shape("processed_image_b64")
+    assert _shape("crop_image_b64")[0] == 84, _shape("crop_image_b64")

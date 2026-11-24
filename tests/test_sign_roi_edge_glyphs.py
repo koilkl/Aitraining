@@ -174,12 +174,17 @@ def test_preview_roi_slice_is_exact_and_correct_slots_bypass_entropy():
             ood_entropy_ratio_max=0.70,
         )
 
-    # ROI-checked must be the EXACT unchecked green-box slice.
+    # ROI CHECKED shows the SEGMENTED 3-SLOT STRIP — the pixels the three
+    # inferences actually consumed — not the ROI rectangle (which made the
+    # ROI toggle indistinguishable from ROI OFF).  ROI OFF still carries the
+    # full-frame view.
     full = np.asarray(Image.open(BytesIO(base64.b64decode(res["full_image_b64"]))))
     processed = np.asarray(Image.open(BytesIO(base64.b64decode(res["processed_image_b64"]))))
     x1, y1, x2, y2 = (int(v) for v in res["roi_box"])
-    assert processed.shape == (y2 - y1, x2 - x1), (processed.shape, res["roi_box"])
-    assert np.array_equal(processed, full[y1:y2, x1:x2]), "ROI view is not the exact slice"
+    assert full.shape == (160, 160), full.shape
+    assert processed.ndim == 2 and processed.shape[0] == 84, processed.shape
+    assert processed.shape[1] >= 3 * 84, ("three 28x28 panels", processed.shape)
+    assert not np.array_equal(processed, full[y1:y2, x1:x2]), "ROI view must not be the raw slice"
 
     slots = res["slots"]
     assert [s["char"] for s in slots] == ["A", "1", "2"], slots

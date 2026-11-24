@@ -231,6 +231,22 @@ def _connected_bbox_from_seed(mask: np.ndarray, seed_x: int, seed_y: int) -> Opt
     sy = int(max(0, min(h - 1, seed_y)))
     if not mask[sy, sx]:
         return None
+    # Fast path: a 4-connected component's bounding box is exactly what the
+    # Python flood fill below computes — BFS visits the whole component, so
+    # min/max over its pixels is the same box.  On a 640x480 camera frame the
+    # BFS was ~50 ms per call (the dominant cost of 04 PREVIEW); OpenCV's C
+    # labelling returns the identical box in ~1 ms.
+    try:
+        import cv2
+
+        _n, labels = cv2.connectedComponents(np.asarray(mask, dtype=np.uint8), connectivity=4)
+        label = int(labels[sy, sx])
+        if label == 0:
+            return None
+        ys, xs = np.nonzero(labels == label)
+        return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+    except Exception:
+        pass
     visited = np.zeros_like(mask, dtype=bool)
     stack = [(sx, sy)]
     visited[sy, sx] = True
@@ -339,81 +355,86 @@ def _estimate_sign_center_and_side(
     best_bbox: Optional[Tuple[int, int, int, int]] = None
     best_peak: Optional[Tuple[int, int]] = None
 
-    for y in range(h):
-        for x in range(w):
-            if not local_mask[y, x] or visited[y, x]:
-                continue
-            stack = [(x, y)]
-            visited[y, x] = True
-            min_x = max_x = x
-            min_y = max_y = y
-            weighted_sum = 0.0
-            weighted_x = 0.0
-            weighted_y = 0.0
-            local_peak_value = -1.0
-            local_peak_x = x
-            local_peak_y = y
+    # Row-major over ONLY the true cells.  The old double loop scanned every
+    # pixel of the full frame in Python (307k iterations at 640x480) even
+    # when the peak mask held a handful of pixels; argwhere preserves the
+    # exact (y, then x) order, so component discovery is unchanged.
+    for y, x in np.argwhere(local_mask):
+        y = int(y)
+        x = int(x)
+        if visited[y, x]:
+            continue
+        stack = [(x, y)]
+        visited[y, x] = True
+        min_x = max_x = x
+        min_y = max_y = y
+        weighted_sum = 0.0
+        weighted_x = 0.0
+        weighted_y = 0.0
+        local_peak_value = -1.0
+        local_peak_x = x
+        local_peak_y = y
 
-            while stack:
-                px, py = stack.pop()
-                value = float(score_map[py, px])
-                weighted_sum += value
-                weighted_x += value * float(px)
-                weighted_y += value * float(py)
-                if value > local_peak_value:
-                    local_peak_value = value
-                    local_peak_x = px
-                    local_peak_y = py
-                min_x = min(min_x, px)
-                max_x = max(max_x, px)
-                min_y = min(min_y, py)
-                max_y = max(max_y, py)
+        while stack:
+            px, py = stack.pop()
+            value = float(score_map[py, px])
+            weighted_sum += value
+            weighted_x += value * float(px)
+            weighted_y += value * float(py)
+            if value > local_peak_value:
+                local_peak_value = value
+                local_peak_x = px
+                local_peak_y = py
+            min_x = min(min_x, px)
+            max_x = max(max_x, px)
+            min_y = min(min_y, py)
+            max_y = max(max_y, py)
 
-                if px > 0 and local_mask[py, px - 1] and not visited[py, px - 1]:
-                    visited[py, px - 1] = True
-                    stack.append((px - 1, py))
-                if px + 1 < w and local_mask[py, px + 1] and not visited[py, px + 1]:
-                    visited[py, px + 1] = True
-                    stack.append((px + 1, py))
-                if py > 0 and local_mask[py - 1, px] and not visited[py - 1, px]:
-                    visited[py - 1, px] = True
-                    stack.append((px, py - 1))
-                if py + 1 < h and local_mask[py + 1, px] and not visited[py + 1, px]:
-                    visited[py + 1, px] = True
-                    stack.append((px, py + 1))
+            if px > 0 and local_mask[py, px - 1] and not visited[py, px - 1]:
+                visited[py, px - 1] = True
+                stack.append((px - 1, py))
+            if px + 1 < w and local_mask[py, px + 1] and not visited[py, px + 1]:
+                visited[py, px + 1] = True
+                stack.append((px + 1, py))
+            if py > 0 and local_mask[py - 1, px] and not visited[py - 1, px]:
+                visited[py - 1, px] = True
+                stack.append((px, py - 1))
+            if py + 1 < h and local_mask[py + 1, px] and not visited[py + 1, px]:
+                visited[py + 1, px] = True
+                stack.append((px, py + 1))
 
-            if weighted_sum <= 0.0:
-                continue
+        if weighted_sum <= 0.0:
+            continue
 
-            # Background rejection: components touching >= 2 borders of the
-            # search region are the desk/surface, not the sign (the sign
-            # lives on bright paper and never spans the frame edges).
-            touch_count = int(min_x <= _SIGN_BORDER_TOUCH_PX) + int(min_y <= _SIGN_BORDER_TOUCH_PX) \
-                + int(max_x >= w - 1 - _SIGN_BORDER_TOUCH_PX) + int(max_y >= h - 1 - _SIGN_BORDER_TOUCH_PX)
-            if touch_count >= 2:
-                continue
+        # Background rejection: components touching >= 2 borders of the
+        # search region are the desk/surface, not the sign (the sign
+        # lives on bright paper and never spans the frame edges).
+        touch_count = int(min_x <= _SIGN_BORDER_TOUCH_PX) + int(min_y <= _SIGN_BORDER_TOUCH_PX) \
+            + int(max_x >= w - 1 - _SIGN_BORDER_TOUCH_PX) + int(max_y >= h - 1 - _SIGN_BORDER_TOUCH_PX)
+        if touch_count >= 2:
+            continue
 
-            span_w = int(max_x - min_x + 1)
-            span_h = int(max_y - min_y + 1)
-            aspect = float(span_w) / float(max(1, span_h))
-            aspect_error = abs(aspect - _SIGN_LOCAL_ASPECT_TARGET)
-            if aspect_error > _SIGN_LOCAL_ASPECT_TOL:
-                continue
+        span_w = int(max_x - min_x + 1)
+        span_h = int(max_y - min_y + 1)
+        aspect = float(span_w) / float(max(1, span_h))
+        aspect_error = abs(aspect - _SIGN_LOCAL_ASPECT_TARGET)
+        if aspect_error > _SIGN_LOCAL_ASPECT_TOL:
+            continue
 
-            aspect_score = max(0.2, 1.0 - aspect_error / max(_SIGN_LOCAL_ASPECT_TOL, 1e-6))
-            area_score = min(1.0, float(span_w * span_h) / float(max(1, kernel_size * kernel_size)))
-            center_x = (weighted_x / weighted_sum) / float(max(1, w - 1))
-            center_y = (weighted_y / weighted_sum) / float(max(1, h - 1))
-            center_score_x = float(np.exp(-0.5 * ((center_x - _SIGN_PRIOR_CENTER_X_FRAC) / max(_SIGN_PRIOR_SIGMA_X_FRAC, 1e-6)) ** 2))
-            center_score_y = float(np.exp(-0.5 * ((center_y - _SIGN_PRIOR_CENTER_Y_FRAC) / max(_SIGN_PRIOR_SIGMA_Y_FRAC, 1e-6)) ** 2))
-            center_score = 0.35 + 0.65 * center_score_x * center_score_y
-            score = weighted_sum * aspect_score * (0.6 + 0.4 * area_score) * center_score
+        aspect_score = max(0.2, 1.0 - aspect_error / max(_SIGN_LOCAL_ASPECT_TOL, 1e-6))
+        area_score = min(1.0, float(span_w * span_h) / float(max(1, kernel_size * kernel_size)))
+        center_x = (weighted_x / weighted_sum) / float(max(1, w - 1))
+        center_y = (weighted_y / weighted_sum) / float(max(1, h - 1))
+        center_score_x = float(np.exp(-0.5 * ((center_x - _SIGN_PRIOR_CENTER_X_FRAC) / max(_SIGN_PRIOR_SIGMA_X_FRAC, 1e-6)) ** 2))
+        center_score_y = float(np.exp(-0.5 * ((center_y - _SIGN_PRIOR_CENTER_Y_FRAC) / max(_SIGN_PRIOR_SIGMA_Y_FRAC, 1e-6)) ** 2))
+        center_score = 0.35 + 0.65 * center_score_x * center_score_y
+        score = weighted_sum * aspect_score * (0.6 + 0.4 * area_score) * center_score
 
-            if score > best_score:
-                best_score = score
-                best_span = (span_w, span_h)
-                best_bbox = (min_x, min_y, max_x, max_y)
-                best_peak = (local_peak_x, local_peak_y)
+        if score > best_score:
+            best_score = score
+            best_span = (span_w, span_h)
+            best_bbox = (min_x, min_y, max_x, max_y)
+            best_peak = (local_peak_x, local_peak_y)
 
     if best_span is None or best_bbox is None or best_peak is None:
         return None
@@ -687,7 +708,10 @@ def normalize_class_preprocess(raw: Any) -> Dict[str, Any]:
     bg_dark = int(src.get("bg_dark_thresh", 0))
     out["bg_lum_thresh"] = max(50, min(255, bg_lum))
     out["bg_diff_abs"] = max(0, min(255, bg_diff))  # |B-G| magnitude
-    out["bg_dark_thresh"] = max(0, min(100, bg_dark))
+    # Dark Thr is a full 0..255 luminance bound (Phase 1 design lock).  The
+    # old 0..100 clamp silently changed a 0..255 slider value before it ever
+    # reached the pipeline.
+    out["bg_dark_thresh"] = max(0, min(255, bg_dark))
 
     # Glyph (OCR project) knobs, carried here rather than in a parallel
     # class-config schema: this function IS the per-class preprocess record,
@@ -893,7 +917,8 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
                                bg_lum_thresh: int = 100,
                                return_crop_box: bool = False,
                                fast_mode: bool = False,
-                               return_stats: bool = False):
+                               return_stats: bool = False,
+                               previews: bool = True):
     """Simplified pipeline for all-black signs on white background.
 
     Uses raw G channel (best SNR in green-biased lighting).
@@ -953,38 +978,41 @@ def preprocess_blue_diff_array(arr: np.ndarray, out_size: int, color_mode: str =
     # This is the G-channel after thresholding (non-sign pixels → white), cropped
     # and resized to out_size.  Distinct from the model-input image below.
     masked_preview = None
-    try:
-        mp = gray[y1:y2, x1:x2]  # crop the masked G-channel
-        mp_img = Image.fromarray(mp, mode="L")
-        mp_img = mp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
-        mp_arr = _contrast_stretch_u8(np.asarray(mp_img, dtype=np.uint8))
-        masked_preview = np.expand_dims(mp_arr.astype(np.float32) / 255.0, axis=-1)
-    except Exception:
-        pass
+    if previews:
+        try:
+            mp = gray[y1:y2, x1:x2]  # crop the masked G-channel
+            mp_img = Image.fromarray(mp, mode="L")
+            mp_img = mp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+            mp_arr = _contrast_stretch_u8(np.asarray(mp_img, dtype=np.uint8))
+            masked_preview = np.expand_dims(mp_arr.astype(np.float32) / 255.0, axis=-1)
+        except Exception:
+            pass
 
     # Full-frame thresholded preview (mask applied, NO crop) — for the Orig view.
     # Keep the frame's aspect ratio (fit inside out_size): the ROI overlay
     # draws the search box with normalized coordinates of the ORIGINAL frame,
     # and a squashed square here would misplace the box on the Orig view.
     full_preview = None
-    try:
-        fp_arr = gray.copy()  # gray is already masked: non-sign → 255
-        fp_img = Image.fromarray(fp_arr, mode="L")
-        fp_img.thumbnail((int(out_size), int(out_size)), Image.BILINEAR)
-        full_preview = np.expand_dims(np.asarray(fp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
-    except Exception:
-        pass
+    if previews:
+        try:
+            fp_arr = gray.copy()  # gray is already masked: non-sign → 255
+            fp_img = Image.fromarray(fp_arr, mode="L")
+            fp_img.thumbnail((int(out_size), int(out_size)), Image.BILINEAR)
+            full_preview = np.expand_dims(np.asarray(fp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
+        except Exception:
+            pass
 
     # Crop-only preview: cropped RGB → luminance, resized, NO threshold/stretch.
     crop_preview = None
-    try:
-        cp_rgb = src[y1:y2, x1:x2, :3].astype(np.int32)
-        cp_gray = ((cp_rgb[:,:,0] * 30 + cp_rgb[:,:,1] * 59 + cp_rgb[:,:,2] * 11 + 50) // 100).astype(np.uint8)
-        cp_img = Image.fromarray(cp_gray, mode="L")
-        cp_img = cp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
-        crop_preview = np.expand_dims(np.asarray(cp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
-    except Exception:
-        pass
+    if previews:
+        try:
+            cp_rgb = src[y1:y2, x1:x2, :3].astype(np.int32)
+            cp_gray = ((cp_rgb[:,:,0] * 30 + cp_rgb[:,:,1] * 59 + cp_rgb[:,:,2] * 11 + 50) // 100).astype(np.uint8)
+            cp_img = Image.fromarray(cp_gray, mode="L")
+            cp_img = cp_img.resize((int(out_size), int(out_size)), Image.BILINEAR)
+            crop_preview = np.expand_dims(np.asarray(cp_img, dtype=np.uint8).astype(np.float32) / 255.0, axis=-1)
+        except Exception:
+            pass
 
     # ── Model-input pixels: device-exact transform ──────────────────────
     # Mirrors TFLite/image_provider.cpp crop_resize_bilinear() +
@@ -1094,6 +1122,7 @@ def prepare_inference_inputs(
     bg_dark_thresh: Optional[int] = None,
     bg_lum_thresh: Optional[int] = None,
     crop_mode: str = CROP_MODE_CENTER,
+    previews: bool = True,
 ) -> Dict[str, Any]:
     mode = normalize_preprocess_mode(preprocess_mode)
     roi: Any = None
@@ -1122,7 +1151,8 @@ def prepare_inference_inputs(
                                         bg_lum_thresh=use_lum,
                                         return_crop_box=True,
                                         fast_mode=fast_mode,
-                                        return_stats=True)
+                                        return_stats=True,
+                                        previews=previews)
     out: Dict[str, Any] = {"default": None, "mask_stats": None}
     stats: Any = None
     crop_norm: Any = None
@@ -1168,7 +1198,7 @@ def prepare_inference_inputs(
             box_result = preprocess_blue_diff_array(
                 arr, out_size=out_size, color_mode=color_mode, roi=None,
                 bg_dark_thresh=use_dark, bg_lum_thresh=use_lum,
-                return_crop_box=True, fast_mode=False,
+                return_crop_box=True, fast_mode=False, previews=previews,
             )
             if isinstance(box_result, tuple):
                 if len(box_result) >= 2 and box_result[1] is not None:

@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
+import mimetypes
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import queue
 import threading
 import time
+import traceback
+import uuid
 import zipfile
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 def _ensure_bundle_sys_path() -> None:
@@ -62,7 +69,7 @@ del _ensure_bundle_sys_path
 import numpy as np
 from PIL import Image, ImageOps
 
-from camera_permission import ensure_camera_access
+from camera_permission import ensure_camera_access, get_camera_access_status
 from serial_device import SerialFrameReader, list_serial_ports, parse_sync_header
 from dataset_io import (
     DEFAULT_IMG_SIZE_BY_PROJECT,
@@ -73,6 +80,7 @@ from dataset_io import (
     PROJECT_TYPE_OCR,
     PROJECT_TYPE_SIGN_OCR,
     app_data_dir,
+    infer_imported_data,
     is_glyph_project,
     default_img_size,
     project_header,
@@ -121,6 +129,13 @@ from ocr_preprocess import (
 # than duplicated in the frontend.
 SIGN_MATCH_TEXT = "🟢 YES — MATCH"
 SIGN_NOMATCH_TEXT = "🔴 NO — NOT MATCH"
+
+# Phase 1 desktop host + live-stream constants.  The shell is served by the
+# same ThreadingHTTPServer as the controller API so the SPA can use relative
+# URLs (no CORS, no iframe).
+SHELL_HTML_NAME = "AIoScout_UI_Shell.html"
+SERIAL_PORT_CACHE_S = 30.0
+LIVE_JPEG_QUALITY = 82
 
 # Template (EMNIST) sample seeding writes files whose names start with this,
 # which is how a re-seed can replace its own previous output without ever
@@ -194,6 +209,11 @@ class SessionConfig:
     # "ocr" = the integer-exact glyph pipeline in ocr_preprocess.  It is a
     # single dispatch key, not a fork of the surrounding lifecycle.
     project_type: str = PROJECT_TYPE_IMAGE
+    # Decoupled producer rates.  The sensor grabber runs continuously and
+    # publishes a preview at view_fps; /live/capture never waits for a new
+    # frame and hold-capture is paced by capture_fps on the client.
+    view_fps: float = 20.0
+    capture_fps: float = 6.0
 
 
 def _persist_webcam_choice(cfg: "SessionConfig") -> None:
@@ -571,6 +591,10 @@ def _generate_model_resolver_h(tflite_bytes: bytes) -> str:
 #   then revives a DEAD producer instead of serving the last frame forever.
 LIVE_IDLE_S = 15.0
 LIVE_STALE_S = 1.5
+# A closed session must not be resurrected by a late GET (the collect page's
+# 2.5 s MJPEG retry used to reopen the camera after returning Home).  Only an
+# explicit POST /live/activate or /live/config clears this window.
+LIVE_REOPEN_BLOCK_S = 10.0
 
 # Longest side a saved webcam sample keeps.  The saved PNG is the "Original
 # Sample" the user draws a Manual ROI on, so downsampling it to the model
@@ -582,9 +606,1217 @@ LIVE_STALE_S = 1.5
 CAPTURE_MAX_SIDE = 1024
 
 
+def _aioscout_shell_path() -> Optional[Path]:
+    """Locate the finalized single-file shell in dev and frozen layouts."""
+    candidates: List[Path] = []
+    env_path = os.environ.get("AIOSCOUT_UI_SHELL")
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(here / SHELL_HTML_NAME)
+        candidates.append(here.parent / SHELL_HTML_NAME)
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            base = Path(str(meipass))
+            candidates.append(base / SHELL_HTML_NAME)
+            candidates.append(base / "AItraining" / SHELL_HTML_NAME)
+        except Exception:
+            pass
+    try:
+        candidates.append(Path.cwd() / SHELL_HTML_NAME)
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.resolve()
+        except Exception:
+            continue
+    return None
+
+
+def _aioscout_asset_roots(shell_path: Optional[Path]) -> List[Path]:
+    roots: List[Path] = []
+    if shell_path is not None:
+        roots.append(shell_path.parent)
+        roots.append(shell_path.parent / "assets")
+    try:
+        here = Path(__file__).resolve().parent
+        roots.append(here / "assets")
+        roots.append(here.parent / "assets")
+    except Exception:
+        pass
+    out: List[Path] = []
+    seen = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def _fs_expand_path(raw: Any) -> Optional[Path]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = unquote(text)
+    try:
+        path = Path(os.path.expanduser(text))
+    except Exception:
+        return None
+    if not path.is_absolute():
+        try:
+            path = Path.cwd() / path
+        except Exception:
+            return None
+    try:
+        return path.resolve()
+    except Exception:
+        return path
+
+
+def _fs_allowed_roots() -> List[Path]:
+    roots: List[Path] = []
+    try:
+        roots.append(Path(app_data_dir()).resolve())
+    except Exception:
+        pass
+    try:
+        roots.append(Path.home().resolve())
+    except Exception:
+        pass
+    try:
+        roots.append(Path(tempfile.gettempdir()).resolve())
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            roots.append(Path("/Volumes").resolve())
+        except Exception:
+            pass
+    elif os.name == "nt":
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = Path(f"{letter}:\\")
+            try:
+                if drive.exists():
+                    roots.append(drive.resolve())
+            except Exception:
+                continue
+    else:
+        try:
+            roots.append(Path("/").resolve())
+        except Exception:
+            pass
+    try:
+        settings = _load_global_settings()
+        root = _fs_expand_path(settings.get("projectsRoot"))
+        if root is not None:
+            roots.append(root)
+    except Exception:
+        pass
+    out: List[Path] = []
+    seen = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+
+def _fs_path_allowed(path: Path, *, allow_missing_parent: bool = False, roots: Optional[List[Path]] = None) -> bool:
+    try:
+        candidate = path.resolve()
+    except Exception:
+        candidate = path
+    allowed_roots = roots if roots is not None else _fs_allowed_roots()
+    for root in allowed_roots:
+        try:
+            if candidate == root or root in candidate.parents:
+                return True
+        except Exception:
+            continue
+    if allow_missing_parent:
+        try:
+            parent = candidate.parent.resolve()
+        except Exception:
+            return False
+        for root in allowed_roots:
+            try:
+                if parent == root or root in parent.parents:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _fs_drive_entries() -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+
+    def add(name: str, path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved)
+        if key in seen or not resolved.exists() or not resolved.is_dir():
+            return
+        seen.add(key)
+        out.append({"name": str(name), "path": key})
+
+    try:
+        add("Home", Path.home())
+    except Exception:
+        pass
+    try:
+        add("Workspace", Path(app_data_dir()))
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            for child in sorted(Path("/Volumes").iterdir(), key=lambda p: p.name.lower()):
+                if child.is_dir():
+                    add(child.name, child)
+        except Exception:
+            pass
+    elif os.name == "nt":
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive = Path(f"{letter}:\\")
+            try:
+                if drive.exists():
+                    add(f"{letter}:", drive)
+            except Exception:
+                continue
+    else:
+        try:
+            add("Root", Path("/"))
+        except Exception:
+            pass
+    return out
+
+
+def _tmproj_zip_data(path: Path) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Dict[str, int]]:
+    manifest: Dict[str, Any] = {}
+    state: Dict[str, Any] = {}
+    latest: Optional[Dict[str, Any]] = None
+    image_counts: Dict[str, int] = {}
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = zf.namelist()
+            if "manifest.json" in names:
+                try:
+                    manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                except Exception:
+                    manifest = {}
+            if "tm_project_state.json" in names:
+                try:
+                    state = json.loads(zf.read("tm_project_state.json").decode("utf-8"))
+                except Exception:
+                    state = {}
+            if "tm_train_latest.json" in names:
+                try:
+                    latest = json.loads(zf.read("tm_train_latest.json").decode("utf-8"))
+                except Exception:
+                    latest = None
+            for name in names:
+                parts = name.split("/")
+                if len(parts) == 3 and parts[0] == "dataset" and parts[2]:
+                    suffix = Path(parts[2]).suffix.lower()
+                    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}:
+                        image_counts[parts[1]] = image_counts.get(parts[1], 0) + 1
+    except Exception:
+        return manifest, state, latest, image_counts
+    return manifest, state, latest, image_counts
+
+
+def _accuracy_percent(value: Any) -> Optional[float]:
+    """Run metadata stores a FRACTION (val_accuracy 0..1); the UI shows a
+    percentage.  Normalising here — once, where archives are summarised —
+    is what keeps a perfect model from displaying as `Trained · 1.0%`:
+    1.0 is 100 %, not 1 %.  The `<= 1.0` bound (not `< 1.0`) is deliberate."""
+    try:
+        acc = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(acc):
+        return None
+    if acc <= 1.0:
+        acc *= 100.0
+    return max(0.0, min(100.0, acc))
+
+
+def _tmproj_summary(path: Path) -> Dict[str, Any]:
+    manifest, state, latest, image_counts = _tmproj_zip_data(path)
+    header = read_project_header(manifest or state)
+    project_type = str((manifest or {}).get("project_type") or (state or {}).get("project_type") or header.get("project_type") or PROJECT_TYPE_IMAGE)
+    classes = [str(x) for x in ((state or {}).get("classes") or (manifest or {}).get("classes") or [])]
+    counts = (state or {}).get("counts") or {}
+    if not isinstance(counts, dict):
+        counts = {}
+    for name, count in image_counts.items():
+        counts.setdefault(name, int(count))
+    sample_count = sum(int(v or 0) for v in counts.values())
+    accuracy = None
+    if isinstance(latest, dict):
+        metrics = latest.get("metrics") if isinstance(latest.get("metrics"), dict) else {}
+        accuracy = _accuracy_percent(metrics.get("val_accuracy", latest.get("accuracy")))
+    if accuracy is None:
+        accuracy = _accuracy_percent(
+            (manifest or {}).get("accuracy") if manifest else (state or {}).get("accuracy")
+        )
+    return {
+        "manifest": manifest,
+        "state": state,
+        "latest": latest,
+        "project_type": project_type,
+        "classes": classes,
+        "counts": {str(k): int(v or 0) for k, v in counts.items()},
+        "sample_count": int(sample_count),
+        "accuracy": accuracy,
+        "trained": bool(latest),
+        "img_size": int((manifest or {}).get("img_size") or (state or {}).get("img_size") or default_img_size(project_type)),
+    }
+
+
+def _ui_preprocess_from_backend(raw: Any) -> Dict[str, Any]:
+    cfg = raw if isinstance(raw, dict) else {}
+    mode = str(cfg.get("mode") or "auto")
+    roi = cfg.get("manual_roi")
+    ui: Dict[str, Any] = {
+        "mode": "manual_roi" if mode == "manual_roi" else "auto",
+        "dark": int(cfg.get("bg_dark_thresh", 0) or 0),
+        "lum": int(cfg.get("bg_lum_thresh", 100) or 100),
+        "roi": {"x": 0.24, "y": 0.22, "w": 0.52, "h": 0.56},
+    }
+    if isinstance(roi, (list, tuple)) and len(roi) == 4:
+        try:
+            x1, y1, x2, y2 = [float(v) for v in roi]
+            ui["roi"] = {"x": x1, "y": y1, "w": max(0.04, x2 - x1), "h": max(0.04, y2 - y1)}
+        except Exception:
+            pass
+    return ui
+
+
+def _project_state_sidecar(path: Path) -> Optional[Path]:
+    try:
+        side = Path(path).parent / "tm_project_state.json"
+        return side if side.is_file() else None
+    except Exception:
+        return None
+
+
+def _project_effective_mtime(path: Path) -> float:
+    """Archive mtime, or the newer Tier-1 sidecar mtime when one exists."""
+    try:
+        stamp = Path(path).stat().st_mtime
+    except Exception:
+        stamp = 0.0
+    side = _project_state_sidecar(path)
+    if side is not None:
+        try:
+            stamp = max(stamp, side.stat().st_mtime)
+        except Exception:
+            pass
+    return stamp
+
+
+def _merge_live_project_state(summary: Dict[str, Any], path: Path) -> Dict[str, Any]:
+    """Let the Tier-1 sidecar override the archive's saved half.
+
+    Class/ROI mutations commit to ``tm_project_state.json`` without rewriting
+    the (image-bearing) archive.  The launcher must show the LIVE class list
+    after a restart, not the list that happened to be present at creation.
+    """
+    side = _project_state_sidecar(path)
+    if side is None:
+        return summary
+    try:
+        live = json.loads(side.read_text(encoding="utf-8"))
+    except Exception:
+        return summary
+    if not isinstance(live, dict):
+        return summary
+    state = summary.get("state")
+    merged = dict(state) if isinstance(state, dict) else {}
+    merged.update(live)
+    summary["state"] = merged
+    if isinstance(live.get("classes"), list) and live["classes"]:
+        summary["classes"] = [str(name) for name in live["classes"]]
+    counts = dict(summary.get("counts") or {})
+    live_counts = live.get("counts")
+    if isinstance(live_counts, dict):
+        for name, count in live_counts.items():
+            try:
+                counts[str(name)] = int(count or 0)
+            except Exception:
+                continue
+        summary["counts"] = counts
+    live_type = str(live.get("project_type") or "").strip().lower()
+    if live_type in KNOWN_PROJECT_TYPES:
+        summary["project_type"] = live_type
+    return summary
+
+
+def _recent_project_entry(path: Path) -> Dict[str, Any]:
+    summary = _merge_live_project_state(_tmproj_summary(path), path)
+    project_type = str(summary.get("project_type") or PROJECT_TYPE_IMAGE)
+    class_preprocess = (summary.get("state") or {}).get("class_preprocess") or {}
+    sample_preprocess = (summary.get("state") or {}).get("sample_preprocess") or {}
+    classes = []
+    counts = summary.get("counts") or {}
+    for name in summary.get("classes") or list(counts.keys()):
+        cls_pre = class_preprocess.get(name) if isinstance(class_preprocess, dict) else None
+        classes.append({
+            "id": uuid.uuid5(uuid.NAMESPACE_URL, f"{path}:{name}").hex,
+            "name": str(name),
+            "samples": int(counts.get(name, 0) or 0),
+            "glyph": str(name)[:3].upper(),
+            "preprocess": _ui_preprocess_from_backend(cls_pre),
+            "samplePreprocess": {},
+            "licensed": project_type == PROJECT_TYPE_SIGN_OCR,
+        })
+    train_cfg = (summary.get("state") or {}).get("train_cfg") or {}
+    img_size = int(summary.get("img_size") or default_img_size(project_type))
+    default_color = "rgb" if project_type == PROJECT_TYPE_IMAGE else "grayscale"
+    channels = 1 if str(train_cfg.get("color_mode") or default_color) in {"grayscale", "gray", "l", "1"} else 3
+    folder = str(path.parent)
+    accuracy = summary.get("accuracy")
+    return {
+        "id": uuid.uuid5(uuid.NAMESPACE_URL, str(path)).hex,
+        "name": path.name,
+        "type": "car" if project_type == PROJECT_TYPE_SIGN_OCR else project_type,
+        "project_type": project_type,
+        "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(_project_effective_mtime(path))) if path.exists() else "",
+        "path": str(path),
+        "folder": folder,
+        "exportsDir": str(path.parent / "exports"),
+        "backupDir": str(path.parent / "backup"),
+        "backups": [],
+        "trained": bool(summary.get("trained")),
+        "accuracy": accuracy,
+        "finalLoss": None,
+        "classes": classes,
+        "settings": {
+            "frameSide": f"{img_size} × {img_size}" if project_type == PROJECT_TYPE_IMAGE else "28 × 28",
+            "channels": channels,
+            "reading_order": str(train_cfg.get("reading_order") or "ltr"),
+            "fps": 8,
+            "camera": "ESP32-P4 Serial or USB Webcam (UVC)",
+            "port": "",
+            "baud": 115200,
+            "syncWord": "AA 55 AA",
+            "ood": {"maxProb": 0.40, "entropy": 0.85, "signMin": 0.3, "signMax": 70},
+            "emnist": {
+                "enabled": bool(train_cfg.get("ocr_emnist_enabled", True)),
+                "perClass": int(train_cfg.get("ocr_emnist_per_class", 200) or 200),
+            },
+        },
+        "train_cfg": {
+            "reading_order": str(train_cfg.get("reading_order") or "ltr"),
+            "sign_sequences": list(train_cfg.get("sign_sequences") or []) if project_type == PROJECT_TYPE_SIGN_OCR else [],
+        },
+        "licenses": [
+            {"id": uuid.uuid5(uuid.NAMESPACE_URL, f"{path}:license:{plate}").hex, "plate": str(plate)}
+            for plate in (train_cfg.get("sign_sequences") or [])
+        ] if project_type == PROJECT_TYPE_SIGN_OCR else [],
+    }
+
+
+def _global_settings_path() -> Path:
+    return Path(app_data_dir()) / "global_settings.json"
+
+
+def _default_global_settings() -> Dict[str, Any]:
+    return {
+        "appearance": "system",
+        "autoBackup": True,
+        "retention": "5",
+        "projectsRoot": str(Path.home() / "Projects" / "AIoScout"),
+        "compute": "auto",
+        "workers": "auto",
+        "offline": False,
+        "verbosity": "info",
+        # Explorer preference.  Dotfiles/OS-hidden entries are hidden unless
+        # the user flips the Global Settings toggle.
+        "show_hidden_files": False,
+    }
+
+
+def _load_global_settings() -> Dict[str, Any]:
+    out = _default_global_settings()
+    try:
+        raw = json.loads(_global_settings_path().read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for key in list(out.keys()):
+                if key in raw:
+                    out[key] = raw[key]
+    except Exception:
+        pass
+    return out
+
+
+def _save_global_settings(patch: Dict[str, Any]) -> Dict[str, Any]:
+    settings = _load_global_settings()
+    if isinstance(patch, dict):
+        for key in list(_default_global_settings().keys()):
+            if key in patch:
+                settings[key] = patch[key]
+    settings["retention"] = str(settings.get("retention") or "5")
+    path = _global_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return settings
+
+
+# ── Recent-project MRU (disk-backed) ────────────────────────────────────────
+# `GET /projects/recent` used to rebuild its list purely by walking the disk.
+# That scan is unbounded and, on a cold cache, walked the app-data `workspace`
+# tree (48 GB / 441k files, none of them projects) for ~7.9 s — longer than the
+# SPA's 5 s fetch timeout, so the launcher rendered "NO .TMPROJ FILES YET" on
+# every restart.  The MRU below is the authoritative, cheap list; the shallow
+# scan only recovers projects the MRU has never seen.
+_EPHEMERAL_TEMP_MARKERS = (
+    "/private/var/folders/",
+    "/var/folders/",
+    "/private/tmp/",
+    "/tmp/",
+    "/private/var/tmp/",
+    "/var/tmp/",
+)
+
+
+def _canonical_path(raw: Any) -> Optional[Path]:
+    """Resolve symlinks (/var → /private/var) to one canonical spelling."""
+    try:
+        return Path(os.path.realpath(str(Path(str(raw)).expanduser())))
+    except Exception:
+        return None
+
+
+def _is_ephemeral_path(path: Any) -> bool:
+    canonical = _canonical_path(path)
+    text = str(canonical if canonical is not None else path)
+    if "pytest-of-" in text:
+        return True
+    try:
+        temp_root = _canonical_path(tempfile.gettempdir())
+        if temp_root is not None and (text == str(temp_root) or text.startswith(str(temp_root) + os.sep)):
+            return True
+    except Exception:
+        pass
+    return any(text.startswith(prefix) for prefix in _EPHEMERAL_TEMP_MARKERS)
+
+
+def _allow_ephemeral_projects() -> bool:
+    """Temp projects stay visible only in a genuinely isolated test profile.
+
+    The real profile (real ``app_data_dir``) must NEVER record an OS temp
+    project, even if a stray test timer fires after its env override was
+    restored.  Tests get a temp app-data dir from ``tests/conftest.py``, so
+    both conditions hold only there.
+    """
+    try:
+        if not _is_ephemeral_path(app_data_dir()):
+            return False
+    except Exception:
+        return False
+    if os.getenv("TFLITE_ALLOW_TEMP_PROJECTS") == "1":
+        return True
+    try:
+        root = _load_global_settings().get("projectsRoot")
+        return bool(root) and _is_ephemeral_path(root)
+    except Exception:
+        return False
+
+
+def _recent_projects_mru_path() -> Path:
+    return Path(app_data_dir()) / "recent_projects.json"
+
+
+def _recent_mru_load() -> List[Dict[str, Any]]:
+    try:
+        raw = json.loads(_recent_projects_mru_path().read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries = raw.get("projects") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    dirty = False
+    allow_temp = _allow_ephemeral_projects()
+    for item in entries:
+        if not isinstance(item, dict):
+            dirty = True
+            continue
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            dirty = True
+            continue
+        canonical = _canonical_path(raw_path)
+        if canonical is None:
+            dirty = True
+            continue
+        key = str(canonical)
+        if key in seen:
+            dirty = True
+            continue
+        if not allow_temp and _is_ephemeral_path(canonical):
+            # A previous test run (or a temp workspace) must never pollute
+            # the real Recent list.
+            dirty = True
+            continue
+        seen.add(key)
+        folder = _canonical_path(item.get("folder")) or canonical.parent
+        out.append({
+            "path": key,
+            "folder": str(folder),
+            "name": str(item.get("name") or canonical.name),
+            "at": int(item.get("at") or 0),
+        })
+    if dirty:
+        # Persist the cleanup on read so the polluted file heals itself.
+        _recent_mru_save(out)
+    return out
+
+
+def _recent_mru_save(entries: List[Dict[str, Any]]) -> None:
+    path = _recent_projects_mru_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {"version": 1, "projects": list(entries)[:200]}
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _recent_is_backup_path(path: Path) -> bool:
+    """Backup snapshots live in ./backup/ and belong in /backup/list only."""
+    try:
+        parts = [str(part).lower() for part in Path(path).parts]
+    except Exception:
+        return False
+    if "backup" in parts:
+        return True
+    return str(Path(path).name).lower().startswith("backup_")
+
+
+def _recent_has_hidden_part(path: Path, root: Optional[Path] = None) -> bool:
+    try:
+        target = Path(path)
+        if root is not None:
+            try:
+                target = target.resolve().relative_to(Path(root).resolve())
+            except Exception:
+                target = Path(path)
+        return any(str(part).startswith(".") and part not in {".", ".."} for part in target.parts)
+    except Exception:
+        return False
+
+
+def _recent_mru_touch(path: Optional[Path], *, folder: Optional[Path] = None) -> None:
+    """Move an existing project archive to the head of the MRU list."""
+    if path is None:
+        return
+    resolved = _canonical_path(path)
+    if resolved is None:
+        return
+    if not resolved.is_file() or _recent_is_backup_path(resolved):
+        return
+    if not _allow_ephemeral_projects() and _is_ephemeral_path(resolved):
+        return
+    folder_path = _canonical_path(folder) if folder is not None else resolved.parent
+    entry = {
+        "path": str(resolved),
+        "folder": str(folder_path or resolved.parent),
+        "name": resolved.name,
+        "at": int(time.time()),
+    }
+    entries = [item for item in _recent_mru_load() if item.get("path") != entry["path"]]
+    entries.insert(0, entry)
+    _recent_mru_save(entries)
+
+
+def _existing_project_archive(dataset_root: Path) -> Optional[Path]:
+    """Return the project's own `.tmproj` when one is already on disk."""
+    try:
+        folder = Path(dataset_root).parent
+        preferred = folder / f"{folder.name}.tmproj"
+        if preferred.is_file():
+            return preferred
+        candidates = sorted(folder.glob("*.tmproj"))
+        return candidates[0] if candidates else None
+    except Exception:
+        return None
+
+
+def _synthesize_project_archive(folder: Path) -> Optional[Path]:
+    """Create a metadata-only `.tmproj` for a valid project folder.
+
+    A folder with `dataset/` (and/or the sidecar state files) is a real
+    project even when its archive was deleted or was never written (old
+    builds).  The archive is synthesized from the sidecars so the launcher
+    can always reopen it; the live dataset remains the source of truth.
+    """
+    try:
+        folder = Path(folder).expanduser().resolve()
+    except Exception:
+        return None
+    if not folder.is_dir() or _recent_is_backup_path(folder):
+        return None
+    target = folder / f"{folder.name}.tmproj"
+    if target.is_file():
+        return target
+    dataset_root = folder / "dataset"
+    state: Dict[str, Any] = {}
+    state_path = folder / "tm_project_state.json"
+    if state_path.is_file():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except Exception:
+            state = {}
+    classes_meta: Dict[str, Any] = {}
+    classes_meta_path = folder / "tm_classes.json"
+    if classes_meta_path.is_file():
+        try:
+            loaded = json.loads(classes_meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                classes_meta = loaded
+        except Exception:
+            classes_meta = {}
+    classes_raw = state.get("classes") or classes_meta.get("classes")
+    classes: List[str] = []
+    if isinstance(classes_raw, list):
+        classes = [str(name) for name in classes_raw if str(name).strip()]
+    if not classes and dataset_root.is_dir():
+        try:
+            classes = sorted(
+                p.name for p in dataset_root.iterdir()
+                if p.is_dir() and _list_class_image_files(p)
+            )
+        except Exception:
+            classes = []
+    if not classes:
+        return None
+    counts: Dict[str, int] = {}
+    for name in classes:
+        try:
+            counts[name] = len(_list_class_image_files(dataset_root / sanitize_class_name(name)))
+        except Exception:
+            counts[name] = 0
+    project_type = str(state.get("project_type") or "").strip().lower()
+    if project_type not in KNOWN_PROJECT_TYPES:
+        project_type = PROJECT_TYPE_IMAGE
+    train_cfg = state.get("train_cfg") if isinstance(state.get("train_cfg"), dict) else {}
+    try:
+        img_size = int(
+            train_cfg.get("img_size")
+            or state.get("img_size")
+            or default_img_size(project_type)
+            or 96
+        )
+    except Exception:
+        img_size = int(default_img_size(project_type) or 96)
+    class_preprocess = (
+        classes_meta.get("class_preprocess")
+        if isinstance(classes_meta.get("class_preprocess"), dict)
+        else state.get("class_preprocess")
+        if isinstance(state.get("class_preprocess"), dict)
+        else {}
+    )
+    sample_preprocess = (
+        classes_meta.get("sample_preprocess")
+        if isinstance(classes_meta.get("sample_preprocess"), dict)
+        else state.get("sample_preprocess")
+        if isinstance(state.get("sample_preprocess"), dict)
+        else {}
+    )
+    state = dict(state)
+    state.update({
+        "project_type": project_type,
+        "classes": classes,
+        "counts": counts,
+        "class_preprocess": class_preprocess,
+        "sample_preprocess": sample_preprocess,
+        "train_cfg": train_cfg or {"project_type": project_type, "img_size": img_size},
+    })
+    state.update(project_header(project_type))
+    manifest = {
+        **project_header(project_type),
+        "format": "tmproj",
+        "img_size": int(img_size),
+        "created_at": int(time.time()),
+        "dataset_dir": "dataset",
+        "dataset_labels_txt": "dataset/labels.txt",
+        "dataset_labels_json": "dataset/labels.json",
+        "classes_meta": "tm_classes.json" if classes_meta_path.is_file() else "",
+        "project_state": "tm_project_state.json",
+        "sample_count": int(sum(counts.values())),
+        "class_count": len(classes),
+        "synthesized": True,
+    }
+    tmp = target.with_suffix(".tmproj.tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            zf.writestr("tm_project_state.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+            if classes_meta_path.is_file():
+                zf.write(classes_meta_path, arcname="tm_classes.json")
+            zf.writestr("dataset/labels.txt", "\n".join(classes) + ("\n" if classes else ""))
+            zf.writestr(
+                "dataset/labels.json",
+                json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n",
+            )
+        tmp.replace(target)
+        return target
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
+def _eula_flag_path() -> Path:
+    return Path(app_data_dir()) / "eula_accepted.flag"
+
+
+def _eula_text_path() -> Optional[Path]:
+    candidates: List[Path] = []
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(here / "EULA.md")
+        candidates.append(here.parent / "EULA.md")
+    except Exception:
+        pass
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            candidates.append(Path(str(meipass)) / "EULA.md")
+        except Exception:
+            pass
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _logs_tail(lines: int = 80) -> Dict[str, Any]:
+    limit = max(1, min(500, int(lines or 80)))
+    candidates: List[Path] = []
+    try:
+        base = Path(app_data_dir()) / "logs"
+        candidates.extend([base / "aioscout.log", base / "streamlit.log"])
+    except Exception:
+        pass
+    candidates.append(Path(tempfile.gettempdir()) / "TFLiteTraining" / "logs" / "streamlit.log")
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            tail = text.splitlines()[-limit:]
+            return {"ok": "1", "path": str(candidate), "lines": tail}
+        except Exception:
+            continue
+    return {"ok": "1", "path": "", "lines": []}
+
+
+def _fs_is_hidden(path: Path) -> bool:
+    """Dot-prefixed OR the platform's own hidden attribute."""
+    name = path.name
+    if not name:
+        return False
+    if name.startswith("."):
+        return True
+    try:
+        if sys.platform == "darwin":
+            # UF_HIDDEN (0x8000) — Finder hidden, e.g. ~/Library.
+            return bool(int(getattr(os.stat(path), "st_flags", 0)) & 0x8000)
+        if os.name == "nt":
+            import ctypes
+
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            return bool(int(attrs) & 0x2)  # FILE_ATTRIBUTE_HIDDEN
+    except Exception:
+        return False
+    return False
+
+
+def _fs_entry_payload(path: Path) -> Dict[str, Any]:
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+    except Exception:
+        return {}
+    is_dir = resolved.is_dir()
+    item_count = 0
+    if is_dir:
+        try:
+            item_count = sum(1 for _ in resolved.iterdir())
+        except Exception:
+            item_count = 0
+    suffix = resolved.suffix.lower()
+    kind = "dir" if is_dir else ("tmproj" if suffix == ".tmproj" else ("image" if suffix in IMAGE_EXTS else "file"))
+    out: Dict[str, Any] = {
+        "name": resolved.name,
+        "path": str(resolved),
+        "is_dir": bool(is_dir),
+        "size": 0 if is_dir else int(stat.st_size),
+        "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "item_count": int(item_count),
+        "kind": kind,
+        "project_type": "",
+        "manifest": None,
+    }
+    if kind == "tmproj":
+        try:
+            summary = _tmproj_summary(resolved)
+            out["project_type"] = str(summary.get("project_type") or "")
+            out["manifest"] = {
+                "version": str((summary.get("manifest") or {}).get("version") or PROJECT_FORMAT_LEGACY),
+                "project_type": out["project_type"],
+                "classes": summary.get("classes") or [],
+                "class_count": len(summary.get("classes") or []),
+                "sample_count": int(summary.get("sample_count") or 0),
+                "accuracy": summary.get("accuracy"),
+                "trained": bool(summary.get("trained")),
+            }
+        except Exception:
+            pass
+    elif is_dir:
+        # A project FOLDER is selectable too: OPEN accepts either the folder
+        # or its .tmproj.  Surface the archive so the picker can show/confirm.
+        try:
+            archives = sorted(resolved.glob("*.tmproj"))
+        except Exception:
+            archives = []
+        if archives:
+            try:
+                summary = _tmproj_summary(archives[0])
+                out["project_type"] = str(summary.get("project_type") or "")
+                out["project_file"] = archives[0].name
+                out["manifest"] = {
+                    "version": str((summary.get("manifest") or {}).get("version") or PROJECT_FORMAT_LEGACY),
+                    "project_type": out["project_type"],
+                    "classes": summary.get("classes") or [],
+                    "class_count": len(summary.get("classes") or []),
+                    "sample_count": int(summary.get("sample_count") or 0),
+                    "accuracy": summary.get("accuracy"),
+                    "trained": bool(summary.get("trained")),
+                }
+            except Exception:
+                pass
+    return out
+
+
+def _fs_list_payload(path: Path, show_hidden: bool = False) -> Dict[str, Any]:
+    entries = []
+    roots = _fs_allowed_roots()
+    try:
+        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except Exception as e:
+        return {"ok": "0", "error": str(e), "entries": []}
+    for child in children[:2000]:
+        try:
+            if not _fs_path_allowed(child, roots=roots):
+                continue
+            if not show_hidden and _fs_is_hidden(child):
+                continue
+        except Exception:
+            continue
+        entry = _fs_entry_payload(child)
+        if entry:
+            entries.append(entry)
+    return {"ok": "1", "path": str(path), "entries": entries, "show_hidden": "1" if show_hidden else "0"}
+
+
+def _recent_projects_payload(limit: int = 50, show_hidden: Optional[bool] = None) -> Dict[str, Any]:
+    """Merge the persistent MRU with a SHALLOW scan of the project roots.
+
+    The previous implementation ran ``root.rglob('*.tmproj')`` over every
+    configured root, including ``app_data_dir()/workspace`` — the importer's
+    staging tree, which in a real profile holds 441k files and no project
+    archives.  A cold page cache made that scan take ~7.9 s, longer than the
+    SPA's fetch timeout, so the launcher rendered "NO .TMPROJ FILES YET" on
+    every restart even though the archives were on disk.  Depth is now capped
+    at two levels, that staging root is skipped, and the MRU provides the
+    authoritative ordering for projects outside the scanned roots.
+    """
+    try:
+        limit = max(1, min(200, int(limit or 50)))
+    except Exception:
+        limit = 50
+    settings = _load_global_settings()
+    if show_hidden is None:
+        show_hidden = bool(settings.get("show_hidden_files"))
+    allow_temp = _allow_ephemeral_projects()
+
+    mru = _recent_mru_load()
+    roots: List[Path] = []
+    seen_roots: set = set()
+
+    def add_root(raw: Any) -> None:
+        try:
+            p = _fs_expand_path(raw)
+        except Exception:
+            p = None
+        if p is None:
+            return
+        try:
+            p = p.resolve()
+        except Exception:
+            pass
+        # Never scan an OS temp tree in production: that is where test
+        # workspaces live, and they must not leak into the launcher.
+        if not allow_temp and _is_ephemeral_path(p):
+            return
+        try:
+            if not p.is_dir():
+                return
+            key = str(p)
+            if key in seen_roots:
+                return
+            seen_roots.add(key)
+            roots.append(p)
+        except Exception:
+            return
+
+    add_root(settings.get("projectsRoot"))
+    for entry in mru:
+        add_root(entry.get("folder"))
+        try:
+            add_root(Path(str(entry.get("path") or "")).parent)
+        except Exception:
+            pass
+    add_root(str(Path(app_data_dir()) / "Projects"))
+    add_root(str(Path.home() / "Projects" / "AIoScout"))
+    # app_data_dir()/workspace is intentionally NOT scanned: it is the
+    # importer staging area and never contains a project archive.
+
+    paths: List[Path] = []
+    seen: set = set()
+
+    def add_path(raw: Any) -> None:
+        p = _canonical_path(raw)
+        if p is None:
+            return
+        try:
+            if not p.is_file() or p.suffix.lower() != ".tmproj":
+                return
+            if _recent_is_backup_path(p):
+                return
+            if not allow_temp and _is_ephemeral_path(p):
+                return
+            if not show_hidden and _recent_has_hidden_part(p, root=p.parent.parent):
+                return
+            if not _fs_path_allowed(p):
+                return
+            key = str(p)
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(p)
+        except Exception:
+            return
+
+    for root in roots:
+        try:
+            for p in root.glob("*.tmproj"):
+                add_path(p)
+            for child in root.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name in {"dataset", "exports", "backup", ".git"}:
+                    continue
+                if not show_hidden and child.name.startswith("."):
+                    continue
+                found = False
+                for p in child.glob("*.tmproj"):
+                    add_path(p)
+                    found = True
+                if not found and (
+                    (child / "dataset").is_dir()
+                    or (child / "tm_project_state.json").is_file()
+                ):
+                    synthesized = _synthesize_project_archive(child)
+                    if synthesized is not None:
+                        add_path(synthesized)
+        except Exception:
+            continue
+
+    for entry in mru:
+        add_path(entry.get("path"))
+
+    live = {str(p) for p in paths}
+    pruned = [entry for entry in mru if str(entry.get("path")) in live]
+    if len(pruned) != len(mru):
+        _recent_mru_save(pruned)
+
+    ordered: List[Path] = []
+    for p in paths:
+        try:
+            if p.is_file():
+                ordered.append(p)
+        except Exception:
+            continue
+    ordered.sort(key=_project_effective_mtime, reverse=True)
+
+    projects = []
+    for p in ordered[:limit]:
+        try:
+            projects.append(_recent_project_entry(p))
+        except Exception:
+            continue
+    return {
+        "ok": "1",
+        "projects": projects,
+        "root": str(roots[0]) if roots else "",
+        "scanned": str(len(ordered)),
+    }
+
+
+def _cv2_single_threaded(cv2_module: Any) -> None:
+    """Disable OpenCV's internal pools inside a Cocoa/threaded host.
+
+    OpenCV's TBB/OpenMP workers plus TensorFlow's thread pools are a known
+    Apple-Silicon deadlock pair (notably when a camera grabber runs while a
+    training worker imports TensorFlow).  The grabber is I/O-bound; 0 lets
+    OpenCV use the calling thread only.
+    """
+    try:
+        cv2_module.setNumThreads(0)
+    except Exception:
+        pass
+
+
+def _controller_log(message: str) -> None:
+    """Append a line to the same aioscout.log the launcher writes."""
+    try:
+        path = Path(app_data_dir()) / "logs" / "aioscout.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except Exception:
+        pass
+
+
+def _preview_stage_image_b64(
+    pred: Dict[str, Any],
+    full_raw_b64: str,
+    view_roi: bool,
+    view_orig: bool,
+) -> str:
+    """Exact (ROI × Orig) stage image.
+
+    (roi=0, orig=1) full raw
+    (roi=0, orig=0) full threshold-processed
+    (roi=1, orig=1) cropped raw
+    (roi=1, orig=0) cropped threshold-processed
+    """
+    if view_roi and view_orig:
+        b64 = pred.get("crop_image_b64")
+    elif view_roi:
+        b64 = pred.get("processed_image_b64")
+    elif view_orig:
+        b64 = full_raw_b64
+    else:
+        b64 = (
+            pred.get("full_image_b64")
+            or pred.get("processed_image_b64")
+            or full_raw_b64
+        )
+    return str(b64 or "")
+
+
+# ── Live ROI stabilization ──────────────────────────────────────────────
+# The live auto-ROI is not an estimate to be trusted frame by frame: sensor
+# noise moves a detected box by a pixel or two, and a frame with NO sign in
+# view has no box to find at all, so the detector wanders between unrelated
+# dark blobs (hair, shadows) and the full-frame fallback.  Drawn raw, that
+# reads as a broken instrument.  Three rules fix it:
+#
+#   deadband  a change below ROI_DEADBAND_IOU is jitter → keep the box
+#   EMA       a real, moderate change is blended (alpha = ROI_EMA_ALPHA)
+#   snap      a scene change (IoU < ROI_SNAP_IOU) must persist for
+#             ROI_SNAP_FRAMES frames before the box jumps to it
+#
+# Only LIVE sources (webcam/device) are stabilized; an upload or synth
+# frame is static and is returned exactly as detected.
+ROI_EMA_ALPHA = 0.35
+ROI_DEADBAND_IOU = 0.985
+ROI_SNAP_IOU = 0.30
+ROI_SNAP_FRAMES = 2
+
+
+def _roi_iou(a: Any, b: Any) -> float:
+    """Intersection-over-union of two normalized (x1, y1, x2, y2) boxes."""
+    try:
+        ax1, ay1, ax2, ay2 = (float(v) for v in a)
+        bx1, by1, bx2, by2 = (float(v) for v in b)
+    except Exception:
+        return 0.0
+    iw = min(ax2, bx2) - max(ax1, bx1)
+    ih = min(ay2, by2) - max(ay1, by1)
+    if iw <= 0.0 or ih <= 0.0:
+        return 0.0
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0.0 else 0.0
+
+
+def _roi_union(boxes: List[List[float]]) -> Optional[List[float]]:
+    if not boxes:
+        return None
+    return [
+        min(float(b[0]) for b in boxes),
+        min(float(b[1]) for b in boxes),
+        max(float(b[2]) for b in boxes),
+        max(float(b[3]) for b in boxes),
+    ]
+
+
+def _roi_blend(prev: List[float], new: List[float], alpha: float = ROI_EMA_ALPHA) -> List[float]:
+    return [float(alpha) * float(n) + (1.0 - float(alpha)) * float(p) for p, n in zip(prev, new)]
+
+
+def _jpeg_bytes_from_png(png: bytes, quality: int = LIVE_JPEG_QUALITY) -> Optional[bytes]:
+    try:
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        bio = io.BytesIO()
+        img.save(bio, format="JPEG", quality=int(quality), optimize=False)
+        return bio.getvalue()
+    except Exception:
+        return None
+
+
 class RecordController:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._stream_gen = 0
+        self._active_streams = 0
         self._configs: Dict[str, SessionConfig] = {}
         self._active: Dict[str, Dict[str, Any]] = {}
         self._live: Dict[str, Dict[str, Any]] = {}
@@ -594,6 +1826,9 @@ class RecordController:
         self._record_conds: Dict[str, threading.Condition] = {}
         self._train: Dict[str, Dict[str, Any]] = {}
         self._train_conds: Dict[str, threading.Condition] = {}
+        # Cooperative cancellation: one Event per active run.  It is set by
+        # POST /train/cancel and polled by the trainer's Keras callback.
+        self._train_cancels: Dict[str, threading.Event] = {}
         self._preview: Dict[str, Dict[str, Any]] = {}
         self._preview_locks: Dict[str, threading.Lock] = {}
         # The most recent uploaded Preview image per session.  /preview/upload
@@ -601,9 +1836,93 @@ class RecordController:
         # re-run inference on the SAME picture without re-uploading it; the
         # SPA sends reuse=1 for those re-evaluations.
         self._preview_uploads: Dict[str, Dict[str, Any]] = {}
+        self._preview_sig: Dict[str, Any] = {}
+        # Per (session, pipeline) box history for the live ROI EMA/hysteresis
+        # in _stabilize_live_boxes(), and one decoded frame per live source so
+        # a 15-20 FPS preview does not re-open the same PNG every tick.
+        self._roi_track: Dict[str, Dict[str, Any]] = {}
+        self._preview_decode: Dict[str, Dict[str, Any]] = {}
+        # Lock-free-ish latest-frame slot per live producer.  A tuple/dict
+        # assignment under this tiny lock is O(1); /live/capture never waits
+        # for a camera read.
+        self._latest_frame_lock = threading.Lock()
+        self._latest_capture_frames: Dict[str, Dict[str, Any]] = {}
+        # Capture responses return a tiny inline thumbnail immediately; the
+        # full-resolution PNG is written by this dedicated I/O worker.
+        self._capture_write_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self._capture_write_lock = threading.Lock()
+        self._capture_write_cond = threading.Condition(self._capture_write_lock)
+        self._capture_write_pending = 0
+        self._capture_name_lock = threading.Lock()
+        self._capture_name_seq: Dict[str, int] = {}
+        self._capture_writer = threading.Thread(
+            target=self._capture_writer_loop, daemon=True
+        )
+        self._capture_writer.start()
+        # Tier-1 auto-commit: coalesce class/ROI mutations into one lightweight
+        # tm_project_state.json write ~500 ms later instead of rebuilding the
+        # whole .tmproj archive (and its image payload) on every edit.
+        self._meta_timers: Dict[str, threading.Timer] = {}
+        self._meta_timer_lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._port: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
+        # Phase 1: single-origin host / filesystem / serial cache / live loop.
+        self._shell_path: Optional[Path] = None
+        self._asset_roots: List[Path] = []
+        self._serial_ports_cache: Optional[List[Dict[str, str]]] = None
+        self._serial_ports_cache_at = 0.0
+        self._serial_ports_lock = threading.Lock()
+        self._active_source: Dict[str, str] = {}
+        # session -> monotonic close timestamp; blocks implicit hardware
+        # re-open from a stale MJPEG/preview GET.
+        self._live_closed_at: Dict[str, float] = {}
+        # Backup snapshots are written/pruned under their own lock so a slow
+        # zip never blocks live frame delivery.
+        self._backup_lock = threading.RLock()
+        # Optional quit hook installed by desktop_launcher (destroys the
+        # pywebview window).  The HTTP fallback uses it when the JS bridge is
+        # unavailable; without it the controller still exits the process.
+        self._quit_handler: Optional[Any] = None
+        # Optional window-mode hook installed by desktop_launcher.  The HTTP
+        # fallback resizes the frameless window when the JS bridge is late.
+        self._window_mode_handler: Optional[Any] = None
+
+    def set_quit_handler(self, handler: Any) -> None:
+        self._quit_handler = handler
+
+    def set_window_mode_handler(self, handler: Any) -> None:
+        self._window_mode_handler = handler
+
+    def request_window_mode(self, mode: str) -> bool:
+        with self._lock:
+            handler = self._window_mode_handler
+        if handler is None:
+            return False
+        try:
+            handler(str(mode))
+            return True
+        except Exception:
+            return False
+
+    def request_quit(self) -> None:
+        with self._lock:
+            handler = self._quit_handler
+
+        def _run() -> None:
+            time.sleep(0.15)
+            if handler is not None:
+                try:
+                    handler()
+                except Exception:
+                    pass
+            try:
+                self.release_all_resources()
+            except Exception:
+                pass
+            os._exit(0)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     @property
     def port(self) -> int:
@@ -613,6 +1932,13 @@ class RecordController:
 
     def stop(self) -> None:
         """Shut the HTTP server down and join its thread (hot-reload support)."""
+        # Flush before the workspace can be removed by an owner that treats
+        # stop() as the end of the controller's life (tests, hot reload).
+        try:
+            self._flush_capture_writes(timeout=5.0)
+        except Exception:
+            pass
+        self._flush_pending_meta_commits()
         with self._lock:
             server = self._server
             thread = self._thread
@@ -664,6 +1990,8 @@ class RecordController:
         with self._lock:
             if self._server is not None:
                 return
+            self._shell_path = _aioscout_shell_path()
+            self._asset_roots = _aioscout_asset_roots(self._shell_path)
             host = "127.0.0.1"
             port = _find_free_port(host)
             server = ThreadingHTTPServer((host, port), self._make_handler())
@@ -692,6 +2020,8 @@ class RecordController:
         direct_tensor_stream: Optional[bool] = None,
         project_type: Optional[str] = None,
         fps: Optional[float] = None,
+        view_fps: Optional[float] = None,
+        capture_fps: Optional[float] = None,
     ) -> SessionConfig:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -702,6 +2032,8 @@ class RecordController:
                 cfg,
                 project_type=str(cfg.project_type if project_type is None else project_type),
                 fps=float(cfg.fps if fps is None else fps),
+                view_fps=float(getattr(cfg, "view_fps", 20.0) if view_fps is None else view_fps),
+                capture_fps=float(getattr(cfg, "capture_fps", 6.0) if capture_fps is None else capture_fps),
                 webcam_index=int(cfg.webcam_index if webcam_index is None else webcam_index),
                 webcam_id=(str(cfg.webcam_id) if cfg.webcam_id else "") if webcam_id is None else str(webcam_id),
                 img_size=int(cfg.img_size if img_size is None else img_size),
@@ -769,6 +2101,8 @@ class RecordController:
         if not ok or frame is None:
             return None
         import cv2
+
+        _cv2_single_threaded(cv2)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         cfg = self.get_config(session_id) if session_id else None
         frame = _center_crop_webcam_square(
@@ -798,6 +2132,226 @@ class RecordController:
             return _to_png_bytes(img)
         except Exception:
             return None
+
+    # ── Phase 1: single-origin shell host ────────────────────────────────
+    def _serve_shell(self, req: BaseHTTPRequestHandler) -> None:
+        path = self._shell_path or _aioscout_shell_path()
+        if path is None:
+            _send_bytes(req, b"AIoScout_UI_Shell.html not found in this build.", "text/plain; charset=utf-8", status=404)
+            return
+        try:
+            data = path.read_bytes()
+        except Exception as e:
+            _send_bytes(req, f"Unable to read shell: {e}".encode("utf-8"), "text/plain; charset=utf-8", status=500)
+            return
+        _send_bytes(req, data, "text/html; charset=utf-8", cache_control="no-store, max-age=0")
+
+    def _serve_asset(self, req: BaseHTTPRequestHandler, rel_path: str) -> None:
+        rel = unquote(str(rel_path or "")).lstrip("/\\")
+        parts = Path(rel).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            _send_bytes(req, b"not found", "text/plain; charset=utf-8", status=404)
+            return
+        for root in self._asset_roots or _aioscout_asset_roots(self._shell_path):
+            try:
+                candidate = (root / rel).resolve()
+            except Exception:
+                continue
+            try:
+                if root not in candidate.parents and candidate != root:
+                    continue
+            except Exception:
+                continue
+            if not candidate.is_file():
+                continue
+            data = candidate.read_bytes()
+            ctype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+            _send_bytes(req, data, ctype, cache_control="public, max-age=86400")
+            return
+        _send_bytes(req, b"not found", "text/plain; charset=utf-8", status=404)
+
+    def _serve_fs_file(self, req: BaseHTTPRequestHandler, path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            _send_bytes(req, b"not found", "text/plain; charset=utf-8", status=404)
+            return
+        if not _fs_path_allowed(resolved) or not resolved.is_file():
+            _send_bytes(req, b"forbidden", "text/plain; charset=utf-8", status=403)
+            return
+        try:
+            if resolved.stat().st_size > 64 * 1024 * 1024:
+                _send_bytes(req, b"file too large", "text/plain; charset=utf-8", status=413)
+                return
+            data = resolved.read_bytes()
+        except Exception:
+            _send_bytes(req, b"not found", "text/plain; charset=utf-8", status=404)
+            return
+        ctype = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+        _send_bytes(req, data, ctype, cache_control="private, max-age=60")
+
+    def _serial_ports_payload(self, refresh: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        with self._serial_ports_lock:
+            if (not refresh and self._serial_ports_cache is not None
+                    and now - float(self._serial_ports_cache_at or 0.0) < SERIAL_PORT_CACHE_S):
+                age = max(0.0, now - float(self._serial_ports_cache_at or 0.0))
+                return {
+                    "ok": "1",
+                    "ports": list(self._serial_ports_cache),
+                    "cached": "1",
+                    "expires_in": max(0, int(SERIAL_PORT_CACHE_S - age)),
+                }
+            ports: List[Dict[str, str]] = []
+            try:
+                blocked = {
+                    "/dev/cu.bluetooth-incoming-port",
+                    "/dev/cu.debug-console",
+                    "/dev/tty.bluetooth-incoming-port",
+                    "/dev/tty.debug-console",
+                }
+                seen = set()
+                for p in list_serial_ports():
+                    dev = str(p.device or "")
+                    if dev in seen:
+                        continue
+                    seen.add(dev)
+                    desc = str(getattr(p, "description", "") or "")
+                    d_low = dev.strip().lower()
+                    if d_low in blocked:
+                        continue
+                    if "bluetooth" in desc.lower() and "serial" not in desc.lower():
+                        continue
+                    label = f"{dev} - {desc}" if desc else dev
+                    ports.append({"device": dev, "label": str(label)})
+            except Exception as e:
+                return {"ok": "0", "error": str(e), "ports": []}
+            self._serial_ports_cache = list(ports)
+            self._serial_ports_cache_at = now
+            return {
+                "ok": "1",
+                "ports": ports,
+                "cached": "0",
+                "expires_in": int(SERIAL_PORT_CACHE_S),
+            }
+
+    def _create_project(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raw_type = str(payload.get("project_type") or payload.get("type") or PROJECT_TYPE_IMAGE).strip().lower()
+        if raw_type in {"car", "sign", PROJECT_TYPE_SIGN_OCR}:
+            project_type = PROJECT_TYPE_SIGN_OCR
+        elif raw_type == PROJECT_TYPE_OCR:
+            project_type = PROJECT_TYPE_OCR
+        else:
+            project_type = PROJECT_TYPE_IMAGE
+        raw_name = str(payload.get("folderName") or payload.get("name") or "untitled_project").strip()
+        name = re.sub(r"[^\w.-]+", "_", raw_name).strip("._-")[:64] or "untitled_project"
+        parent_raw = payload.get("parent") or _load_global_settings().get("projectsRoot")
+        parent = _fs_expand_path(parent_raw)
+        if parent is None:
+            parent = Path(app_data_dir()) / "Projects"
+        parent = parent.resolve()
+        if not _fs_path_allowed(parent, allow_missing_parent=True):
+            return {"ok": "0", "error": "Parent directory is outside the allowed workspace.", "status": 403}
+        folder = (parent / name).resolve()
+        if folder.exists() and any(folder.iterdir()):
+            return {"ok": "0", "error": "A project folder already exists there.", "status": 409}
+        dataset_root = folder / "dataset"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            dataset_root.mkdir(parents=True, exist_ok=True)
+            (folder / "exports").mkdir(exist_ok=True)
+            (folder / "backup").mkdir(exist_ok=True)
+        except Exception as e:
+            return {"ok": "0", "error": f"Unable to create project folder: {e}", "status": 400}
+        img_size = 160 if project_type == PROJECT_TYPE_IMAGE else default_img_size(project_type)
+        session_id = uuid.uuid4().hex
+        cfg = SessionConfig(
+            dataset_root=dataset_root,
+            serial_port="",
+            serial_baud=115200,
+            serial_sync="AA 55 AA",
+            serial_frame_side=96,
+            serial_channels=1,
+            webcam_index=0,
+            fps=8.0,
+            crop_box=None,
+            img_size=int(img_size),
+            project_type=project_type,
+        )
+        self.set_config(session_id, cfg)
+        classes_raw = payload.get("classes")
+        classes: List[str] = []
+        if isinstance(classes_raw, list):
+            for item in classes_raw:
+                class_name = sanitize_class_name(str(item))
+                if class_name and class_name not in classes:
+                    classes.append(class_name)
+        try:
+            for class_name in classes:
+                (dataset_root / class_name).mkdir(parents=True, exist_ok=True)
+            if classes:
+                self._classes_save(dataset_root, classes)
+            (dataset_root / "labels.txt").write_text("\n".join(classes) + ("\n" if classes else ""), encoding="utf-8")
+            (dataset_root / "labels.json").write_text(json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        tmproj = folder / f"{name}.tmproj"
+        manifest = {
+            **project_header(project_type),
+            "format": "tmproj",
+            "img_size": int(img_size),
+            "created_at": int(time.time()),
+            "dataset_dir": "dataset",
+            "dataset_labels_txt": "dataset/labels.txt",
+            "dataset_labels_json": "dataset/labels.json",
+            "classes_meta": "tm_classes.json" if (folder / "tm_classes.json").exists() else "",
+            "project_state": "tm_project_state.json",
+            "sample_count": 0,
+            "class_count": len(classes),
+        }
+        state = {
+            "project_type": project_type,
+            "classes": classes,
+            "counts": {name: 0 for name in classes},
+            "class_preprocess": {},
+            "sample_preprocess": {},
+            "train_cfg": {"project_type": project_type, "img_size": int(img_size)},
+        }
+        try:
+            with zipfile.ZipFile(tmproj, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+                zf.writestr("tm_project_state.json", json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+                zf.writestr("dataset/labels.txt", "\n".join(classes) + ("\n" if classes else ""))
+                zf.writestr("dataset/labels.json", json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n")
+        except Exception as e:
+            return {"ok": "0", "error": f"Unable to write project archive: {e}", "status": 400}
+        _recent_mru_touch(tmproj, folder=folder)
+        project = _recent_project_entry(tmproj)
+        return {"ok": "1", "session": session_id, "project": project, "folder": str(folder), "path": str(tmproj)}
+
+    def _get_live_jpeg(self, session_id: str, source: str) -> Optional[bytes]:
+        png = self._get_live_preview(session_id=session_id, source=source)
+        if png is None:
+            return None
+        key = self._live_key(session_id, source)
+        with self._lock:
+            state = self._live.get(key)
+            if state is not None:
+                data = state.get("preview_jpeg")
+                if isinstance(data, (bytes, bytearray)) and float(state.get("_jpeg_ts") or 0.0) >= float(state.get("_preview_ts") or 0.0):
+                    return bytes(data)
+                png_now = state.get("preview_png")
+                if isinstance(png_now, (bytes, bytearray)):
+                    png = bytes(png_now)
+        jpeg = _jpeg_bytes_from_png(png, LIVE_JPEG_QUALITY)
+        if jpeg is None:
+            return None
+        with self._lock:
+            state = self._live.get(key)
+            if state is not None:
+                state["preview_jpeg"] = jpeg
+                state["_jpeg_ts"] = time.time()
+        return jpeg
 
     def _make_handler(self):
         controller = self
@@ -840,6 +2394,408 @@ class RecordController:
         parsed = urlparse(req.path)
         qs = parse_qs(parsed.query)
         path = parsed.path
+        if path in {"/", "/index.html"}:
+            self._serve_shell(req)
+            return
+        if path == "/favicon.ico":
+            _send_bytes(req, b"", "image/x-icon", status=204)
+            return
+        if path.startswith("/assets/"):
+            self._serve_asset(req, path[len("/assets/"):])
+            return
+        if path == "/projects/recent":
+            try:
+                limit = int((qs.get("limit") or ["50"])[0])
+            except Exception:
+                limit = 50
+            show_hidden_raw = str((qs.get("show_hidden") or [""])[0]).strip().lower()
+            show_hidden = (
+                show_hidden_raw in {"1", "true", "yes", "on"}
+                if show_hidden_raw
+                else None
+            )
+            _send_json(req, _recent_projects_payload(limit, show_hidden=show_hidden), cors=True)
+            return
+        if path == "/backup/list":
+            session_id = (qs.get("session") or [""])[0]
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                backups = self._backup_entries(session_id)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "backups": backups}, cors=True)
+            return
+        if path == "/project/state":
+            session_id = (qs.get("session") or [""])[0]
+            if not session_id or self._configs.get(session_id) is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            try:
+                _send_json(req, {"ok": "1", **self._runtime_state_payload(session_id)}, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+            return
+        if path == "/settings/global":
+            settings = _load_global_settings()
+            try:
+                app_dir = app_data_dir()
+                paths = {
+                    "appData": str(app_dir),
+                    "logs": str(Path(app_dir) / "logs"),
+                    "projectsRoot": str(settings.get("projectsRoot") or ""),
+                }
+            except Exception:
+                paths = {"appData": "", "logs": "", "projectsRoot": str(settings.get("projectsRoot") or "")}
+            _send_json(req, {"ok": "1", "settings": settings, "paths": paths}, cors=True)
+            return
+        if path == "/logs/tail":
+            try:
+                lines = int((qs.get("lines") or ["80"])[0])
+            except Exception:
+                lines = 80
+            _send_json(req, _logs_tail(lines), cors=True)
+            return
+        if path == "/system/eula":
+            eula_path = _eula_text_path()
+            text = ""
+            if eula_path is not None:
+                try:
+                    text = eula_path.read_text(encoding="utf-8")
+                except Exception:
+                    text = ""
+            _send_json(req, {
+                "ok": "1",
+                "accepted": _eula_flag_path().is_file(),
+                "path": str(eula_path) if eula_path is not None else "",
+                "text": text,
+            }, cors=True)
+            return
+        if path == "/system/camera_permission":
+            status = get_camera_access_status()
+            _send_json(req, {
+                "ok": "1",
+                "allowed": bool(status.allowed),
+                "status": str(status.status),
+                "message": str(status.message),
+            }, cors=True)
+            return
+        if path == "/fs/drives":
+            _send_json(req, {"ok": "1", "drives": _fs_drive_entries()}, cors=True)
+            return
+        if path == "/fs/roots":
+            # Canonical side-bar locations.  Works WITHOUT a project session:
+            # the Welcome screen's NEW [+] / OPEN pickers use it on cold boot.
+            roots: List[Dict[str, str]] = []
+            seen_roots: set = set()
+
+            def _add_root(name: str, raw: Any, *, require_exists: bool = True) -> None:
+                try:
+                    target = _fs_expand_path(raw)
+                except Exception:
+                    target = None
+                if target is None:
+                    return
+                try:
+                    target = target.resolve()
+                except Exception:
+                    pass
+                key = str(target)
+                if key in seen_roots:
+                    return
+                if require_exists and (not target.exists() or not target.is_dir()):
+                    return
+                if not _fs_path_allowed(target):
+                    return
+                seen_roots.add(key)
+                roots.append({"name": name, "label": name, "path": key})
+
+            try:
+                _add_root("Home", Path.home())
+            except Exception:
+                pass
+            for _name in ("Desktop", "Documents", "Downloads"):
+                try:
+                    _add_root(_name, Path.home() / _name, require_exists=False)
+                except Exception:
+                    pass
+            try:
+                _add_root("Projects Root", _load_global_settings().get("projectsRoot"))
+            except Exception:
+                pass
+            home = str(Path.home().resolve())
+            _send_json(req, {"ok": "1", "roots": roots, "home": home}, cors=True)
+            return
+        if path == "/fs/list":
+            raw_path = (qs.get("path") or [""])[0]
+            target = _fs_expand_path(raw_path)
+            if target is None:
+                _send_json(req, {"ok": "0", "error": "missing path", "entries": []}, status=400, cors=True)
+                return
+            if not _fs_path_allowed(target):
+                _send_json(req, {"ok": "0", "error": "forbidden", "entries": []}, status=403, cors=True)
+                return
+            show_hidden = str((qs.get("show_hidden") or ["0"])[0]).strip().lower() in {"1", "true", "yes", "on"}
+            if not target.exists() or not target.is_dir():
+                # A missing start folder is NORMAL on cold boot (the default
+                # Projects Root may not exist yet).  Answer 200 with an empty
+                # listing so the SPA keeps using the real backend instead of
+                # falling back to its offline virtual filesystem.
+                _send_json(
+                    req,
+                    {"ok": "1", "entries": [], "path": str(target), "missing": "1",
+                     "show_hidden": "1" if show_hidden else "0"},
+                    cors=True,
+                )
+                return
+            _send_json(req, _fs_list_payload(target, show_hidden=show_hidden), cors=True)
+            return
+        if path == "/fs/search":
+            raw_path = (qs.get("path") or [""])[0]
+            query = str((qs.get("q") or [""])[0]).strip()
+            show_hidden = str((qs.get("show_hidden") or ["0"])[0]).strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                max_results = max(1, min(500, int((qs.get("max_results") or ["200"])[0])))
+            except Exception:
+                max_results = 200
+            try:
+                max_depth = max(1, min(10, int((qs.get("max_depth") or ["5"])[0])))
+            except Exception:
+                max_depth = 5
+            target = _fs_expand_path(raw_path)
+            if target is None or not query:
+                _send_json(req, {"ok": "0", "error": "missing path or query", "results": []}, status=400, cors=True)
+                return
+            if not _fs_path_allowed(target):
+                _send_json(req, {"ok": "0", "error": "forbidden", "results": []}, status=403, cors=True)
+                return
+            started = time.perf_counter()
+            needles = query.lower()
+            # Bounded BFS: depth, visited-entry and result caps keep a cold
+            # search responsive even in a huge home directory.
+            stack: List[Tuple[Path, int]] = [(target, 0)]
+            results: List[Dict[str, Any]] = []
+            scanned = 0
+            truncated = False
+            roots = _fs_allowed_roots()
+
+            def _matches(name: str) -> bool:
+                low = name.lower()
+                if needles in low:
+                    return True
+                # Fuzzy subsequence: "cgr" matches "campus_gate_runs".
+                it = iter(low)
+                return all(ch in it for ch in needles)
+
+            while stack:
+                folder, depth = stack.pop(0)
+                if depth > max_depth or scanned >= 5000 or len(results) >= max_results:
+                    truncated = True
+                    break
+                try:
+                    entries = sorted(folder.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                except Exception:
+                    continue
+                for child in entries:
+                    scanned += 1
+                    if scanned >= 5000 or len(results) >= max_results:
+                        truncated = True
+                        break
+                    try:
+                        if not _fs_path_allowed(child, roots=roots):
+                            continue
+                        if not show_hidden and _fs_is_hidden(child):
+                            continue
+                    except Exception:
+                        continue
+                    is_dir = child.is_dir()
+                    if _matches(child.name):
+                        payload = _fs_entry_payload(child)
+                        if payload:
+                            payload["parent"] = str(folder)
+                            payload["depth"] = int(depth)
+                            results.append(payload)
+                    if is_dir and depth < max_depth and not child.is_symlink():
+                        stack.append((child, depth + 1))
+            elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
+            _send_json(req, {
+                "ok": "1",
+                "path": str(target),
+                "q": query,
+                "results": results,
+                "truncated": "1" if truncated else "0",
+                "scanned": scanned,
+                "elapsed_ms": elapsed_ms,
+            }, cors=True)
+            return
+        if path == "/fs/thumb":
+            raw_path = (qs.get("path") or [""])[0]
+            target = _fs_expand_path(raw_path)
+            if target is None or not target.is_file() or target.suffix.lower() not in IMAGE_EXTS or not _fs_path_allowed(target):
+                _send_bytes(req, b"not an image", "text/plain; charset=utf-8", status=404)
+                return
+            try:
+                img = Image.open(target)
+                try:
+                    img = ImageOps.exif_transpose(img)
+                    img = img.convert("RGB")
+                    img.thumbnail((96, 96), Image.BILINEAR)
+                    thumb = _to_png_bytes(img)
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+            except Exception:
+                _send_bytes(req, b"unreadable image", "text/plain; charset=utf-8", status=404)
+                return
+            _send_png(req, thumb, cors=True, cache_control="private, max-age=300")
+            return
+        if path == "/fs/file":
+            raw_path = (qs.get("path") or [""])[0]
+            target = _fs_expand_path(raw_path)
+            if target is None:
+                _send_bytes(req, b"missing path", "text/plain; charset=utf-8", status=400)
+                return
+            self._serve_fs_file(req, target)
+            return
+        if path == "/live/status":
+            session_id = (qs.get("session") or [""])[0]
+            with self._lock:
+                active = self._active_source.get(session_id, "")
+                state = self._live.get(self._live_key(session_id, active)) if active else None
+                running = bool(state and state.get("running"))
+                webcam_state = self._live.get(self._live_key(session_id, "webcam"))
+                serial_state = self._live.get(self._live_key(session_id, "device"))
+                # `*_open` reflects the actual OS handle/worker lease, not the
+                # last cached frame.  After /live/close it must be false.
+                webcam_open = bool(
+                    webcam_state
+                    and (webcam_state.get("running") or webcam_state.get("_cap"))
+                )
+                serial_open = bool(
+                    serial_state
+                    and (serial_state.get("running") or serial_state.get("_serial_reader"))
+                )
+            _send_json(req, {
+                "ok": "1",
+                "active_source": active,
+                "running": running,
+                "webcam_open": webcam_open,
+                "serial_open": serial_open,
+            }, cors=True)
+            return
+        if path == "/live/jpeg":
+            session_id = (qs.get("session") or [""])[0]
+            source = (qs.get("source") or [""])[0]
+            if not session_id or source not in {"webcam", "device"}:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            if self._live_closed_recently(session_id) and not self._await_live_activation(session_id):
+                _send_json(req, {"ok": "0", "error": "live session is closed"}, status=409, cors=True)
+                return
+            try:
+                self._ensure_live(session_id=session_id, source=source)
+            except Exception:
+                pass
+            jpeg = self._get_live_jpeg(session_id=session_id, source=source)
+            if jpeg is None:
+                _send_json(req, {"ok": "0", "error": "preview unavailable"}, status=404, cors=True)
+                return
+            _send_bytes(req, jpeg, "image/jpeg", cache_control="no-store, max-age=0")
+            return
+        if path == "/live/mjpeg":
+            session_id = (qs.get("session") or [""])[0]
+            source = (qs.get("source") or [""])[0]
+            if not session_id or source not in {"webcam", "device"}:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            if self._live_closed_recently(session_id) and not self._await_live_activation(session_id):
+                # A delayed collect-page retry must never reopen the camera.
+                _send_json(req, {"ok": "0", "error": "live session is closed"}, status=409, cors=True)
+                return
+            # The reconnect URL pins the selected camera.  If it disagrees
+            # with the session (bridge/config race), restart the worker on the
+            # URL's camera BEFORE this socket starts, so it cannot serve the
+            # previous device's frames.
+            cam_raw = (qs.get("cam") or [""])[0]
+            if source == "webcam" and str(cam_raw).strip() != "":
+                try:
+                    cam_index = int(float(str(cam_raw).replace("×", " ").split()[0]))
+                    with self._lock:
+                        cfg_now = self._configs.get(session_id)
+                    if cfg_now is not None and int(getattr(cfg_now, "webcam_index", 0) or 0) != cam_index:
+                        self.update_config(session_id, webcam_index=cam_index)
+                        self._restart_webcam_live(session_id)
+                except Exception:
+                    pass
+            # A new stream invalidates any older generator for this app.  The
+            # old loop sees the token change and exits in <=20 ms, releasing
+            # its HTTP/1.1 connection instead of holding one of WKWebView's
+            # six sockets for up to five minutes.
+            token = self._bump_stream_generation()
+            with self._lock:
+                self._active_streams = int(getattr(self, "_active_streams", 0)) + 1
+            try:
+                try:
+                    self._ensure_live(session_id=session_id, source=source)
+                except Exception:
+                    pass
+                first_jpeg = None
+                first_deadline = time.time() + 3.0
+                while time.time() < first_deadline and first_jpeg is None:
+                    if not self._stream_generation_current(token):
+                        return
+                    first_jpeg = self._get_live_jpeg(session_id=session_id, source=source)
+                    if first_jpeg is None:
+                        time.sleep(0.02)
+                if first_jpeg is None:
+                    _send_json(req, {"ok": "0", "error": "preview unavailable"}, status=404, cors=True)
+                    return
+                boundary = "aioscoutframe"
+                try:
+                    req.send_response(200)
+                    req.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+                    req.send_header("Cache-Control", "no-store, max-age=0")
+                    req.send_header("Connection", "close")
+                    req.end_headers()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
+                try:
+                    # Bound a dead/slow client write so a stuck socket cannot
+                    # pin a server thread forever.
+                    req.connection.settimeout(2.0)
+                except Exception:
+                    pass
+                started = time.time()
+                last_frame_at = started
+                try:
+                    jpeg = first_jpeg
+                    while time.time() - started < 300.0:
+                        if not self._stream_generation_current(token):
+                            break
+                        if jpeg:
+                            req.wfile.write(
+                                f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                            )
+                            req.wfile.write(jpeg)
+                            req.wfile.write(b"\r\n")
+                            req.wfile.flush()
+                            last_frame_at = time.time()
+                        if time.time() - last_frame_at > 5.0:
+                            break
+                        time.sleep(0.02)
+                        jpeg = self._get_live_jpeg(session_id=session_id, source=source)
+                except (BrokenPipeError, ConnectionResetError, OSError, socket.timeout):
+                    pass
+                finally:
+                    req.close_connection = True
+                return
+            finally:
+                with self._lock:
+                    self._active_streams = max(0, int(getattr(self, "_active_streams", 1)) - 1)
         if path == "/status":
             session_id = (qs.get("session") or [""])[0]
             data = self.status(session_id)
@@ -915,8 +2871,9 @@ class RecordController:
             if cfg is None:
                 _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                 return
+            thumb = str((qs.get("thumb") or [""])[0]).strip().lower() in {"1", "true", "yes", "on"}
             try:
-                png = self._sample_image_png(cfg.dataset_root, class_name, filename)
+                png = self._sample_image_png(cfg.dataset_root, class_name, filename, thumb=thumb)
             except FileNotFoundError:
                 _send_json(req, {"ok": "0", "error": "sample not found"}, status=404, cors=True)
                 return
@@ -941,36 +2898,9 @@ class RecordController:
             _send_json(req, {"ok": "1", "options": opts}, cors=True)
             return
         if path == "/serial/ports":
-            ports = []
-            try:
-                blocked = {
-                    "/dev/cu.bluetooth-incoming-port",
-                    "/dev/cu.debug-console",
-                    "/dev/tty.bluetooth-incoming-port",
-                    "/dev/tty.debug-console",
-                }
-                seen = set()
-                for p in list_serial_ports():
-                    dev = str(p.device or "")
-                    # Skip entries we have already emitted — some adapters
-                    # enumerate the same COM port under multiple interface
-                    # descriptions, which would otherwise produce duplicate
-                    # dropdown entries.
-                    if dev in seen:
-                        continue
-                    seen.add(dev)
-                    desc = str(getattr(p, "description", "") or "")
-                    d_low = dev.strip().lower()
-                    if d_low in blocked:
-                        continue
-                    if "bluetooth" in desc.lower() and "serial" not in desc.lower():
-                        continue
-                    label = f"{dev} - {desc}" if desc else dev
-                    ports.append({"device": dev, "label": str(label)})
-            except Exception as e:
-                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
-                return
-            _send_json(req, {"ok": "1", "ports": ports}, cors=True)
+            refresh = str((qs.get("refresh") or [""])[0]).strip().lower() in {"1", "true", "yes", "on"}
+            payload = self._serial_ports_payload(refresh=refresh)
+            _send_json(req, payload, status=200 if payload.get("ok") == "1" else 400, cors=True)
             return
         if path == "/capture":
             session_id = (qs.get("session") or [""])[0]
@@ -1141,6 +3071,12 @@ class RecordController:
                 starting = "1" if self._is_live_starting(session_id=session_id, source=source) else "0"
                 _send_json(req, {"ok": "0", "error": err, "starting": starting}, status=404, cors=True)
                 return
+            fmt = str((qs.get("fmt") or [""])[0]).strip().lower()
+            if fmt in {"jpeg", "jpg"}:
+                jpeg = _jpeg_bytes_from_png(png, LIVE_JPEG_QUALITY)
+                if jpeg is not None:
+                    _send_bytes(req, jpeg, "image/jpeg", cache_control="no-store, max-age=0")
+                    return
             _send_png(req, png, cors=True)
             return
         if path == "/preview/predict":
@@ -1165,6 +3101,9 @@ class RecordController:
             # instead of a full-resolution PNG per tick.  Upload/synth and
             # the API keep the lossless image.
             compact_preview = str((qs.get("compact") or [""])[0]).strip() == "1"
+            view_roi = str((qs.get("view_roi") or ["0"])[0]).strip() == "1"
+            view_orig = str((qs.get("view_orig") or ["0"])[0]).strip() == "1"
+            loop_token = str((qs.get("loop_token") or [""])[0]).strip()
             bg_dark_thresh = int(bg_dark_raw) if str(bg_dark_raw).strip() != "" else None
             bg_lum_thresh  = int(bg_lum_raw)  if str(bg_lum_raw).strip()  != "" else None
             sign_match_min = float(match_min_raw) if str(match_min_raw).strip() != "" else None
@@ -1175,9 +3114,36 @@ class RecordController:
             if not session_id or source not in {"webcam", "device"}:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
+            if self._live_closed_recently(session_id) and not self._await_live_activation(session_id):
+                _send_json(req, {"ok": "0", "error": "live session is closed"}, status=409, cors=True)
+                return
+            _route_t0 = time.perf_counter()
+            _grab_t0 = time.perf_counter()
             try:
-                self._ensure_live(session_id=session_id, source=source)
+                try:
+                    self._ensure_live(session_id=session_id, source=source)
+                except RuntimeError as live_error:
+                    _send_json(req, {"ok": "0", "error": str(live_error)}, status=409, cors=True)
+                    return
+                with self._lock:
+                    live_state = self._live.get(self._live_key(session_id, source))
+                    frame_seq = int((live_state or {}).get("frame_seq") or 0)
+                    model_entry = self._preview.get(session_id)
+                    model_mtime = float((model_entry or {}).get("tflite_mtime") or 0.0)
+                frame_sig = (
+                    frame_seq, view_roi, view_orig, compact_preview, loop_token,
+                    str(preprocess_mode or ""), bg_dark_thresh, bg_lum_thresh,
+                    ood_sign_pct_min, ood_sign_pct_max, ood_max_prob_min,
+                    ood_entropy_ratio_max, sign_seq_raw, tuple(sign_seqs_list or ()),
+                    reading_raw, match_min_raw, source, model_mtime,
+                )
+                with self._lock:
+                    same_frame = self._preview_sig.get(session_id) == frame_sig
+                if compact_preview and same_frame:
+                    _send_json(req, {"ok": "1", "unchanged": "1", "compact": "1"}, cors=True)
+                    return
                 preview_png = self._get_live_preview(session_id=session_id, source=source)
+                _frame_grab_ms = (time.perf_counter() - _grab_t0) * 1000.0
                 if preview_png is None:
                     err = self._get_live_error(session_id=session_id, source=source) or "preview unavailable"
                     _send_json(req, {"ok": "0", "error": err}, status=404, cors=True)
@@ -1193,10 +3159,13 @@ class RecordController:
                 else:
                     capture_png = self._get_live_capture(session_id=session_id, source=source)
                     predict_png = capture_png if capture_png else preview_png
+                # One decode per PRODUCED frame: repeated preview ticks that
+                # land between two camera frames reuse the decoded image.
+                predict_input = self._decoded_live_frame(session_id, source, frame_seq, predict_png)
                 if self._is_sign_ocr_session(session_id):
                     pred = self._preview_predict_sign_ocr(
                         session_id=session_id,
-                        png=predict_png,
+                        png=predict_input,
                         sign_sequence=sign_seq_raw,
                         sign_sequences=sign_seqs_list,
                         reading_order=reading_raw,
@@ -1210,11 +3179,13 @@ class RecordController:
                         preprocess_frame_side=GLYPH_PREPROCESS_FRAME_SIDE,
                         source=source,
                         compact=compact_preview,
+                        view_roi=view_roi,
+                        view_orig=view_orig,
                     )
                 else:
                     pred = self._preview_predict(
                         session_id=session_id,
-                        png=predict_png,
+                        png=predict_input,
                         preprocess_mode=preprocess_mode,
                         bg_dark_thresh=bg_dark_thresh,
                         bg_lum_thresh=bg_lum_thresh,
@@ -1224,10 +3195,35 @@ class RecordController:
                         ood_entropy_ratio_max=ood_entropy_ratio_max,
                         source=source,
                         compact=compact_preview,
+                        view_roi=view_roi,
+                        view_orig=view_orig,
                     )
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
+            with self._lock:
+                self._preview_sig[session_id] = frame_sig
+            if compact_preview:
+                if view_roi and view_orig:
+                    stage_b64 = str(pred.get("crop_image_b64") or "")
+                elif view_roi:
+                    stage_b64 = str(pred.get("processed_image_b64") or "")
+                elif view_orig:
+                    # The predictor already encoded the raw frame — only fall
+                    # back to decode+JPEG here for older callers.
+                    stage_b64 = str(pred.get("full_image_b64") or "") or _png_bytes_to_compact_jpeg_b64(
+                        preview_png, max_side=480
+                    )
+                else:
+                    stage_b64 = str(
+                        pred.get("full_image_b64")
+                        or pred.get("processed_image_b64")
+                        or ""
+                    )
+                full_raw_b64 = ""
+            else:
+                full_raw_b64 = base64.b64encode(preview_png).decode("ascii")
+                stage_b64 = _preview_stage_image_b64(pred, full_raw_b64, view_roi, view_orig)
             payload = {
                     "ok": "1",
                     "labels": pred.get("labels") or [],
@@ -1239,18 +3235,23 @@ class RecordController:
                     "sign_pct": float(pred.get("sign_pct") or 0.0),
                     "max_prob": float(pred.get("max_prob") or 0.0),
                     "entropy_ratio": float(pred.get("entropy_ratio") or 0.0),
-                    "image_b64": (
-                        _png_bytes_to_compact_jpeg_b64(preview_png)
-                        if compact_preview
-                        else base64.b64encode(preview_png).decode("ascii")
-                    ),
-                    "processed_image_b64": str(pred.get("processed_image_b64") or ""),
-                    "crop_image_b64": str(pred.get("crop_image_b64") or ""),
-                    "full_image_b64": str(pred.get("full_image_b64") or ""),
+                    "image_b64": full_raw_b64,
+                    "stage_image_b64": stage_b64,
+                    "stage_mime": "image/jpeg" if compact_preview else "image/png",
+                    "view_roi": "1" if view_roi else "0",
+                    "view_orig": "1" if view_orig else "0",
+                    "processed_image_b64": "" if compact_preview else str(pred.get("processed_image_b64") or ""),
+                    "crop_image_b64": "" if compact_preview else str(pred.get("crop_image_b64") or ""),
+                    "full_image_b64": "" if compact_preview else str(pred.get("full_image_b64") or ""),
                     "compact": "1" if compact_preview else "0",
                     "processed_variant": str(pred.get("processed_variant") or ""),
                     "crop": pred.get("crop"),
                     "model_source": str(pred.get("model_source") or "latest"),
+                    "timings": {
+                        **(pred.get("timings") or {}),
+                        "frame_grab_ms": float(_frame_grab_ms),
+                        "total_ms": (time.perf_counter() - _route_t0) * 1000.0,
+                    },
             }
             if pred.get("sign_ocr"):
                 payload.update(sign_ocr_payload_extras(pred))
@@ -1427,37 +3428,98 @@ class RecordController:
             if not session_id or not source or not class_name:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
-            # Single capture consumes the live worker's capture_png cache —
-            # NEVER opens a second camera/serial reader (macOS allows one
-            # consumer per camera; the serial reader is single-consumer).
-            # Wait briefly for a FRESH frame so a click can never save an
-            # arbitrarily old one.
-            self._ensure_live(session_id=session_id, source=source)
-            png = self._get_live_capture_fresh(session_id=session_id, source=source, timeout_s=0.4)
-            if png is None:
-                err = self._get_live_error(session_id=session_id, source=source) or "capture unavailable"
-                _send_json(req, {"ok": "0", "error": err}, status=409, cors=True)
+            if self._live_closed_recently(session_id) and not self._await_live_activation(session_id):
+                _send_json(req, {"ok": "0", "error": "live session is closed"}, status=409, cors=True)
                 return
             cfg = self._configs.get(session_id)
             if cfg is None:
                 _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                 return
-            p = _save_png(cfg.dataset_root, class_name, png)
-            self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size), project_type=str(cfg.project_type))
-            _send_json(
-                req,
-                {
-                    "ok": "1",
-                    "class": class_name,
-                    "filename": p.name,
-                    "image_b64": base64.b64encode(png).decode("ascii"),
-                },
-                cors=True,
+            try:
+                self._ensure_live(session_id=session_id, source=source)
+            except RuntimeError as live_error:
+                _send_json(req, {"ok": "0", "error": str(live_error)}, status=409, cors=True)
+                return
+            # 0 ms path: take the newest in-memory frame the producer has
+            # already grabbed.  Never wait for cap.read() on the HTTP thread.
+            key = self._live_key(session_id, source)
+            item = None
+            deadline = time.time() + 0.6
+            while True:
+                with self._latest_frame_lock:
+                    item = self._latest_capture_frames.get(key)
+                if item is not None:
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.005)
+            image = None
+            png_bytes = None
+            thumb_source = None
+            if item is not None:
+                if str(item.get("kind") or "") == "pil":
+                    image = item["image"].copy()
+                    thumb_source = item.get("preview_image")
+                else:
+                    png_bytes = item.get("data")
+                    if png_bytes:
+                        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                    thumb_source = item.get("preview_image")
+            if image is None and png_bytes is None:
+                # First frames after activation, or a legacy producer.
+                png_bytes = self._get_live_capture_fresh(
+                    session_id=session_id, source=source, timeout_s=0.4
+                )
+                if png_bytes is None:
+                    err = self._get_live_error(session_id=session_id, source=source) or "capture unavailable"
+                    _send_json(req, {"ok": "0", "error": err}, status=409, cors=True)
+                    return
+                image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            # Inline 96 px JPEG (3-5 KB) — the strip paints this immediately,
+            # so no second /sample_image request and no blank white tile.
+            try:
+                small = thumb_source
+                if small is None:
+                    small = image
+                if isinstance(small, Image.Image):
+                    small_img = small.copy()
+                else:
+                    small_img = Image.fromarray(small)
+                small_img.thumbnail((96, 96), Image.BILINEAR)
+                buf = io.BytesIO()
+                small_img.convert("RGB").save(buf, format="JPEG", quality=80)
+                thumb_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception:
+                thumb_b64 = ""
+            path = self._next_capture_path(cfg.dataset_root, class_name)
+            # Full-resolution PNG encoding + disk write + processed-cache
+            # update happen on the dedicated I/O writer thread.
+            self._enqueue_capture_write(
+                cfg,
+                class_name,
+                path,
+                png=png_bytes if image is None or png_bytes is not None else None,
+                image=None if png_bytes is not None else image,
             )
+            response: Dict[str, Any] = {
+                "ok": "1",
+                "class": class_name,
+                "filename": path.name,
+                "src": _sample_src_url(session_id, class_name, path),
+                "thumb": _sample_thumb_url(session_id, class_name, path),
+                "thumb_b64": thumb_b64,
+            }
+            if str((qs.get("image") or ["0"])[0]).strip().lower() not in {"0", "false", "no"}:
+                try:
+                    response["image_b64"] = base64.b64encode(_to_png_bytes(image)).decode("ascii")
+                except Exception:
+                    pass
+            _send_json(req, response, cors=True)
             return
         if path == "/live/close":
             session_id = (qs.get("session") or [""])[0]
             source = (qs.get("source") or [""])[0]
+            self._bump_stream_generation()
             self._stop_live(session_id=session_id, source=source if source else None, wait=True, timeout_s=2.0)
             _send_json(req, {"ok": "1"}, cors=True)
             return
@@ -1488,13 +3550,19 @@ class RecordController:
         if path not in {
             "/upload",
             "/train/start",
+            "/train/cancel",
             "/train/config",
             "/train/recommend",
             "/export/run",
             "/dataset/export",
             "/project/save",
+            "/project/touch",
             "/project/open",
+            "/project/bind",
             "/project/reset",
+            "/backup/restore",
+            "/backup/restore_class",
+            "/backup/delete",
             "/classes/rename",
             "/classes/add",
             "/classes/add_named",
@@ -1508,9 +3576,25 @@ class RecordController:
             "/preview/ood",
             "/preview/predict_upload",
             "/preview/upload",
+            "/preview/upload_path",
             "/preview/synthesize_sign",
             "/classes/save_config",
             "/classes/reorder",
+            "/fs/mkdir",
+            "/fs/validate",
+            "/project/new",
+            "/settings/global",
+            "/system/eula/accept",
+            "/system/camera_permission",
+            "/live/config",
+            "/live/activate",
+            "/live/close",
+            "/record/pull",
+            "/record/flush",
+            "/samples/import_paths",
+            "/import/classified",
+            "/app/quit",
+            "/window/mode",
         }:
             _send_json(req, {"ok": "0", "error": "not found"}, status=404, cors=True)
             return
@@ -1548,7 +3632,473 @@ class RecordController:
                 if key in qs_params:
                     payload[key] = (qs_params[key] or [""])[0]
         else:
-            payload = json.loads(raw.decode("utf-8"))
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": f"invalid json: {e}"}, status=400, cors=True)
+                return
+            if not isinstance(payload, dict):
+                _send_json(req, {"ok": "0", "error": "json object required"}, status=400, cors=True)
+                return
+        if path == "/fs/mkdir":
+            target = _fs_expand_path(payload.get("path"))
+            if target is None:
+                _send_json(req, {"ok": "0", "error": "missing path"}, status=400, cors=True)
+                return
+            if not _fs_path_allowed(target, allow_missing_parent=True):
+                _send_json(req, {"ok": "0", "error": "forbidden"}, status=403, cors=True)
+                return
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "path": str(target)}, cors=True)
+            return
+        if path == "/fs/validate":
+            target = _fs_expand_path(payload.get("path"))
+            if target is None:
+                _send_json(req, {"ok": "0", "error": "missing path"}, status=400, cors=True)
+                return
+            if not _fs_path_allowed(target, allow_missing_parent=True):
+                _send_json(req, {"ok": "0", "error": "forbidden", "exists": False, "is_dir": False}, status=403, cors=True)
+                return
+            exists = target.exists()
+            is_dir = bool(exists and target.is_dir())
+            kind = str(payload.get("kind") or "any").strip().lower()
+            kind_ok = True if kind in {"", "any"} else (is_dir if kind == "dir" else (exists and not is_dir))
+            _send_json(req, {"ok": "1", "exists": bool(exists), "is_dir": bool(is_dir), "kind_ok": bool(kind_ok), "path": str(target)}, cors=True)
+            return
+        if path == "/project/new":
+            result = self._create_project(payload)
+            status = int(result.pop("status", 200) or 200)
+            _send_json(req, result, status=status, cors=True)
+            return
+        if path == "/settings/global":
+            try:
+                settings = _save_global_settings(payload)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "settings": settings}, cors=True)
+            return
+        if path == "/system/eula/accept":
+            accepted = payload.get("accepted", True)
+            try:
+                flag = _eula_flag_path()
+                if bool(accepted):
+                    flag.parent.mkdir(parents=True, exist_ok=True)
+                    flag.write_text("1", encoding="utf-8")
+                else:
+                    flag.unlink(missing_ok=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "accepted": bool(accepted)}, cors=True)
+            return
+        if path == "/system/camera_permission":
+            request_access = bool(payload.get("request"))
+            try:
+                if request_access:
+                    status_obj = ensure_camera_access(
+                        webcam_index=int(payload.get("webcam_index") or 0),
+                        unique_id=str(payload.get("webcam_id") or ""),
+                    )
+                else:
+                    status_obj = get_camera_access_status()
+                _send_json(req, {
+                    "ok": "1",
+                    "allowed": bool(status_obj.allowed),
+                    "status": str(status_obj.status),
+                    "message": str(status_obj.message),
+                }, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+            return
+        if path == "/live/config":
+            session_id = str(payload.get("session") or "").strip()
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+
+            def _opt_int(*keys):
+                for key in keys:
+                    raw = payload.get(key)
+                    if raw is None or str(raw).strip() == "":
+                        continue
+                    try:
+                        return int(float(str(raw).replace("×", " ").split()[0]))
+                    except Exception:
+                        continue
+                return None
+
+            def _opt_float(*keys):
+                for key in keys:
+                    raw = payload.get(key)
+                    if raw is None or str(raw).strip() == "":
+                        continue
+                    try:
+                        return float(raw)
+                    except Exception:
+                        continue
+                return None
+
+            webcam_index = _opt_int("webcam_index")
+            webcam_id = payload.get("webcam_id")
+            if webcam_id is None:
+                webcam_id = payload.get("unique_id")
+            img_size = _opt_int("img_size", "input_size")
+            serial_port = payload.get("serial_port")
+            if serial_port is None:
+                serial_port = payload.get("port")
+            serial_baud = _opt_int("serial_baud", "baud")
+            serial_sync = payload.get("serial_sync")
+            if serial_sync is None:
+                serial_sync = payload.get("sync_word", payload.get("syncWord"))
+            serial_frame_side = _opt_int("serial_frame_side", "frame_side", "capture_frame_side")
+            serial_channels = _opt_int("serial_channels", "channels")
+            direct_tensor = payload.get("direct_tensor_stream")
+            project_type = payload.get("project_type")
+            fps = _opt_float("fps")
+            view_fps = _opt_float("view_fps", "viewFps")
+            capture_fps = _opt_float("capture_fps", "captureFps", "hold_capture_fps")
+            with self._lock:
+                old_cfg = self._configs.get(session_id)
+            old_index = int(getattr(old_cfg, "webcam_index", 0) or 0) if old_cfg is not None else None
+            old_uid = str(getattr(old_cfg, "webcam_id", "") or "") if old_cfg is not None else ""
+            try:
+                if serial_sync not in (None, ""):
+                    parse_sync_header(str(serial_sync))
+                if fps is not None and (fps < 1.0 or fps > 60.0):
+                    raise ValueError("fps must be between 1 and 60")
+                if view_fps is not None and (view_fps < 1.0 or view_fps > 30.0):
+                    raise ValueError("view_fps must be between 1 and 30")
+                if capture_fps is not None and (capture_fps < 1.0 or capture_fps > 15.0):
+                    raise ValueError("capture_fps must be between 1 and 15")
+                if serial_frame_side is not None and (serial_frame_side < 8 or serial_frame_side > 512):
+                    raise ValueError("invalid serial_frame_side")
+                if serial_channels is not None and serial_channels not in (1, 3):
+                    raise ValueError("serial_channels must be 1 or 3")
+                cfg = self.update_config(
+                    session_id,
+                    webcam_index=webcam_index,
+                    webcam_id=None if webcam_id is None else str(webcam_id),
+                    img_size=img_size,
+                    serial_port=None if serial_port is None else str(serial_port),
+                    serial_baud=serial_baud,
+                    serial_sync=None if serial_sync is None else str(serial_sync),
+                    serial_frame_side=serial_frame_side,
+                    serial_channels=serial_channels,
+                    direct_tensor_stream=None if direct_tensor is None else _is_truthy(direct_tensor),
+                    project_type=None if project_type in (None, "") else str(project_type).strip().lower(),
+                    fps=fps,
+                    view_fps=view_fps,
+                    capture_fps=capture_fps,
+                )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            camera_changed = bool(
+                old_cfg is not None
+                and (
+                    (webcam_index is not None and int(cfg.webcam_index) != int(old_index))
+                    or (webcam_id is not None and str(cfg.webcam_id or "") != old_uid)
+                )
+            )
+            if camera_changed:
+                self._restart_webcam_live(session_id)
+            _send_json(req, {
+                "ok": "1",
+                "webcam_index": str(int(cfg.webcam_index)),
+                "webcam_id": str(cfg.webcam_id or ""),
+                "img_size": str(int(cfg.img_size)),
+                "project_type": str(getattr(cfg, "project_type", PROJECT_TYPE_IMAGE)),
+                "serial_port": str(cfg.serial_port),
+                "serial_baud": str(int(cfg.serial_baud)),
+                "serial_sync": str(cfg.serial_sync),
+                "serial_frame_side": str(int(cfg.serial_frame_side)),
+                "serial_channels": str(int(cfg.serial_channels)),
+                "fps": str(float(cfg.fps)),
+                "view_fps": str(float(getattr(cfg, "view_fps", cfg.fps))),
+                "capture_fps": str(float(getattr(cfg, "capture_fps", 6.0))),
+            }, cors=True)
+            return
+        if path == "/live/activate":
+            session_id = str(payload.get("session") or "").strip()
+            source = str(payload.get("source") or "").strip().lower()
+            if not session_id or source not in {"webcam", "device"}:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            try:
+                with self._lock:
+                    old_cfg = self._configs.get(session_id)
+                if old_cfg is None:
+                    raise RuntimeError("missing config")
+                # Explicit activation is the ONLY path that lifts the
+                # stale-GET tombstone (including camera-change restarts).
+                self._live_closed_at.pop(session_id, None)
+                old_index = int(getattr(old_cfg, "webcam_index", 0) or 0)
+                old_uid = str(getattr(old_cfg, "webcam_id", "") or "")
+                idx_raw = payload.get("webcam_index")
+                uid_raw = payload.get("webcam_id")
+                new_index = None
+                if idx_raw not in (None, ""):
+                    new_index = int(float(str(idx_raw).replace("×", " ").split()[0]))
+                new_uid = None if uid_raw is None else str(uid_raw)
+                camera_changed = (
+                    (new_index is not None and int(new_index) != old_index)
+                    or (new_uid is not None and new_uid != old_uid)
+                )
+                if camera_changed:
+                    self.update_config(
+                        session_id,
+                        webcam_index=new_index,
+                        webcam_id=new_uid,
+                    )
+                    if source == "webcam":
+                        self._restart_webcam_live(session_id)
+                    else:
+                        self._ensure_live(session_id=session_id, source=source, explicit=True)
+                else:
+                    self._ensure_live(session_id=session_id, source=source, explicit=True)
+                with self._lock:
+                    cfg_now = self._configs.get(session_id)
+                _send_json(req, {
+                    "ok": "1",
+                    "active_source": source,
+                    "webcam_index": str(int(cfg_now.webcam_index)) if cfg_now else "",
+                    "webcam_id": str(getattr(cfg_now, "webcam_id", "") or "") if cfg_now else "",
+                }, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+            return
+        if path == "/live/close":
+            session_id = str(payload.get("session") or "").strip()
+            source = str(payload.get("source") or "").strip().lower() or None
+            close_all = _is_truthy(payload.get("all"))
+            if not session_id and not close_all:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                self._bump_stream_generation()
+                if close_all:
+                    # Stop BOTH producers (webcam + serial) and join them, so
+                    # cv2.VideoCapture.release() / serial close run before the
+                    # response.  A session-less all-close targets every live
+                    # session (app teardown).
+                    with self._lock:
+                        targets = (
+                            [session_id]
+                            if session_id
+                            else sorted({key.rsplit(":", 1)[0] for key in self._live})
+                        )
+                    stopped: List[str] = []
+                    for sid in targets:
+                        if not sid:
+                            continue
+                        self._stop_live(session_id=sid, source=None, wait=True, timeout_s=2.0)
+                        self._live_closed_at[sid] = time.time()
+                        stopped.append(sid)
+                    _send_json(req, {"ok": "1", "stopped": stopped}, cors=True)
+                    return
+                self._stop_live(session_id=session_id, source=source, wait=True, timeout_s=2.0)
+                self._live_closed_at[session_id] = time.time()
+                _send_json(req, {"ok": "1", "stopped": [session_id]}, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+            return
+        if path == "/record/pull":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            count = max(1, min(50, int(payload.get("count") or 1)))
+            with self._lock:
+                cfg = self._configs.get(session_id)
+                source = str(payload.get("source") or self._active_source.get(session_id) or "")
+            if cfg is None or not class_name or not source:
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            if source not in {"webcam", "device"}:
+                _send_json(req, {"ok": "0", "error": "invalid source"}, status=400, cors=True)
+                return
+            try:
+                self._ensure_live(session_id=session_id, source=source)
+            except Exception:
+                pass
+            saved = []
+            for _ in range(count):
+                png = self._get_live_capture_fresh(session_id=session_id, source=source, timeout_s=1.0)
+                if png is None:
+                    break
+                p = _save_png(cfg.dataset_root, class_name, png)
+                self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size), project_type=str(cfg.project_type))
+                saved.append({
+                    "filename": p.name,
+                    "thumb_b64": base64.b64encode(png).decode("ascii"),
+                    "src": _sample_src_url(session_id, class_name, p),
+                })
+            if saved:
+                self._mark_dataset_dirty(cfg.dataset_root)
+            response = {"ok": "1" if saved else "0", "saved": saved, "count": len(saved)}
+            if not saved:
+                response["error"] = self._get_live_error(session_id=session_id, source=source) or "capture unavailable"
+            try:
+                response["state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
+            return
+        if path == "/record/flush":
+            session_id = str(payload.get("session") or "").strip()
+            source = str(payload.get("source") or "").strip().lower() or None
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                self._bump_stream_generation()
+                self._stop_live(session_id=session_id, source=source, wait=True, timeout_s=2.0)
+                _send_json(req, {"ok": "1"}, cors=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+            return
+        if path == "/samples/import_paths":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            paths = payload.get("paths")
+            if not session_id or not class_name or not isinstance(paths, list):
+                _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
+                return
+            with self._lock:
+                cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            classes = self._classes_load(cfg.dataset_root)
+            if class_name not in classes:
+                _send_json(req, {"ok": "0", "error": "unknown class"}, status=400, cors=True)
+                return
+            saved = []
+            errors = []
+            for raw_path in paths[:200]:
+                path = _fs_expand_path(raw_path)
+                if path is None or not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+                    errors.append({"path": str(raw_path), "error": "not an image file"})
+                    continue
+                if not _fs_path_allowed(path):
+                    errors.append({"path": str(path), "error": "path not allowed"})
+                    continue
+                try:
+                    img = Image.open(path)
+                    try:
+                        img = ImageOps.exif_transpose(img)
+                        if img.mode not in {"L", "RGB"}:
+                            img = img.convert("RGB")
+                        png = _to_png_bytes(img)
+                    finally:
+                        try:
+                            img.close()
+                        except Exception:
+                            pass
+                    p = _save_png(cfg.dataset_root, class_name, png)
+                    self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size), project_type=str(cfg.project_type))
+                    thumb = Image.open(path)
+                    try:
+                        thumb = ImageOps.exif_transpose(thumb).convert("RGB")
+                        thumb.thumbnail((96, 96))
+                        thumb_png = _to_png_bytes(thumb)
+                    finally:
+                        try:
+                            thumb.close()
+                        except Exception:
+                            pass
+                    saved.append({
+                        "filename": p.name,
+                        "thumb_b64": base64.b64encode(thumb_png).decode("ascii"),
+                        # URL, not a data: URL — the SPA renders the thumb
+                        # through /sample_image so a 200-file import never
+                        # pushes megabytes of base64 through the main thread.
+                        "src": _sample_src_url(session_id, class_name, p),
+                    })
+                except Exception as e:
+                    errors.append({"path": str(path), "error": str(e)})
+            if saved:
+                self._mark_dataset_dirty(cfg.dataset_root)
+            response = {"ok": "1" if saved else "0", "saved": saved, "errors": errors}
+            try:
+                response["state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
+            return
+        if path == "/import/classified":
+            session_id = str(payload.get("session") or "").strip()
+            folder = _fs_expand_path(payload.get("path"))
+            if not session_id or folder is None or not folder.is_dir() or not _fs_path_allowed(folder):
+                _send_json(req, {"ok": "0", "error": "invalid folder"}, status=400, cors=True)
+                return
+            with self._lock:
+                cfg = self._configs.get(session_id)
+            if cfg is None:
+                _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
+                return
+            try:
+                imported = infer_imported_data(folder)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            if not imported.classified or not imported.class_to_images:
+                _send_json(req, {"ok": "0", "error": "folder must contain class subfolders"}, status=400, cors=True)
+                return
+            classes = self._classes_load(cfg.dataset_root)
+            selected: Dict[str, str] = {}
+            entries_raw = payload.get("entries")
+            if isinstance(entries_raw, list) and entries_raw:
+                for entry in entries_raw:
+                    if not isinstance(entry, dict):
+                        continue
+                    source = str(entry.get("source") or entry.get("name") or "").strip()
+                    target = sanitize_class_name(str(entry.get("name") or source))
+                    if source in imported.class_to_images and target:
+                        selected[source] = target
+            if not selected:
+                for name in imported.class_to_images.keys():
+                    selected[name] = sanitize_class_name(name)
+            names = list(dict.fromkeys(selected.values()))
+            new_names = [name for name in names if name not in classes]
+            if new_names:
+                try:
+                    self._classes_add_named(session_id=session_id, names=new_names, prune_empty_placeholders=False)
+                except Exception:
+                    for name in new_names:
+                        (cfg.dataset_root / name).mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for source_name, class_name in selected.items():
+                files = imported.class_to_images.get(source_name) or []
+                for src in files:
+                    try:
+                        img = Image.open(src)
+                        try:
+                            img = ImageOps.exif_transpose(img)
+                            if img.mode not in {"L", "RGB"}:
+                                img = img.convert("RGB")
+                            png = _to_png_bytes(img)
+                        finally:
+                            try:
+                                img.close()
+                            except Exception:
+                                pass
+                        p = _save_png(cfg.dataset_root, class_name, png)
+                        self._cache_one_sample(cfg.dataset_root, class_name, p, img_size=int(cfg.img_size), project_type=str(cfg.project_type))
+                        copied += 1
+                    except Exception:
+                        continue
+            self._mark_dataset_dirty(cfg.dataset_root)
+            response = {"ok": "1", "class_count": len(names), "sample_count": copied}
+            try:
+                response["state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
+            return
         if path == "/upload":
             session_id = str(payload.get("session") or "").strip()
             class_name = str(payload.get("class") or "").strip()
@@ -1600,16 +4150,41 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(
-                req,
-                {
-                    "ok": "1",
-                    "class": class_name,
-                    "filename": p.name,
-                    "thumb_b64": thumb_b64,
-                },
-                cors=True,
-            )
+            response = {
+                "ok": "1",
+                "class": class_name,
+                "filename": p.name,
+                "thumb_b64": thumb_b64,
+                "src": _sample_src_url(session_id, class_name, p),
+            }
+            # Batch uploads pass state=0: N x the full runtime payload (every
+            # filename + thumbnail URL) dominated a drop of 100 images.  The
+            # client fetches /project/state ONCE after the batch instead.
+            # (`or "1"` would treat the integer 0 as absent.)
+            state_flag = payload.get("state")
+            if state_flag is None:
+                state_flag = "1"
+            if str(state_flag).strip().lower() not in {"0", "false", "no"}:
+                try:
+                    response["state"] = self._runtime_state_payload(session_id)
+                except Exception:
+                    pass
+            _send_json(req, response, cors=True)
+            return
+        if path == "/window/mode":
+            mode = str(payload.get("mode") or "").strip().lower()
+            if mode not in {"workspace", "launcher"}:
+                _send_json(req, {"ok": "0", "error": "mode must be workspace|launcher"}, status=400, cors=True)
+                return
+            applied = self.request_window_mode(mode)
+            _send_json(req, {"ok": "1" if applied else "0", "mode": mode}, cors=True)
+            return
+        if path == "/app/quit":
+            # Fallback for the browser host (and any WKWebView case where the
+            # JS bridge is not ready): answer first, then stop workers and
+            # terminate this process.
+            _send_json(req, {"ok": "1"}, cors=True)
+            self.request_quit()
             return
         if path == "/train/start":
             session_id = str(payload.get("session") or "").strip()
@@ -1623,6 +4198,18 @@ class RecordController:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
             _send_json(req, {"ok": "1"}, cors=True)
+            return
+        if path == "/train/cancel":
+            session_id = str(payload.get("session") or "").strip()
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            try:
+                cancelling = self._cancel_train(session_id)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "cancelling": "1" if cancelling else "0", **self._train_status_payload(session_id)}, cors=True)
             return
         if path == "/train/config":
             session_id = str(payload.get("session") or "").strip()
@@ -1711,10 +4298,18 @@ class RecordController:
                 return
             try:
                 result = self._classes_reorder(session_id, [str(x) for x in ordered])
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "classes": result}, cors=True)
+            response: Dict[str, Any] = {"ok": "1", "classes": result}
+            try:
+                # Counts/previews travel with the order: a reorder must not
+                # make the SPA rebuild every class card from name-only data.
+                response.update(self._runtime_state_payload(session_id))
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
         if path == "/classes/save_config":
             session_id = str(payload.get("session") or "").strip()
@@ -1730,6 +4325,13 @@ class RecordController:
                     _send_json(req, {"ok": "0", "error": "missing config"}, status=400, cors=True)
                     return
                 classes = self._classes_load(sess_cfg.dataset_root)
+                normalized_class = normalize_class_preprocess_map(class_preprocess) if class_preprocess else None
+                normalized_sample = normalize_sample_preprocess_map(sample_preprocess) if sample_preprocess is not None else self._sample_preprocess_load(sess_cfg.dataset_root)
+                clear_names = payload.get("clear_sample_preprocess")
+                if isinstance(clear_names, list) and clear_names:
+                    normalized_sample = dict(normalized_sample or {})
+                    for name in clear_names:
+                        normalized_sample.pop(str(name), None)
                 # BOTH maps, and each one only when the caller actually sent
                 # it: _classes_save treats None as "keep what is on disk", so a
                 # save that carries only one of them cannot blank the other.
@@ -1740,12 +4342,12 @@ class RecordController:
                 self._classes_save(
                     sess_cfg.dataset_root,
                     classes,
-                    class_preprocess=normalize_class_preprocess_map(class_preprocess) if class_preprocess else None,
+                    class_preprocess=normalized_class,
                     # `is not None`, not truthiness: an EMPTY map is what the
                     # client sends after removing the last sample override, and
                     # that has to clear the stored map rather than be read as
                     # "no opinion, keep what is on disk".
-                    sample_preprocess=normalize_sample_preprocess_map(sample_preprocess) if sample_preprocess is not None else None,
+                    sample_preprocess=normalized_sample,
                 )
                 # Thresholds / ROI config changed — the processed cache must
                 # follow so previews and the next training use the new
@@ -1753,18 +4355,24 @@ class RecordController:
                 try:
                     self._rebuild_processed_cache(
                         sess_cfg.dataset_root,
-                        class_preprocess=normalize_class_preprocess_map(class_preprocess) if class_preprocess else None,
-                        sample_preprocess=normalize_sample_preprocess_map(sample_preprocess) if sample_preprocess is not None else None,
+                        class_preprocess=normalized_class,
+                        sample_preprocess=normalized_sample,
                         fast_mode=False,
                         out_size=int(sess_cfg.img_size),
                         project_type=str(sess_cfg.project_type),
                     )
                 except Exception:
                     pass
+                self._mark_dataset_dirty(sess_cfg.dataset_root)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1"}, cors=True)
+            response = {"ok": "1"}
+            try:
+                response["state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
         if path == "/preview/ood":
             # The Input Settings preview group pushes its four OOD values
@@ -1848,6 +4456,8 @@ class RecordController:
             ood_sign_pct_max = float(ood_sign_pct_max) if ood_sign_pct_max is not None and str(ood_sign_pct_max).strip() != "" else None
             ood_max_prob_min = float(ood_max_prob_min) if ood_max_prob_min is not None and str(ood_max_prob_min).strip() != "" else None
             ood_entropy_ratio_max = float(ood_entropy_ratio_max) if ood_entropy_ratio_max is not None and str(ood_entropy_ratio_max).strip() != "" else None
+            view_roi = _is_truthy(payload.get("view_roi"))
+            view_orig = _is_truthy(payload.get("view_orig"))
             if not session_id or not image_b64:
                 _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
                 return
@@ -1896,6 +4506,11 @@ class RecordController:
                     "ok": "1",
                     **pred,
                     "image_b64": image_b64,
+                    "stage_image_b64": _preview_stage_image_b64(
+                        pred, image_b64, view_roi, view_orig
+                    ),
+                    "view_roi": "1" if view_roi else "0",
+                    "view_orig": "1" if view_orig else "0",
                 },
                 cors=True,
             )
@@ -1917,17 +4532,27 @@ class RecordController:
             image_b64_in = str(payload.get("image_b64") or "").strip()
             reuse = _is_truthy(payload.get("reuse"))
             filename = str(payload.get("filename") or "").strip()
+            view_roi = _is_truthy(payload.get("view_roi"))
+            view_orig = _is_truthy(payload.get("view_orig"))
             if not image_bytes and image_b64_in:
                 try:
                     image_bytes = base64.b64decode(image_b64_in, validate=True)
                 except Exception as e:
                     _send_json(req, {"ok": "0", "error": f"invalid image data: {e}"}, status=400, cors=True)
                     return
+            # `reuse=1` is the fader/toggle path: the original PNG bytes AND
+            # the decoded PIL frame are already in RAM, so a Dark/Lum/OOD
+            # drag or an [ROI]/[Orig] click never touches disk and never
+            # re-decodes or re-encodes the upload.
+            cached_img = None
+            orig_b64 = ""
             if not image_bytes and reuse:
                 with self._lock:
                     stored = dict(self._preview_uploads.get(session_id) or {})
                 image_bytes = stored.get("bytes")
                 filename = filename or str(stored.get("filename") or "")
+                cached_img = stored.get("pil")
+                orig_b64 = str(stored.get("orig_b64") or "")
             if not image_bytes:
                 _send_json(
                     req,
@@ -1939,29 +4564,36 @@ class RecordController:
             # Re-encode to a clean PNG BEFORE storing: EXIF-rotated phone
             # photos and palette/CMYK JPEGs would otherwise make the same
             # upload preprocess differently from the preview shown.
-            try:
-                src_img = Image.open(_bytes_io(image_bytes))
+            if cached_img is None or not orig_b64:
                 try:
-                    src_img = ImageOps.exif_transpose(src_img)
-                    if src_img.mode not in {"L", "RGB"}:
-                        src_img = src_img.convert("RGB")
-                    orig_png = _to_png_bytes(src_img)
-                finally:
+                    src_img = Image.open(_bytes_io(image_bytes))
                     try:
-                        src_img.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                _send_json(req, {"ok": "0", "error": f"unsupported image: {e}"}, status=400, cors=True)
-                return
-            with self._lock:
-                self._preview_uploads[session_id] = {
-                    "bytes": orig_png,
-                    "filename": filename,
-                    # A real file the user chose; the sign auto-preview must
-                    # never replace it on the next auto-fill / training run.
-                    "synthetic": False,
-                }
+                        src_img = ImageOps.exif_transpose(src_img)
+                        if src_img.mode not in {"L", "RGB"}:
+                            src_img = src_img.convert("RGB")
+                        orig_png = _to_png_bytes(src_img)
+                        cached_img = src_img.copy()
+                        orig_b64 = base64.b64encode(orig_png).decode("ascii")
+                    finally:
+                        try:
+                            src_img.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _send_json(req, {"ok": "0", "error": f"unsupported image: {e}"}, status=400, cors=True)
+                    return
+                with self._lock:
+                    self._preview_uploads[session_id] = {
+                        "bytes": orig_png,
+                        "filename": filename,
+                        # Decoded frame + response base64 are cached so a
+                        # fader drag recomputes entirely in RAM.
+                        "pil": cached_img,
+                        "orig_b64": orig_b64,
+                        # A real file the user chose; the sign auto-preview must
+                        # never replace it on the next auto-fill / training run.
+                        "synthetic": False,
+                    }
 
             def _opt_int(*keys: str) -> Optional[int]:
                 for key in keys:
@@ -1989,7 +4621,7 @@ class RecordController:
                 if self._is_sign_ocr_session(session_id):
                     pred = self._preview_predict_sign_ocr(
                         session_id=session_id,
-                        png=orig_png,
+                        png=cached_img,
                         sign_sequence=payload.get("sign_sequence"),
                         sign_sequences=payload.get("sign_sequences"),
                         reading_order=payload.get("reading_order"),
@@ -2008,11 +4640,13 @@ class RecordController:
                         ood_sign_pct_max=_opt_float("ood_sign_max", "ood_sign_pct_max"),
                         match_min_prob=_opt_float("match_min", "match_min_prob"),
                         preprocess_frame_side=GLYPH_PREPROCESS_FRAME_SIDE,
+                        view_roi=view_roi,
+                        view_orig=view_orig,
                     )
                 else:
                     pred = self._preview_predict(
                         session_id=session_id,
-                        png=orig_png,
+                        png=cached_img,
                         preprocess_mode=str(payload.get("preprocess") or "").strip(),
                         bg_dark_thresh=bg_dark_thresh,
                         bg_lum_thresh=bg_lum_thresh,
@@ -2024,7 +4658,6 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            orig_b64 = base64.b64encode(orig_png).decode("ascii")
             _send_json(
                 req,
                 {
@@ -2035,9 +4668,136 @@ class RecordController:
                     # keys because the SPA's ROI/Orig toggles use them by
                     # name; image_b64 stays for older callers.
                     "image_b64": orig_b64,
+                    "stage_image_b64": _preview_stage_image_b64(
+                        pred, orig_b64, view_roi, view_orig
+                    ),
+                    "view_roi": "1" if view_roi else "0",
+                    "view_orig": "1" if view_orig else "0",
                     "orig_b64": orig_b64,
                     "roi_b64": str(pred.get("processed_image_b64") or ""),
                     "filename": filename or "upload",
+                },
+                cors=True,
+            )
+            return
+        if path == "/preview/upload_path":
+            # Path-based test upload: the browser sends a canonical path (via
+            # #fsBrowserModal); the SERVER reads the bytes, so no full image
+            # ever crosses the main thread as base64.  The response matches
+            # /preview/upload exactly, including the stored frame so later
+            # slider moves can reuse it.
+            session_id = str(payload.get("session") or "").strip()
+            raw_path = payload.get("path")
+            view_roi = _is_truthy(payload.get("view_roi"))
+            view_orig = _is_truthy(payload.get("view_orig"))
+            if not session_id or raw_path in (None, ""):
+                _send_json(req, {"ok": "0", "error": "missing params"}, status=400, cors=True)
+                return
+            image_path = _fs_expand_path(raw_path)
+            if (
+                image_path is None
+                or not image_path.is_file()
+                or image_path.suffix.lower() not in IMAGE_EXTS
+                or not _fs_path_allowed(image_path)
+            ):
+                _send_json(req, {"ok": "0", "error": "not an allowed image file"}, status=400, cors=True)
+                return
+            try:
+                raw_bytes = image_path.read_bytes()
+                src_img = Image.open(_bytes_io(raw_bytes))
+                try:
+                    src_img = ImageOps.exif_transpose(src_img)
+                    if src_img.mode not in {"L", "RGB"}:
+                        src_img = src_img.convert("RGB")
+                    orig_png = _to_png_bytes(src_img)
+                finally:
+                    try:
+                        src_img.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": f"unsupported image: {e}"}, status=400, cors=True)
+                return
+            with self._lock:
+                self._preview_uploads[session_id] = {
+                    "bytes": orig_png,
+                    "filename": image_path.name,
+                    "synthetic": False,
+                }
+
+            def _up_int(*keys: str) -> Optional[int]:
+                for key in keys:
+                    raw = payload.get(key)
+                    if raw is not None and str(raw).strip() != "":
+                        try:
+                            return int(float(raw))
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            def _up_float(*keys: str) -> Optional[float]:
+                for key in keys:
+                    raw = payload.get(key)
+                    if raw is not None and str(raw).strip() != "":
+                        try:
+                            return float(raw)
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            bg_dark_thresh = _up_int("bg_dark", "dark")
+            bg_lum_thresh = _up_int("bg_lum", "lum")
+            try:
+                if self._is_sign_ocr_session(session_id):
+                    pred = self._preview_predict_sign_ocr(
+                        session_id=session_id,
+                        png=orig_png,
+                        sign_sequence=payload.get("sign_sequence"),
+                        sign_sequences=payload.get("sign_sequences"),
+                        reading_order=payload.get("reading_order"),
+                        bg_dark_thresh=bg_dark_thresh,
+                        bg_lum_thresh=bg_lum_thresh,
+                        ood_max_prob_min=_up_float("ood_max_prob", "ood_max_prob_min"),
+                        ood_entropy_ratio_max=_up_float("ood_entropy_max", "ood_entropy_ratio_max"),
+                        ood_sign_pct_min=_up_float("ood_sign_min", "ood_sign_pct_min"),
+                        ood_sign_pct_max=_up_float("ood_sign_max", "ood_sign_pct_max"),
+                        match_min_prob=_up_float("match_min", "match_min_prob"),
+                        preprocess_frame_side=GLYPH_PREPROCESS_FRAME_SIDE,
+                        view_roi=view_roi,
+                        view_orig=view_orig,
+                    )
+                else:
+                    pred = self._preview_predict(
+                        session_id=session_id,
+                        png=orig_png,
+                        preprocess_mode=str(payload.get("preprocess") or "").strip(),
+                        bg_dark_thresh=bg_dark_thresh,
+                        bg_lum_thresh=bg_lum_thresh,
+                        ood_sign_pct_min=_up_float("ood_sign_min"),
+                        ood_sign_pct_max=_up_float("ood_sign_max"),
+                        ood_max_prob_min=_up_float("ood_max_prob"),
+                        ood_entropy_ratio_max=_up_float("ood_entropy_max"),
+                        view_roi=view_roi,
+                        view_orig=view_orig,
+                    )
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            orig_b64 = base64.b64encode(orig_png).decode("ascii")
+            _send_json(
+                req,
+                {
+                    "ok": "1",
+                    **pred,
+                    "image_b64": orig_b64,
+                    "stage_image_b64": _preview_stage_image_b64(
+                        pred, orig_b64, view_roi, view_orig
+                    ),
+                    "view_roi": "1" if view_roi else "0",
+                    "view_orig": "1" if view_orig else "0",
+                    "orig_b64": orig_b64,
+                    "roi_b64": str(pred.get("processed_image_b64") or ""),
+                    "filename": image_path.name,
                 },
                 cors=True,
             )
@@ -2049,6 +4809,8 @@ class RecordController:
             # sign split + three invokes the upload path runs.  One response
             # shape, so the SPA card does not care which one produced it.
             session_id = str(payload.get("session") or "").strip()
+            view_roi = _is_truthy(payload.get("view_roi"))
+            view_orig = _is_truthy(payload.get("view_orig"))
             if not session_id:
                 _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
                 return
@@ -2171,6 +4933,11 @@ class RecordController:
                     "ok": "1",
                     **pred,
                     "image_b64": orig_b64,
+                    "stage_image_b64": _preview_stage_image_b64(
+                        pred, orig_b64, view_roi, view_orig
+                    ),
+                    "view_roi": "1" if view_roi else "0",
+                    "view_orig": "1" if view_orig else "0",
                     "orig_b64": orig_b64,
                     "roi_b64": str(pred.get("processed_image_b64") or ""),
                     "filename": synth["filename"],
@@ -2258,6 +5025,8 @@ class RecordController:
             if not session_id or not save_path:
                 _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
                 return
+            # Persist every queued capture before the archive snapshot.
+            self._flush_capture_writes(timeout=5.0)
             try:
                 out_path = self._project_save(
                     session_id=session_id,
@@ -2267,7 +5036,84 @@ class RecordController:
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
+            # Every explicit save leaves a recoverable snapshot in ./backup/.
+            try:
+                self._create_backup(session_id, "SAVE")
+            except Exception:
+                pass
+            try:
+                _recent_mru_touch(out_path, folder=out_path.parent)
+            except Exception:
+                pass
             _send_json(req, {"ok": "1", "save_path": str(out_path)}, cors=True)
+            return
+        if path == "/project/touch":
+            # Tier-1 flush used by the SPA on stage switch / return home /
+            # quit, and debounced after ROI or class mutations.  Writes the
+            # lightweight sidecar, never the full image archive.
+            session_id = str(payload.get("session") or "").strip()
+            if not session_id:
+                _send_json(req, {"ok": "0", "error": "missing session"}, status=400, cors=True)
+                return
+            # Stage switch / return home / quit: drain capture disk writes.
+            self._flush_capture_writes(timeout=5.0)
+            try:
+                archive = self._project_meta_commit(session_id)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {
+                "ok": "1",
+                "path": str(archive) if archive is not None else "",
+            }, cors=True)
+            return
+        if path == "/backup/restore":
+            session_id = str(payload.get("session") or "").strip()
+            confirm = str(payload.get("confirm") or "").strip()
+            backup_path = self._valid_backup_path(session_id, payload.get("path"))
+            if not session_id or confirm != "1" or backup_path is None:
+                _send_json(req, {"ok": "0", "error": "missing or invalid backup"}, status=400, cors=True)
+                return
+            try:
+                state = self._project_open(session_id=session_id, open_path=backup_path)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", "path": str(backup_path), "state": state}, cors=True)
+            return
+        if path == "/backup/restore_class":
+            session_id = str(payload.get("session") or "").strip()
+            class_name = str(payload.get("class") or "").strip()
+            backup_path = self._valid_backup_path(session_id, payload.get("path"))
+            if not session_id or not class_name or backup_path is None:
+                _send_json(req, {"ok": "0", "error": "missing or invalid backup"}, status=400, cors=True)
+                return
+            try:
+                result = self._backup_restore_class(session_id, backup_path, class_name)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1", **result}, cors=True)
+            return
+        if path == "/backup/delete":
+            session_id = str(payload.get("session") or "").strip()
+            backup_path = self._valid_backup_path(session_id, payload.get("path"))
+            if not session_id or backup_path is None:
+                _send_json(req, {"ok": "0", "error": "missing or invalid backup"}, status=400, cors=True)
+                return
+            try:
+                backup_path.unlink(missing_ok=True)
+            except Exception as e:
+                _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
+                return
+            _send_json(req, {"ok": "1"}, cors=True)
+            return
+        if path == "/project/bind":
+            # The launcher opens projects it has no session for.  Attach one
+            # to the project's own dataset (in place) before the SPA hydrates.
+            result = self._bind_project(payload.get("path") or payload.get("open_path"), payload.get("folder"))
+            status = int(result.pop("status", 200) or 200)
+            _send_json(req, result, status=status, cors=True)
             return
         if path == "/project/open":
             session_id = str(payload.get("session") or "").strip()
@@ -2319,6 +5165,7 @@ class RecordController:
             try:
                 classes = self._classes_add(session_id=session_id)
                 self._seed_empty_char_classes(session_id)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -2348,6 +5195,7 @@ class RecordController:
                     prune_empty_placeholders=bool(payload.get("prune_placeholders")),
                 )
                 self._seed_empty_char_classes(session_id)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -2396,6 +5244,30 @@ class RecordController:
             if not isinstance(names, list) or not names:
                 _send_json(req, {"ok": "0", "error": "missing names"}, status=400, cors=True)
                 return
+            # Validate BEFORE the train-config patch: _classes_sync_ocr raises
+            # on a non-single-character name, and leaving a half-written
+            # sign_sequences target behind made a rejected edit look like a
+            # silent plate-sync failure on the next reload.
+            bad_name = next(
+                (str(n) for n in names if not re.fullmatch(r"[0-9A-Za-z]", str(n).strip())),
+                None,
+            )
+            if bad_name is not None:
+                _send_json(req, {
+                    "ok": "0",
+                    "error": f"Not a sign character: {bad_name!r}",
+                }, status=400, cors=True)
+                return
+            bad_seq = next(
+                (s for s in sequences if not re.fullmatch(r"[0-9A-Za-z]{3}", str(s))),
+                None,
+            )
+            if bad_seq is not None:
+                _send_json(req, {
+                    "ok": "0",
+                    "error": f"Plate must be exactly 3 letters or digits: {bad_seq!r}",
+                }, status=400, cors=True)
+                return
             try:
                 with self._lock:
                     sess_cfg = self._configs.get(session_id)
@@ -2416,6 +5288,7 @@ class RecordController:
                     self._save_train_cfg(session_id, patch)
 
                 classes = self._classes_sync_ocr(session_id=session_id, names=names)
+                self._mark_dirty_for_session(session_id)
                 # A slot character that just became a class starts empty.
                 # Backfill when EITHER the caller's current checkbox state or
                 # the project's persisted TrainConfig says auto-fill is on.
@@ -2472,15 +5345,27 @@ class RecordController:
             session_id = str(payload.get("session") or "").strip()
             class_name = str(payload.get("class") or "").strip()
             filename = str(payload.get("filename") or "").strip()
-            if not session_id or not class_name or not filename:
+            filenames = payload.get("filenames")
+            if not isinstance(filenames, list):
+                filenames = [filename] if filename else []
+            filenames = [str(name).strip() for name in filenames if str(name).strip()]
+            if not session_id or not class_name or not filenames:
                 _send_json(req, {"ok": "0", "error": "missing fields"}, status=400, cors=True)
                 return
             try:
-                state = self._sample_delete(session_id=session_id, class_name=class_name, filename=filename)
+                state = None
+                for name in filenames:
+                    state = self._sample_delete(session_id=session_id, class_name=class_name, filename=name)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "state": state}, cors=True)
+            response = {"ok": "1", "deleted": len(filenames), "state": state}
+            try:
+                response["runtime_state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
         if path == "/samples/clear":
             session_id = str(payload.get("session") or "").strip()
@@ -2490,10 +5375,16 @@ class RecordController:
                 return
             try:
                 state = self._samples_clear(session_id=session_id, class_name=class_name)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "state": state}, cors=True)
+            response = {"ok": "1", "state": state}
+            try:
+                response["runtime_state"] = self._runtime_state_payload(session_id)
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
         if path in ("/samples/seed_emnist", "/classes/seed_emnist"):
             session_id = str(payload.get("session") or "").strip()
@@ -2514,6 +5405,7 @@ class RecordController:
                     sign_sequence=payload.get("sign_sequence") or payload.get("sign_seq"),
                     reading_order=payload.get("reading_order") or payload.get("reading"),
                 )
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
@@ -2527,10 +5419,16 @@ class RecordController:
                 return
             try:
                 classes = self._classes_delete(session_id=session_id, name=name)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "classes": classes}, cors=True)
+            response: Dict[str, Any] = {"ok": "1", "classes": classes}
+            try:
+                response.update(self._runtime_state_payload(session_id))
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
         if path == "/classes/rename":
             session_id = str(payload.get("session") or "").strip()
@@ -2541,10 +5439,18 @@ class RecordController:
                 return
             try:
                 classes = self._classes_rename(session_id=session_id, old_name=old_name, new_name=new_name)
+                self._mark_dirty_for_session(session_id)
             except Exception as e:
                 _send_json(req, {"ok": "0", "error": str(e)}, status=400, cors=True)
                 return
-            _send_json(req, {"ok": "1", "classes": classes}, cors=True)
+            response: Dict[str, Any] = {"ok": "1", "classes": classes}
+            try:
+                # A rename moves the samples to a new label; without these,
+                # the card would show 0 samples until the next hydrate.
+                response.update(self._runtime_state_payload(session_id))
+            except Exception:
+                pass
+            _send_json(req, response, cors=True)
             return
 
         session_id = str(payload.get("session") or "").strip()
@@ -2582,6 +5488,136 @@ class RecordController:
     def _classes_meta_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_classes.json"
 
+    def _dataset_dirty_path(self, dataset_root: Path) -> Path:
+        return dataset_root.parent / "dataset_dirty_since_train.json"
+
+    def _mark_dataset_dirty(self, dataset_root: Path) -> None:
+        try:
+            path = self._dataset_dirty_path(dataset_root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"at": time.time()}) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _dataset_dirty_since_train(self, dataset_root: Path) -> bool:
+        try:
+            return self._dataset_dirty_path(dataset_root).is_file()
+        except Exception:
+            return False
+
+    def _mark_dirty_for_session(self, session_id: str) -> None:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is not None:
+            self._mark_dataset_dirty(cfg.dataset_root)
+            archive = _existing_project_archive(cfg.dataset_root)
+            if archive is not None:
+                _recent_mru_touch(archive, folder=cfg.dataset_root.parent)
+            self._schedule_meta_commit(session_id)
+
+    # ── Tier-1 metadata commit (no zip rewrite) ─────────────────────────────
+    def _schedule_meta_commit(self, session_id: str, delay: float = 0.5) -> None:
+        """Coalesce rapid class/ROI mutations into one sidecar write."""
+        if not session_id:
+            return
+        try:
+            delay = max(0.0, float(delay))
+        except Exception:
+            delay = 0.5
+        timer = threading.Timer(delay, self._flush_meta_commit, args=(session_id,))
+        timer.daemon = True
+        with self._meta_timer_lock:
+            old = self._meta_timers.pop(session_id, None)
+            if old is not None:
+                try:
+                    old.cancel()
+                except Exception:
+                    pass
+            self._meta_timers[session_id] = timer
+        timer.start()
+
+    def _flush_meta_commit(self, session_id: str) -> None:
+        with self._meta_timer_lock:
+            self._meta_timers.pop(session_id, None)
+        try:
+            self._project_meta_commit(session_id)
+        except Exception:
+            pass
+
+    def _flush_pending_meta_commits(self) -> None:
+        with self._meta_timer_lock:
+            todos = list(self._meta_timers.keys())
+            for timer in self._meta_timers.values():
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            self._meta_timers.clear()
+        for session_id in todos:
+            try:
+                self._project_meta_commit(session_id)
+            except Exception:
+                continue
+
+    def _project_meta_commit(self, session_id: str) -> Optional[Path]:
+        """Atomically refresh ``tm_project_state.json`` and the MRU entry.
+
+        This is the Tier-1 path: counts, class order, ROI and threshold maps
+        are committed to the lightweight sidecar (and the archive is created
+        only if it is missing).  The archive's image payload is never rewritten
+        here — that belongs to an explicit save / retrain snapshot.
+        """
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            return None
+        dataset_root = Path(cfg.dataset_root)
+        if not dataset_root.is_dir():
+            # The owner removed the workspace (project delete / test cleanup);
+            # never recreate files under a directory that is going away.
+            return None
+        folder = dataset_root.parent
+        classes = self._classes_load(dataset_root)
+        counts: Dict[str, int] = {}
+        for name in classes:
+            try:
+                counts[name] = len(_list_class_image_files(dataset_root / sanitize_class_name(name)))
+            except Exception:
+                counts[name] = 0
+        project_type = str(getattr(cfg, "project_type", PROJECT_TYPE_IMAGE) or PROJECT_TYPE_IMAGE)
+        try:
+            train_cfg = self._project_train_cfg(dataset_root) or {}
+        except Exception:
+            train_cfg = {}
+        if not isinstance(train_cfg, dict) or not train_cfg:
+            train_cfg = {
+                "project_type": project_type,
+                "img_size": int(getattr(cfg, "img_size", 0) or default_img_size(project_type) or 96),
+            }
+        state: Dict[str, Any] = {
+            "project_type": project_type,
+            "classes": classes,
+            "counts": counts,
+            "class_preprocess": self._class_preprocess_load(dataset_root),
+            "sample_preprocess": self._sample_preprocess_load(dataset_root),
+            "train_cfg": train_cfg,
+        }
+        state.update(project_header(project_type))
+        state_path = folder / "tm_project_state.json"
+        try:
+            self._atomic_write_text(
+                state_path,
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            )
+        except Exception:
+            pass
+        archive = _existing_project_archive(dataset_root)
+        if archive is None:
+            archive = _synthesize_project_archive(folder)
+        if archive is not None:
+            _recent_mru_touch(archive, folder=folder)
+        return archive
+
     def _processed_cache_dir(self, dataset_root: Path) -> Path:
         return dataset_root.parent / ".tm_processed_cache"
 
@@ -2613,7 +5649,9 @@ class RecordController:
         inferred = self._classes_infer_from_dirs(dataset_root)
         if inferred:
             return inferred
-        return ["Class 1", "Class 2"]
+        # A truly blank project has ZERO classes.  The old Class 1/Class 2
+        # placeholder was prototype data that leaked into every cold start.
+        return []
 
     def _class_preprocess_load(self, dataset_root: Path) -> Dict[str, Dict[str, Any]]:
         raw = self._classes_meta_load(dataset_root)
@@ -3323,6 +6361,22 @@ class RecordController:
     def _train_result_path(self, dataset_root: Path) -> Path:
         return dataset_root.parent / "tm_train_latest.json"
 
+    @staticmethod
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @classmethod
+    def _atomic_write_text(cls, path: Path, text: str) -> None:
+        cls._atomic_write_bytes(path, text.encode("utf-8"))
+
     def _export_run(self, session_id: str, export_dir: Path, model_name: str, array_name: str, overwrite: bool = False, runtime_config: Optional[Dict[str, Any]] = None) -> Path:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -3405,13 +6459,16 @@ class RecordController:
             raise ExportConflictError(conflicts)
 
         src, hdr = export_tflite_c_sources(source_bytes, array_name=array)
-        (export_dir / f"{safe_base}.tflite").write_bytes(source_bytes)
-        (export_dir / h_name).write_text(hdr, encoding="utf-8")
-        (export_dir / cpp_name).write_text(f'#include "{h_name}"\n\n' + src, encoding="utf-8")
-        (export_dir / "labels.txt").write_text("\n".join([str(x) for x in labels]) + "\n", encoding="utf-8")
+        # Every artifact is written to a sibling temp file and renamed, so a
+        # crash can never leave a half-written .tflite or header in place of
+        # a previously good export (design.md: exports write temp then rename).
+        self._atomic_write_bytes(export_dir / f"{safe_base}.tflite", source_bytes)
+        self._atomic_write_text(export_dir / h_name, hdr)
+        self._atomic_write_text(export_dir / cpp_name, f'#include "{h_name}"\n\n' + src)
+        self._atomic_write_text(export_dir / "labels.txt", "\n".join([str(x) for x in labels]) + "\n")
         # Generate model_resolver.h from the actual ops in the exported model
         resolver_h = _generate_model_resolver_h(source_bytes)
-        (export_dir / "model_resolver.h").write_text(resolver_h, encoding="utf-8")
+        self._atomic_write_text(export_dir / "model_resolver.h", resolver_h)
         def _c_str(s: str) -> str:
             return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -3527,6 +6584,9 @@ class RecordController:
                 "// A class index of -1 means the character has no class in this",
                 "// export, so that slot can never match.",
                 "constexpr char kTargetSignSequence[] = " + _c_str("".join(sign_seq)) + ";",
+                "// Plain macro alias used by sketches and host-side build checks.",
+                "#define TM_TARGET_SIGN " + _c_str("".join(sign_seq)),
+                "#define TM_READING_ORDER " + _c_str("RTL" if reading_order == "rtl" else "LTR"),
                 "constexpr int kTargetSignClassIndices["
                 + str(int(len(sign_class_indices))) + "] = {"
                 + ", ".join(str(int(i)) for i in sign_class_indices) + "};",
@@ -3656,8 +6716,8 @@ class RecordController:
                 "",
             ]
         )
-        (export_dir / "model_settings.h").write_text(model_settings_h, encoding="utf-8")
-        (export_dir / "model_settings.cpp").write_text(model_settings_cpp, encoding="utf-8")
+        self._atomic_write_text(export_dir / "model_settings.h", model_settings_h)
+        self._atomic_write_text(export_dir / "model_settings.cpp", model_settings_cpp)
         # Stamp the deployed pointer: Preview must keep validating the SAME
         # model that was just exported to the device.  Without this, every
         # later training run silently advances the Preview model while the
@@ -3706,23 +6766,35 @@ class RecordController:
 
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_dir = export_dir / f"tm_dataset_{ts}"
-        out_dir.mkdir(parents=True, exist_ok=False)
+        # Build in a hidden temp directory, then rename: a partial dataset is
+        # never visible under its final name.
+        tmp_dir = export_dir / f".tm_dataset_{ts}.tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
         for class_name in classes:
             src_dir = dataset_root / sanitize_class_name(class_name)
-            dst_dir = out_dir / sanitize_class_name(class_name)
+            dst_dir = tmp_dir / sanitize_class_name(class_name)
             dst_dir.mkdir(parents=True, exist_ok=True)
             if not src_dir.exists():
                 continue
             for src in _list_class_image_files(src_dir):
                 shutil.copy2(src, dst_dir / src.name)
-        labels_txt = out_dir / "labels.txt"
-        labels_json = out_dir / "labels.json"
-        labels_txt.write_text("\n".join(classes) + "\n", encoding="utf-8")
-        labels_json.write_text(json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (tmp_dir / "labels.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+        (tmp_dir / "labels.json").write_text(
+            json.dumps({"labels": classes}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        tmp_dir.replace(out_dir)
         return out_dir
 
     def _project_save(
-        self, session_id: str, save_path: Path, project_state: Optional[Dict[str, Any]] = None
+        self,
+        session_id: str,
+        save_path: Path,
+        project_state: Optional[Dict[str, Any]] = None,
+        *,
+        rebuild_cache: bool = True,
+        extra_manifest: Optional[Dict[str, Any]] = None,
     ) -> Path:
         with self._lock:
             cfg = self._configs.get(session_id)
@@ -3788,6 +6860,10 @@ class RecordController:
             "project_state": "tm_project_state.json",
             "processed_cache_dir": "",
         }
+        # Backup snapshots stamp their own provenance (trigger/accuracy/counts/
+        # runtime config) into the manifest; a normal save passes nothing.
+        if isinstance(extra_manifest, dict):
+            manifest.update(extra_manifest)
 
         run_dir = Path(str(meta.get("run_dir") or "")).expanduser().resolve() if meta else Path()
         include_run_dir = bool(run_dir) and run_dir.exists() and str(run_dir).startswith(str(workspace_root.resolve()))
@@ -3795,7 +6871,9 @@ class RecordController:
             manifest["train_run_dir"] = "runs/latest"
         class_preprocess = normalize_class_preprocess_map(merged_project_state.get("class_preprocess"))
         sample_preprocess = normalize_sample_preprocess_map(merged_project_state.get("sample_preprocess"))
-        if processed_cache_dir.exists():
+        # A backup snapshot reuses the cache the explicit save just built;
+        # rebuilding it again would double the save latency for no gain.
+        if rebuild_cache and processed_cache_dir.exists():
             shutil.rmtree(processed_cache_dir)
         # The global mode is the FALLBACK for a class with no entry of its own,
         # so it has to come from the same place the session reads it — the
@@ -3806,16 +6884,17 @@ class RecordController:
         _state_mode = ""
         if isinstance(_state_train_cfg, dict):
             _state_mode = str(_state_train_cfg.get("preprocess_mode") or "")
-        self._rebuild_processed_cache(
-            dataset_root,
-            class_preprocess=class_preprocess,
-            sample_preprocess=sample_preprocess,
-            global_preprocess_mode=str(
-                _state_mode or merged_project_state.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL
-            ),
-            out_size=int(cfg.img_size),
-            project_type=project_type,
-        )
+        if rebuild_cache:
+            self._rebuild_processed_cache(
+                dataset_root,
+                class_preprocess=class_preprocess,
+                sample_preprocess=sample_preprocess,
+                global_preprocess_mode=str(
+                    _state_mode or merged_project_state.get("preprocess_mode") or PREPROCESS_MODE_AUTO_BY_LABEL
+                ),
+                out_size=int(cfg.img_size),
+                project_type=project_type,
+            )
         if processed_cache_dir.exists():
             manifest["processed_cache_dir"] = "processed_cache"
 
@@ -3886,6 +6965,271 @@ class RecordController:
                     zf.write(p, arcname=str(Path("runs/latest") / rel))
         tmp_path.replace(save_path)
         return save_path
+
+    def _backup_dir(self, dataset_root: Path) -> Path:
+        return Path(dataset_root).parent / "backup"
+
+    def _backup_retention_limit(self) -> int:
+        try:
+            raw = _load_global_settings().get("retention", 5)
+            value = int(float(str(raw)))
+        except Exception:
+            value = 5
+        return max(1, value)
+
+    def _prune_backups(self, backup_dir: Path) -> None:
+        try:
+            files = sorted(
+                [p for p in backup_dir.glob("backup_*.tmproj") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return
+        for stale in files[self._backup_retention_limit():]:
+            try:
+                stale.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _create_backup(
+        self, session_id: str, trigger: str = "SAVE", *, rebuild_cache: bool = False
+    ) -> Optional[Path]:
+        """Atomic full-project snapshot under ``<workspace>/backup/``.
+
+        The archive is written through ``_project_save`` (`.tmproj.tmp` then
+        replace), so a crash can never leave a half-written backup.  The
+        manifest carries the provenance Phase 3's Backup UI lists.
+        """
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            return None
+        dataset_root = Path(cfg.dataset_root)
+        backup_dir = self._backup_dir(dataset_root)
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+        meta: Dict[str, Any] = {}
+        latest = self._train_result_path(dataset_root)
+        if latest.exists():
+            try:
+                loaded = json.loads(latest.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except Exception:
+                meta = {}
+        accuracy = 0.0
+        metrics = meta.get("metrics") if isinstance(meta.get("metrics"), dict) else {}
+        try:
+            acc = float(metrics.get("val_accuracy") or 0.0)
+            accuracy = acc * 100.0 if acc <= 1.0 else acc
+        except Exception:
+            accuracy = 0.0
+        classes = self._classes_load(dataset_root)
+        sample_count = 0
+        for name in classes:
+            sample_count += len(_list_class_image_files(dataset_root / sanitize_class_name(name)))
+        try:
+            train_cfg = self._project_train_cfg(dataset_root)
+        except Exception:
+            train_cfg = {}
+        runtime_config = {
+            "img_size": int(cfg.img_size),
+            "project_type": str(cfg.project_type),
+            "serial_port": str(cfg.serial_port),
+            "serial_baud": int(cfg.serial_baud),
+            "serial_sync": str(cfg.serial_sync),
+            "serial_frame_side": int(cfg.serial_frame_side),
+            "serial_channels": int(cfg.serial_channels),
+            "webcam_index": int(cfg.webcam_index),
+            "fps": float(cfg.fps),
+            "reading_order": str(train_cfg.get("reading_order") or "ltr"),
+            "sign_sequences": list(train_cfg.get("sign_sequences") or []),
+            "color_mode": str(meta.get("color_mode") or train_cfg.get("color_mode") or ""),
+        }
+        safe_trigger = re.sub(r"[^A-Za-z0-9_-]+", "_", str(trigger or "SAVE")).strip("_").upper() or "SAVE"
+        stamp = time.strftime("%Y%m%d_%H%M")
+        acc_tag = f"{int(round(max(0.0, min(100.0, accuracy))))}"
+        extra = {
+            "backup_trigger": safe_trigger,
+            "accuracy": float(accuracy),
+            "created_at": int(time.time()),
+            "sample_count": int(sample_count),
+            "class_count": len(classes),
+            "classes": list(classes),
+            "trained": bool(meta),
+            "runtime_config": runtime_config,
+        }
+        # Serialise snapshot write + retention: two concurrent triggers (an
+        # explicit save racing a just-finished train) must not pick the same
+        # filename or prune each other's file.
+        with self._backup_lock:
+            path = backup_dir / f"backup_{stamp}_{safe_trigger}_acc{acc_tag}.tmproj"
+            if path.exists():
+                # More than one snapshot in the same minute (save + train, or
+                # a rapid save loop) must never overwrite an earlier one.
+                suffix = time.strftime("%S")
+                for counter in range(0, 1000):
+                    candidate = backup_dir / (
+                        f"backup_{stamp}_{suffix}_{safe_trigger}_acc{acc_tag}"
+                        + (f"_{counter}" if counter else "")
+                        + ".tmproj"
+                    )
+                    if not candidate.exists():
+                        path = candidate
+                        break
+            try:
+                self._project_save(
+                    session_id,
+                    path,
+                    project_state=None,
+                    rebuild_cache=rebuild_cache,
+                    extra_manifest=extra,
+                )
+            except Exception:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
+            self._prune_backups(backup_dir)
+            return path
+
+    def _backup_manifest(self, path: Path) -> Dict[str, Any]:
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                raw = zf.read("manifest.json")
+            loaded = json.loads(raw.decode("utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    def _backup_entries(self, session_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        backup_dir = self._backup_dir(Path(cfg.dataset_root))
+        if not backup_dir.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for path in sorted(backup_dir.glob("backup_*.tmproj"), key=lambda p: p.stat().st_mtime, reverse=True):
+            manifest = self._backup_manifest(path)
+            created = manifest.get("created_at")
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(created)))
+            except Exception:
+                try:
+                    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))
+                except Exception:
+                    stamp = ""
+            out.append({
+                "filename": path.name,
+                "path": str(path),
+                "trigger": str(manifest.get("backup_trigger") or "SAVE"),
+                "timestamp": stamp,
+                "sample_count": int(manifest.get("sample_count") or 0),
+                "class_count": int(manifest.get("class_count") or 0),
+                "accuracy": float(_accuracy_percent(manifest.get("accuracy")) or 0.0),
+                "trained": bool(manifest.get("trained")),
+                "classes": list(manifest.get("classes") or []),
+                "manifest": manifest,
+            })
+        return out
+
+    def _valid_backup_path(self, session_id: str, raw: Any) -> Optional[Path]:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None or not raw:
+            return None
+        try:
+            path = Path(str(raw)).expanduser().resolve()
+            backup_dir = self._backup_dir(Path(cfg.dataset_root)).resolve()
+        except Exception:
+            return None
+        if path.suffix.lower() != ".tmproj" or path.parent != backup_dir or not path.is_file():
+            return None
+        return path
+
+    def _backup_restore_class(self, session_id: str, backup_path: Path, class_name: str) -> Dict[str, Any]:
+        with self._lock:
+            cfg = self._configs.get(session_id)
+        if cfg is None:
+            raise RuntimeError("missing config")
+        name = str(class_name or "").strip()
+        if not name:
+            raise ValueError("missing class")
+        safe = sanitize_class_name(name)
+        prefix = f"dataset/{safe}/"
+        payloads: List[tuple[str, bytes]] = []
+        state: Dict[str, Any] = {}
+        with zipfile.ZipFile(backup_path, "r") as zf:
+            names = set(zf.namelist())
+            for arc in names:
+                if not arc.startswith(prefix) or arc.endswith("/"):
+                    continue
+                rel = Path(arc).relative_to(Path("dataset") / safe)
+                if rel.is_absolute() or ".." in rel.parts or len(rel.parts) != 1:
+                    continue
+                payloads.append((rel.name, zf.read(arc)))
+            for sidecar in ("tm_project_state.json", "tm_classes.json"):
+                if sidecar in names:
+                    try:
+                        loaded = json.loads(zf.read(sidecar).decode("utf-8"))
+                        if isinstance(loaded, dict):
+                            for key, value in loaded.items():
+                                state.setdefault(key, value)
+                    except Exception:
+                        pass
+        if not payloads:
+            raise ValueError(f"backup has no samples for class '{name}'")
+        dataset_root = Path(cfg.dataset_root)
+        classes = self._classes_load(dataset_root)
+        if name not in classes:
+            classes.append(name)
+        target_dir = dataset_root / safe
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        processed_dir = self._processed_cache_dir(dataset_root) / safe
+        if processed_dir.exists():
+            shutil.rmtree(processed_dir)
+        restored = 0
+        for filename, data in payloads:
+            try:
+                (target_dir / filename).write_bytes(data)
+                self._cache_one_sample(
+                    dataset_root,
+                    name,
+                    target_dir / filename,
+                    img_size=int(cfg.img_size),
+                    project_type=str(cfg.project_type),
+                )
+                restored += 1
+            except Exception:
+                continue
+        class_preprocess = self._class_preprocess_load(dataset_root)
+        sample_preprocess = self._sample_preprocess_load(dataset_root)
+        archive_cp = normalize_class_preprocess_map(state.get("class_preprocess"))
+        archive_pp = normalize_sample_preprocess_map(state.get("sample_preprocess"))
+        cp_key = next((k for k in archive_cp if sanitize_class_name(k) == safe), "")
+        if cp_key:
+            class_preprocess[name] = archive_cp[cp_key]
+        pp_key = next((k for k in archive_pp if sanitize_class_name(k) == safe), "")
+        if pp_key:
+            sample_preprocess[name] = dict(archive_pp[pp_key])
+        else:
+            sample_preprocess.pop(name, None)
+        self._classes_save(
+            dataset_root,
+            classes,
+            class_preprocess=class_preprocess,
+            sample_preprocess=sample_preprocess,
+        )
+        self._mark_dataset_dirty(dataset_root)
+        return {"restored": int(restored), **self._runtime_state_payload(session_id)}
 
     def _project_open(self, session_id: str, open_path: Path) -> Dict[str, Any]:
         with self._lock:
@@ -4017,8 +7361,11 @@ class RecordController:
             else:
                 classes = self._dataset_labels_load(in_dataset)
                 if not classes:
-                    dirs = [d.name for d in dataset_root.iterdir() if d.is_dir()]
-                    classes = sorted([str(x) for x in dirs]) if dirs else ["Class 1", "Class 2"]
+                    dirs = [
+                        d.name for d in dataset_root.iterdir()
+                        if d.is_dir() and not d.name.startswith(".")
+                    ]
+                    classes = sorted([str(x) for x in dirs]) if dirs else []
                 self._classes_save(dataset_root, classes)
 
             # ── RC1: restore the per-sample preprocessing FIRST ──
@@ -4182,6 +7529,229 @@ class RecordController:
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
 
+    def _bind_project(self, raw_path: Any, raw_folder: Any = None) -> Dict[str, Any]:
+        """Attach a live session to an EXISTING project on disk.
+
+        Opening a project from the launcher's Recent list (or the file
+        browser) only knows its folder/tmproj — there is no session yet.  This
+        creates one whose dataset_root is the project's own `dataset/` and
+        ADOPTS whatever is already there, so unsaved Edit work is never
+        clobbered by a stale archive.  Only a folder with no extracted dataset
+        falls back to `_project_open`, which imports the archive once.
+        """
+        target = _fs_expand_path(raw_path)
+        folder = _fs_expand_path(raw_folder) if raw_folder not in (None, "") else None
+        tmproj: Optional[Path] = None
+        if folder is not None and folder.is_dir():
+            root = folder
+        elif target is not None and target.is_dir():
+            root = target
+        elif target is not None and target.is_file() and target.suffix.lower() == ".tmproj":
+            root = target.parent
+            tmproj = target
+        else:
+            return {"ok": "0", "error": "project path not found", "status": 400}
+        try:
+            root = root.resolve()
+        except Exception:
+            pass
+        if not _fs_path_allowed(root):
+            return {"ok": "0", "error": "project folder is outside the allowed workspace.", "status": 403}
+        if tmproj is None:
+            preferred = root / f"{root.name}.tmproj"
+            if preferred.exists():
+                tmproj = preferred
+            else:
+                candidates = sorted(root.glob("*.tmproj"))
+                tmproj = candidates[0] if candidates else None
+        try:
+            summary = _tmproj_summary(tmproj) if tmproj is not None else {}
+        except Exception:
+            summary = {}
+        project_type = str(summary.get("project_type") or PROJECT_TYPE_IMAGE).strip().lower()
+        if project_type not in KNOWN_PROJECT_TYPES:
+            project_type = PROJECT_TYPE_IMAGE
+        try:
+            img_size = int(summary.get("img_size") or 0) or int(default_img_size(project_type) or 96)
+        except Exception:
+            img_size = int(default_img_size(project_type) or 96)
+        dataset_root = root / "dataset"
+
+        session_id = ""
+        with self._lock:
+            for sid, cfg in list(self._configs.items()):
+                try:
+                    if Path(cfg.dataset_root).resolve() == dataset_root.resolve():
+                        session_id = sid
+                        break
+                except Exception:
+                    continue
+        live_dataset = False
+        if dataset_root.is_dir():
+            try:
+                live_dataset = any(
+                    p.is_dir() and bool(_list_class_image_files(p))
+                    for p in dataset_root.iterdir()
+                    if not p.name.startswith(".")
+                )
+            except Exception:
+                live_dataset = False
+        if not session_id:
+            session_id = uuid.uuid4().hex
+            self.set_config(
+                session_id,
+                SessionConfig(
+                    dataset_root=dataset_root,
+                    serial_port="",
+                    serial_baud=115200,
+                    serial_sync="AA 55 AA",
+                    serial_frame_side=96,
+                    serial_channels=3 if project_type == PROJECT_TYPE_IMAGE else 1,
+                    webcam_index=0,
+                    fps=8.0,
+                    crop_box=None,
+                    img_size=int(img_size),
+                    project_type=project_type,
+                ),
+            )
+        try:
+            self.update_config(session_id, project_type=project_type, img_size=int(img_size))
+        except Exception:
+            pass
+
+        if not live_dataset:
+            if tmproj is None:
+                return {
+                    "ok": "0",
+                    "error": "the project folder has no dataset and no .tmproj archive",
+                    "status": 400,
+                }
+            try:
+                self._project_open(session_id=session_id, open_path=tmproj)
+            except Exception as e:
+                return {"ok": "0", "error": str(e), "status": 400}
+        else:
+            try:
+                classes = self._classes_load(dataset_root)
+                if not classes:
+                    classes = sorted(
+                        p.name
+                        for p in dataset_root.iterdir()
+                        if p.is_dir() and not p.name.startswith(".") and _list_class_image_files(p)
+                    )
+                    self._classes_save(dataset_root, classes)
+                if tmproj is not None:
+                    self._merge_archive_preprocess(dataset_root, tmproj, session_id)
+                if not self._processed_cache_dir(dataset_root).exists():
+                    try:
+                        self._rebuild_processed_cache(
+                            dataset_root,
+                            class_preprocess=self._class_preprocess_load(dataset_root),
+                            sample_preprocess=self._sample_preprocess_load(dataset_root),
+                            out_size=int(img_size),
+                            fast_mode=True,
+                            project_type=project_type,
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                return {"ok": "0", "error": str(e), "status": 400}
+
+        # Recover the capture channel count too: a Gray image project must
+        # not bind with the RGB default, or the first device pull misparses
+        # its 1-channel frames.
+        resolved_cfg: Dict[str, Any] = {}
+        try:
+            resolved_cfg = self._project_train_cfg(dataset_root) or {}
+        except Exception:
+            resolved_cfg = {}
+        if not resolved_cfg:
+            resolved_cfg = (summary.get("state") or {}).get("train_cfg") or {}
+        color_mode = str(resolved_cfg.get("color_mode") or "").strip().lower()
+        channels = 1 if color_mode in {"grayscale", "gray", "l", "1"} else (
+            3 if project_type == PROJECT_TYPE_IMAGE else 1
+        )
+        try:
+            self.update_config(session_id, serial_channels=channels)
+        except Exception:
+            pass
+
+        result: Dict[str, Any] = {"ok": "1", "session": session_id}
+        archive = tmproj
+        if archive is None:
+            archive = _synthesize_project_archive(root)
+        if archive is not None:
+            _recent_mru_touch(archive, folder=root)
+            try:
+                result["project"] = _recent_project_entry(archive)
+            except Exception:
+                pass
+        result["state"] = self._runtime_state_payload(session_id)
+        return result
+
+    def _merge_archive_preprocess(self, dataset_root: Path, tmproj: Path, session_id: str) -> None:
+        """Layer an archive's preprocessing sidecars UNDER the live folder's.
+
+        The folder is the working copy: anything it already records wins.  An
+        archive only fills in configs the folder has never seen (a project
+        copied as just its `.tmproj`, or a file whose tm_classes.json predates
+        the per-sample writer).
+        """
+        state: Dict[str, Any] = {}
+        class_meta: Dict[str, Any] = {}
+        try:
+            with zipfile.ZipFile(tmproj, "r") as zf:
+                names = set(zf.namelist())
+                if "tm_project_state.json" in names:
+                    loaded = json.loads(zf.read("tm_project_state.json").decode("utf-8"))
+                    if isinstance(loaded, dict):
+                        state = loaded
+                if "tm_classes.json" in names:
+                    loaded = json.loads(zf.read("tm_classes.json").decode("utf-8"))
+                    if isinstance(loaded, dict):
+                        class_meta = loaded
+        except Exception:
+            return
+        class_in = [
+            normalize_class_preprocess_map(class_meta.get("class_preprocess")),
+            normalize_class_preprocess_map(state.get("class_preprocess")),
+        ]
+        sample_in = [
+            normalize_sample_preprocess_map(class_meta.get("sample_preprocess")),
+            normalize_sample_preprocess_map(state.get("sample_preprocess")),
+        ]
+        merged_cp = self._class_preprocess_load(dataset_root)
+        merged_pp = {name: dict(entries) for name, entries in self._sample_preprocess_load(dataset_root).items()}
+        changed = False
+        for incoming in class_in:
+            for name, cfg in incoming.items():
+                if name not in merged_cp:
+                    merged_cp[name] = cfg
+                    changed = True
+        for incoming in sample_in:
+            for name, entries in incoming.items():
+                bucket = merged_pp.setdefault(name, {})
+                for filename, cfg in entries.items():
+                    if filename not in bucket:
+                        bucket[filename] = cfg
+                        changed = True
+        if changed:
+            self._classes_save(
+                dataset_root,
+                self._classes_load(dataset_root),
+                class_preprocess=merged_cp,
+                sample_preprocess=merged_pp,
+            )
+        # Reading order / sign target live in the run's train_config.json.
+        # A folder copied without a runs/ directory still needs them.
+        run_cfg = dataset_root.parent / "runs" / "latest" / "train_config.json"
+        archived_cfg = state.get("train_cfg")
+        if not run_cfg.exists() and isinstance(archived_cfg, dict) and archived_cfg:
+            try:
+                self._save_train_cfg(session_id, archived_cfg)
+            except Exception:
+                pass
+
     def _run_matches_project(self, run_dir: Path, project_type: str, img_size: int) -> bool:
         """Does a restored run belong to the project being opened?
 
@@ -4264,7 +7834,7 @@ class RecordController:
                 shutil.rmtree(runs_dir)
             except Exception:
                 pass
-        self._classes_save(dataset_root, ["Class 1", "Class 2"])
+        self._classes_save(dataset_root, [])
         return self._project_state_payload(dataset_root)
 
     def _project_train_cfg(
@@ -4613,14 +8183,25 @@ class RecordController:
         classes = self._classes_load(root)
         counts: Dict[str, int] = {}
         sample_previews: Dict[str, List[Dict[str, str]]] = {}
+        sample_filenames: Dict[str, List[str]] = {}
         for name in classes:
             class_dir = root / sanitize_class_name(name)
             files = _list_class_image_files(class_dir) if class_dir.exists() else []
             counts[name] = len(files)
+            sample_filenames[name] = [str(sample.name) for sample in files]
             previews: List[Dict[str, str]] = []
             for sample in files[:12]:
                 try:
-                    previews.append(_preview_item_payload(sample))
+                    if session_id:
+                        # URL, not a base64 data: URL.  /sample_image?thumb=1
+                        # serves a cached 96 px PNG, so a bind response stays
+                        # small and the browser can cache the tiles.
+                        previews.append({
+                            "filename": str(sample.name),
+                            "src": _sample_thumb_url(session_id, name, sample),
+                        })
+                    else:
+                        previews.append(_preview_item_payload(sample))
                 except Exception:
                     continue
             sample_previews[name] = previews
@@ -4630,7 +8211,16 @@ class RecordController:
             "classes": classes,
             "counts": counts,
             "sample_previews": sample_previews,
+            # Filenames (not blobs) let the Edit gallery build its full item
+            # list in ONE round-trip instead of the old N x /class_state
+            # waterfall that competed with the live stream on open.
+            "sample_filenames": sample_filenames,
             "processed_previews": self._processed_previews_payload(root, classes),
+            "class_preprocess": self._class_preprocess_load(root),
+            "sample_preprocess": self._sample_preprocess_load(root),
+            "dataset_dirty_since_train": self._dataset_dirty_since_train(root),
+            "project_type": str(getattr(cfg, "project_type", PROJECT_TYPE_IMAGE) or PROJECT_TYPE_IMAGE),
+            "img_size": int(getattr(cfg, "img_size", 0) or default_img_size(getattr(cfg, "project_type", PROJECT_TYPE_IMAGE))),
             "train_enabled": bool(
                 len(classes) >= 2
                 and non_empty >= 2
@@ -4638,6 +8228,12 @@ class RecordController:
                 and total > 0
             ),
         }
+        try:
+            train_cfg = self._project_train_cfg(root)
+            payload["reading_order"] = str(train_cfg.get("reading_order") or "ltr")
+            payload["sign_sequences"] = list(train_cfg.get("sign_sequences") or [])
+        except Exception:
+            pass
         if session_id:
             try:
                 payload.update(self._train_recommend(session_id=session_id, cfg={}))
@@ -4675,6 +8271,7 @@ class RecordController:
             (dst_dir / (sample_path.stem + ".png")).write_bytes(out_png)
         except Exception:
             pass
+        self._mark_dataset_dirty(dataset_root)
 
     def _preprocess_image_png(self, png: bytes, label_name: str, class_config: Any, sample_config: Any = None, return_crop: bool = False, fast_mode: bool = False, out_size: int = 96, project_type: str = PROJECT_TYPE_IMAGE, dataset_root: Optional[Path] = None, sign_sequences: Any = None, reading_order: Any = None):
         class_cfg = class_config if isinstance(class_config, dict) else {}
@@ -4784,7 +8381,10 @@ class RecordController:
         convention = str(config.get("glyph_convention", NORM_CANON))
         apply_segmentation = bool(config.get("glyph_segment", True))
 
-        src_img = Image.open(_bytes_io(png)).convert("L")
+        if isinstance(png, Image.Image):
+            src_img = png if png.mode == "L" else png.convert("L")
+        else:
+            src_img = Image.open(_bytes_io(png)).convert("L")
         gray = np.asarray(src_img, dtype=np.uint8)
         full_h, full_w = gray.shape[:2]
 
@@ -4827,7 +8427,7 @@ class RecordController:
         # the same set as the mask the sign previews have always drawn.  The
         # same sliders therefore mean the same thing in both project types,
         # and normalize_class_preprocess has already clamped lum to 50..255
-        # and dark to 0..100, so neither nudge leaves binarize_ink's range.
+        # and dark to 0..255, so neither nudge leaves binarize_ink's range.
         #
         # Gated on "adjusted away from the defaults", because 0/100 is what
         # the UI ships and what every existing OCR model was trained through:
@@ -5093,47 +8693,159 @@ class RecordController:
         out_size: int = 96,
         fast_mode: bool = True,
         project_type: str = PROJECT_TYPE_IMAGE,
+        progress_callback: Optional[Any] = None,
+        should_stop: Optional[Any] = None,
     ) -> None:
+        """Incremental deterministic-preprocess cache.
+
+        The old version rmtree'd every class and re-decoded/re-searched every
+        sample on every training run.  A manifest keyed by
+        (filename, source mtime/size, preprocess signature) lets unchanged
+        samples keep their cached PNG; only edited samples are recomputed.
+        No session lock is held while decoding or writing.
+        """
         classes = self._classes_load(dataset_root)
         cache_root = self._processed_cache_dir(dataset_root)
         cache_root.mkdir(parents=True, exist_ok=True)
+        manifest_path = cache_root / ".manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                manifest = {}
+        except Exception:
+            manifest = {}
+        next_manifest: Dict[str, Dict[str, Any]] = {}
         class_preprocess = normalize_class_preprocess_map(class_preprocess if class_preprocess is not None else self._class_preprocess_load(dataset_root))
         sample_preprocess = normalize_sample_preprocess_map(sample_preprocess if sample_preprocess is not None else self._sample_preprocess_load(dataset_root))
+
+        def _check_stop() -> None:
+            if should_stop is not None and should_stop():
+                from trainer import TrainingCancelled
+
+                raise TrainingCancelled("Training cancelled by user.")
+
+        files_by_class = {
+            name: _list_class_image_files(dataset_root / sanitize_class_name(name))
+            for name in classes
+        }
+        total_files = sum(len(files) for files in files_by_class.values())
+        processed_total = 0
+        if progress_callback is not None:
+            try:
+                progress_callback(0, total_files)
+            except Exception:
+                pass
         for class_name in classes:
+            _check_stop()
             src_dir = dataset_root / sanitize_class_name(class_name)
-            dst_dir = cache_root / sanitize_class_name(class_name)
-            if dst_dir.exists():
-                shutil.rmtree(dst_dir)
+            safe_class = sanitize_class_name(class_name)
+            dst_dir = cache_root / safe_class
             dst_dir.mkdir(parents=True, exist_ok=True)
-            if not src_dir.exists():
-                continue
             raw_cfg = class_preprocess.get(class_name, {"mode": global_preprocess_mode})
             config = dict(raw_cfg) if isinstance(raw_cfg, dict) else {"mode": global_preprocess_mode}
             processed_count = 0
-            for src in _list_class_image_files(src_dir):
+            class_files = files_by_class.get(class_name, [])
+            expected_names = set()
+            for src in class_files:
+                _check_stop()
+                out_name = f"{src.stem}.png"
+                expected_names.add(out_name)
+                dst = dst_dir / out_name
+                rel = f"{safe_class}/{out_name}"
                 try:
-                    png = src.read_bytes()
-                    sample_cfg = self._sample_preprocess_lookup(
-                        sample_preprocess, class_name, src.name
+                    stat = src.stat()
+                    mtime_ns = int(stat.st_mtime_ns)
+                    src_size = int(stat.st_size)
+                except Exception:
+                    mtime_ns = 0
+                    src_size = -1
+                sample_cfg = self._sample_preprocess_lookup(sample_preprocess, class_name, src.name)
+                try:
+                    signature = json.dumps(
+                        {
+                            "class": config,
+                            "sample": sample_cfg,
+                            "out_size": int(out_size),
+                            "fast_mode": bool(fast_mode),
+                            "project_type": str(project_type),
+                        },
+                        sort_keys=True,
+                        default=str,
                     )
-                    out_png = self._preprocess_image_png(
-                        png,
-                        label_name=class_name,
-                        class_config=config,
-                        fast_mode=fast_mode,
-                        sample_config=sample_cfg,
-                        out_size=int(out_size),
-                        project_type=project_type,
-                        dataset_root=dataset_root,
-                    )
-                    (dst_dir / f"{src.stem}.png").write_bytes(out_png)
+                except Exception:
+                    signature = repr((config, sample_cfg, out_size, fast_mode, project_type))
+                previous = manifest.get(rel) if isinstance(manifest.get(rel), dict) else None
+                if (
+                    previous
+                    and dst.exists()
+                    and int(previous.get("mtime_ns") or -1) == mtime_ns
+                    and int(previous.get("size") or -2) == src_size
+                    and str(previous.get("sig") or "") == signature
+                ):
                     processed_count += 1
-                except Exception as e:
-                    import logging
-                    logging.warning(f"preprocess failed for {src.name}: {e}")
-            if processed_count == 0 and len(list(_list_class_image_files(src_dir))) > 0:
+                    next_manifest[rel] = {
+                        "mtime_ns": mtime_ns,
+                        "size": src_size,
+                        "sig": signature,
+                    }
+                else:
+                    try:
+                        png = src.read_bytes()
+                        out_png = self._preprocess_image_png(
+                            png,
+                            label_name=class_name,
+                            class_config=config,
+                            fast_mode=fast_mode,
+                            sample_config=sample_cfg,
+                            out_size=int(out_size),
+                            project_type=project_type,
+                            dataset_root=dataset_root,
+                        )
+                        dst.write_bytes(out_png)
+                        processed_count += 1
+                        next_manifest[rel] = {
+                            "mtime_ns": mtime_ns,
+                            "size": src_size,
+                            "sig": signature,
+                        }
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"preprocess failed for {src.name}: {e}")
+                        try:
+                            dst.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                processed_total += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(processed_total, total_files)
+                    except Exception:
+                        pass
+            # A deleted/renamed source must not leave a stale cache tile that
+            # the trainer would still read.
+            try:
+                for cached in dst_dir.glob("*.png"):
+                    if cached.name not in expected_names:
+                        cached.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if processed_count == 0 and len(class_files) > 0:
                 import logging
                 logging.warning(f"No files processed for class '{class_name}' — check preprocess mode '{config.get('mode')}'")
+        # Drop class dirs for classes that no longer exist.
+        try:
+            wanted = {sanitize_class_name(name) for name in classes}
+            for entry in cache_root.iterdir():
+                if entry.is_dir() and entry.name not in wanted:
+                    shutil.rmtree(entry, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            manifest_tmp = manifest_path.with_suffix(".json.tmp")
+            manifest_tmp.write_text(json.dumps(next_manifest, ensure_ascii=False, indent=0) + "\n", encoding="utf-8")
+            manifest_tmp.replace(manifest_path)
+        except Exception:
+            pass
 
     def _processed_previews_payload(self, dataset_root: Path, classes: List[str]) -> Dict[str, List[Dict[str, str]]]:
         out: Dict[str, List[Dict[str, str]]] = {}
@@ -5357,7 +9069,7 @@ class RecordController:
                 return cur
         import tensorflow as tf
 
-        interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+        interpreter = tf.lite.Interpreter(model_path=str(tflite_path), num_threads=4)
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()[0]
         output_details = interpreter.get_output_details()[0]
@@ -5402,10 +9114,98 @@ class RecordController:
             self._preview[session_id] = cur
         return cur
 
+    def _stabilize_live_boxes(
+        self,
+        session_id: str,
+        kind: str,
+        boxes: List[Any],
+        *,
+        live: bool,
+    ) -> List[List[float]]:
+        """EDA-smooth a live detection's normalized boxes (one per slot).
+
+        The group is tracked by its UNION box: a per-slot change that moves
+        the whole plate is a scene change, while a slot wobbling inside a
+        stationary plate is jitter.  The same deadband/EMA/snap decision is
+        then applied to every slot so the drawn dividers stay locked to the
+        outer box.
+        """
+        clean: List[List[float]] = []
+        for box in boxes or []:
+            if isinstance(box, (list, tuple)) and len(box) == 4:
+                try:
+                    clean.append([float(v) for v in box])
+                except (TypeError, ValueError):
+                    continue
+        key = f"{session_id}:{kind}"
+        if not live or not clean:
+            with self._lock:
+                self._roi_track.pop(key, None)
+            return clean
+        with self._lock:
+            state = dict(self._roi_track.get(key) or {})
+        prev = state.get("boxes")
+        stable = int(state.get("stable") or 0)
+        if not (isinstance(prev, list) and len(prev) == len(clean)):
+            with self._lock:
+                self._roi_track[key] = {"boxes": clean, "stable": 0}
+            return [list(b) for b in clean]
+        prev_union = _roi_union(prev)
+        new_union = _roi_union(clean)
+        iou = _roi_iou(prev_union, new_union) if prev_union and new_union else 0.0
+        if iou >= ROI_DEADBAND_IOU:
+            # Sub-1.5 % jitter: keep the box entirely still.
+            return [list(b) for b in prev]
+        if iou < ROI_SNAP_IOU:
+            # A large change might be a real scene change — or a one-frame
+            # false detection.  Hold the old box until it persists.
+            stable += 1
+            if stable >= ROI_SNAP_FRAMES:
+                with self._lock:
+                    self._roi_track[key] = {"boxes": clean, "stable": 0}
+                return [list(b) for b in clean]
+            with self._lock:
+                self._roi_track[key] = {"boxes": prev, "stable": stable}
+            return [list(b) for b in prev]
+        blended = [_roi_blend(p, n) for p, n in zip(prev, clean)]
+        with self._lock:
+            self._roi_track[key] = {"boxes": blended, "stable": 0}
+        return [list(b) for b in blended]
+
+    def _decoded_live_frame(self, session_id: str, source: str, frame_seq: int, png: Any) -> Any:
+        """Decode a live PNG once per produced frame, not once per request.
+
+        `_live_set` stores the SAME bytes object and bumps `frame_seq`
+        atomically, so (seq, id) identifies an exact frame.  Repeated
+        preview ticks between two frames then skip the PNG decode, which is
+        the most expensive part of a tick that is not inference itself.
+        """
+        if isinstance(png, Image.Image) or not isinstance(png, (bytes, bytearray)):
+            return png
+        key = f"{session_id}:{source}"
+        with self._lock:
+            entry = self._preview_decode.get(key)
+            if (
+                isinstance(entry, dict)
+                and int(entry.get("seq") or -1) == int(frame_seq)
+                and int(entry.get("src_id") or 0) == id(png)
+            ):
+                return entry.get("img")
+        try:
+            img = Image.open(_bytes_io(png))
+            img.load()
+            if img.mode not in ("L", "RGB"):
+                img = img.convert("RGB")
+        except Exception:
+            return png
+        with self._lock:
+            self._preview_decode[key] = {"seq": int(frame_seq), "src_id": id(png), "img": img}
+        return img
+
     def _preview_predict(
         self,
         session_id: str,
-        png: bytes,
+        png: Any,
         preprocess_mode: str = "",
         bg_dark_thresh: Optional[int] = None,
         bg_lum_thresh: Optional[int] = None,
@@ -5415,8 +9215,12 @@ class RecordController:
         ood_entropy_ratio_max: Optional[float] = None,
         source: str = "",
         compact: bool = False,
+        view_roi: bool = False,
+        view_orig: bool = False,
     ) -> Dict[str, Any]:
         model = self._preview_load_model(session_id=session_id)
+        timings: Dict[str, float] = {}
+        _t = time.perf_counter()
         encode_preview = _to_preview_jpeg_bytes if compact else _to_png_bytes
         interpreter = model["interpreter"]
         input_details = model["input_details"]
@@ -5436,7 +9240,41 @@ class RecordController:
             raise RuntimeError("unsupported input shape")
         _, h, w, c = shape
         # Always RGB — B-G difference is computed inside the pipeline.
-        img = Image.open(_bytes_io(png)).convert("RGB")
+        # Callers that already hold a decoded frame (the upload reuse path)
+        # pass the PIL image directly, so dragging a fader never re-decodes
+        # the PNG from RAM or disk.
+        if isinstance(png, Image.Image):
+            img = png if png.mode == "RGB" else png.convert("RGB")
+        else:
+            img = Image.open(_bytes_io(png)).convert("RGB")
+        # ── Live webcam: search at the model's resolution ────────────────
+        # The device order is camera → downsize → crop search (the library
+        # hands the model a 96-px frame).  A 640×480 webcam frame searched
+        # at native size costs ~50 ms in the (bit-exact) Python search —
+        # the dominant cost of 04 PREVIEW — while the crop it produces is
+        # immediately resized to 96 anyway.  Run the SEARCH on a frame
+        # downscaled to the model side and map the normalized box back to
+        # the original pixels for the model crop and the Orig visual.
+        # Uploads keep full-resolution search: their training cache is
+        # built from full-resolution webcam captures.
+        search_img = img
+        if source == "webcam":
+            w_img, h_img = img.size
+            side = max(int(h), int(w))
+            if side > 0 and w_img > side and h_img > side:
+                scale = side / float(min(w_img, h_img))
+                search_img = img.resize(
+                    (
+                        max(1, int(round(w_img * scale))),
+                        max(1, int(round(h_img * scale))),
+                    ),
+                    Image.BILINEAR,
+                )
+        # Compact live ticks only need the ONE stage image the user is
+        # looking at; building masked/crop/full previews costs more than the
+        # inference itself.  The search_box is still computed (the ROI
+        # overlay needs it) but the display arrays are skipped.
+        previews_needed = (not compact) or (not view_roi and not view_orig)
         # ── Device grayscale streams ARE the device's tensor input ──────
         # TFLite.ino kCaptureGray / kInferGray stream `input->data.int8 + 128`
         # (already center-cropped + stretched).  Re-running
@@ -5482,6 +9320,7 @@ class RecordController:
                     bg_dark_thresh=d,
                     bg_lum_thresh=l,
                     crop_mode=model_crop_mode,
+                    previews=previews_needed,
                 )
             except Exception:
                 legacy_views = {}
@@ -5501,7 +9340,7 @@ class RecordController:
             }
         else:
             prepared = prepare_inference_inputs(
-                np.asarray(img),
+                np.asarray(search_img),
                 out_size=int(w),
                 color_mode="grayscale" if int(c) == 1 else "rgb",
                 preprocess_mode=preprocess_mode,
@@ -5510,7 +9349,10 @@ class RecordController:
                 bg_dark_thresh=(int(bg_dark_thresh) if bg_dark_thresh is not None else None),
                 bg_lum_thresh=(int(bg_lum_thresh)  if bg_lum_thresh  is not None else None),
                 crop_mode=model_crop_mode,
+                previews=previews_needed,
             )
+        timings["preprocess_ms"] = (time.perf_counter() - _t) * 1000.0
+        _t = time.perf_counter()
         qscale = 0.0
         qzp = 0
         q = input_details.get("quantization")
@@ -5521,6 +9363,15 @@ class RecordController:
 
         def _invoke_one(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             batch = np.expand_dims(arr, axis=0)
+            # The processed cache is grayscale (the canonical training
+            # transform).  An RGB-trained model consumed replicated 1→3
+            # channels in Training, so Preview must replicate the exact
+            # same way — passing (1,H,W,1) to a (1,H,W,3) INT8 input is a
+            # Dimension mismatch and used to reject every image-project frame.
+            if int(c) == 3 and batch.ndim == 4 and batch.shape[-1] == 1:
+                batch = np.repeat(batch, 3, axis=-1)
+            elif int(c) == 1 and batch.ndim == 4 and batch.shape[-1] > 1:
+                batch = batch[..., :1]
             if dtype is not None and dtype != np.float32 and qscale > 0:
                 qarr = np.round(batch / qscale + qzp)
                 if dtype == np.int8:
@@ -5570,27 +9421,23 @@ class RecordController:
                 scores = expv / float(np.sum(expv) + 1e-12)
             return np.clip(scores, 0.0, 1.0), raw_out
 
-        variant_probs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         mask_stats: Any = prepared.get("mask_stats") if isinstance(prepared, dict) else None
-        for name, arr in prepared.items():
-            if name == "mask_stats":
-                continue
-            if not isinstance(arr, np.ndarray):
-                continue
-            try:
-                variant_probs[name] = _invoke_one(arr)
-            except Exception:
-                pass
-        probs = None
-        raw_out = None
-        for k in ("default", "crop_preview", "masked_preview", "full_preview"):
-            if k in variant_probs:
-                probs, raw_out = variant_probs[k]
-                break
-        if probs is None and variant_probs:
-            probs, raw_out = next(iter(variant_probs.values()))
-        if probs is None:
+        # The MODEL input is exactly ONE array per frame.  The masked/crop/
+        # full variants are display-only; invoking the interpreter on all four
+        # every tick quadrupled infer_ms for identical logits.
+        model_arr = None
+        if isinstance(prepared, dict):
+            model_arr = prepared.get("default")
+            if not isinstance(model_arr, np.ndarray):
+                for candidate in ("crop_preview", "masked_preview", "full_preview"):
+                    if isinstance(prepared.get(candidate), np.ndarray):
+                        model_arr = prepared[candidate]
+                        break
+        if not isinstance(model_arr, np.ndarray):
             raise RuntimeError("no usable processed arrays for inference")
+        probs, raw_out = _invoke_one(model_arr)
+        timings["infer_ms"] = (time.perf_counter() - _t) * 1000.0
+        _t = time.perf_counter()
 
         if not labels:
             labels = [f"Class {i+1}" for i in range(int(probs.shape[0]))]
@@ -5679,29 +9526,42 @@ class RecordController:
             labels_out = list(labels)
             probs_out = [float(x) for x in probs.tolist()]
 
-        # Build a displayable preview of the after-processed model input
-        processed_variant = next(iter(prepared.keys()), "")
-        # Use masked_preview (thresholded G-channel) for the ROI toggle so the
-        # user can see dark/lum threshold effects.  Falls back to model-input array.
-        if "masked_preview" in prepared:
+        # Build the single requested display image (compact live path encodes
+        # only the stage image; non-compact callers still get every variant).
+        want_roi = bool(view_roi)
+        want_orig = bool(view_orig)
+        # ROI ON must show the CROP the model actually classified.  It used
+        # to encode masked_preview, which is a full-frame image — so ROI ON
+        # and ROI OFF rendered the same picture and the toggle looked dead.
+        if want_roi and isinstance(prepared.get("crop_preview"), np.ndarray):
+            processed_arr = np.asarray(prepared["crop_preview"])
+            processed_variant = "crop"
+        elif "masked_preview" in prepared:
             processed_arr = np.asarray(prepared["masked_preview"])
             processed_variant = "masked"
         else:
+            processed_variant = next(iter(prepared.keys()), "")
             processed_arr = np.asarray(prepared.get(processed_variant) if processed_variant in prepared else next(iter(prepared.values())))
-        # Crop-only preview (no threshold)
-        if "crop_preview" in prepared:
+        crop_png = None
+        full_png = None
+        processed_png = None
+        # ROI view = the threshold-processed crop.
+        if not compact or (want_roi and not want_orig):
+            processed_img = _model_input_array_to_preview_image(processed_arr)
+            processed_png = encode_preview(processed_img)
+        # Default view = full-frame thresholded preview.
+        if not compact or (not want_roi and not want_orig):
+            if "full_preview" in prepared:
+                full_arr = np.asarray(prepared["full_preview"])
+                full_png = encode_preview(_model_input_array_to_preview_image(full_arr))
+        # Orig-only view = the untouched captured frame (encoded once here;
+        # the route uses this instead of decode-JPEG-ing the PNG again).
+        if compact and want_orig and not want_roi:
+            full_png = encode_preview(img)
+        # Crop-only preview (no threshold) — non-compact callers only.
+        if not compact and "crop_preview" in prepared:
             crop_arr = np.asarray(prepared["crop_preview"])
             crop_png = encode_preview(_model_input_array_to_preview_image(crop_arr))
-        else:
-            crop_png = None
-        # Full-frame thresholded preview (no crop) — for the Orig view
-        if "full_preview" in prepared:
-            full_arr = np.asarray(prepared["full_preview"])
-            full_png = encode_preview(_model_input_array_to_preview_image(full_arr))
-        else:
-            full_png = None
-        processed_img = _model_input_array_to_preview_image(processed_arr)
-        processed_png = encode_preview(processed_img)
         # Auto search box (normalized 0-1) for the preview ROI overlay —
         # same contract as the class-edit page ("crop" field).
         search_box: Any = None
@@ -5709,14 +9569,44 @@ class RecordController:
             sb = prepared.get("search_box")
             if isinstance(sb, (list, tuple)) and len(sb) == 4:
                 search_box = [float(x) for x in sb]
+        # Live boxes jitter; uploads never do.  Stabilize BEFORE the raw crop
+        # is cut so the overlay and the ROI view are the same box.
+        live = source in ("webcam", "device")
+        stable = self._stabilize_live_boxes(
+            session_id, "image", [search_box] if search_box is not None else [], live=live
+        )
+        search_box = stable[0] if stable else None
+        # Image/OCR projects keep their box whenever the crop search found
+        # one: classifier confidence (Layers 2/3) is a verdict gate, not a
+        # detector, and hiding a real crop because the model is unsure
+        # would make the overlay flicker with confidence.  The sign path
+        # has its own geometry gate where "no plate" is a meaningful state.
+        roi_valid = bool(search_box is not None)
+        # (roi=1, orig=1) must be the RAW ROI crop at natural pixels, not the
+        # square model-input crop.  Cut it from the full frame with the same
+        # normalized search box the green overlay uses.
+        if search_box is not None and (not compact or (want_roi and want_orig)):
+            try:
+                w0, h0 = img.size
+                x1p = max(0, min(w0 - 1, int(round(float(search_box[0]) * w0))))
+                y1p = max(0, min(h0 - 1, int(round(float(search_box[1]) * h0))))
+                x2p = max(x1p + 1, min(w0, int(round(float(search_box[2]) * w0))))
+                y2p = max(y1p + 1, min(h0, int(round(float(search_box[3]) * h0))))
+                raw_crop = img.crop((x1p, y1p, x2p, y2p))
+                crop_png = encode_preview(raw_crop)
+            except Exception:
+                pass
+        timings["encode_ms"] = (time.perf_counter() - _t) * 1000.0
         return {
+            "timings": timings,
             "labels": labels_out,
             "probs": probs_out,
             "top_label": top_label_out,
             "top_prob": float(top_prob_out),
             "crop": search_box,
+            "roi_valid": bool(roi_valid),
             "model_source": str(model.get("model_source") or "latest"),
-            "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
+            "processed_image_b64": base64.b64encode(processed_png).decode("ascii") if processed_png else "",
             "crop_image_b64": base64.b64encode(crop_png).decode("ascii") if crop_png else "",
             "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
             "processed_variant": str(processed_variant or ""),
@@ -5965,6 +9855,11 @@ class RecordController:
             dataset_root=Path(cfg.dataset_root),
             bank=bank,
             seed=seed,
+            # Class samples are whole scenes: tell the compositor which plate
+            # sequences they were captured against so it can segment each
+            # class's own glyph instead of pasting the scene into a slot.
+            sample_sequences=[list(s) for s in seqs],
+            sample_reading_order=order,
         )
         label = "".join(seq)
         filename = f"synth_{label}_{kind}.png"
@@ -6024,7 +9919,7 @@ class RecordController:
     def _preview_predict_sign_ocr(
         self,
         session_id: str,
-        png: bytes,
+        png: Any,
         sign_sequence: Any = None,
         sign_sequences: Any = None,
         reading_order: Any = None,
@@ -6038,6 +9933,8 @@ class RecordController:
         preprocess_frame_side: Optional[int] = None,
         source: str = "",
         compact: bool = False,
+        view_roi: bool = False,
+        view_orig: bool = False,
     ) -> Dict[str, Any]:
         """Read a whole road sign: locate, split, one inference per glyph.
 
@@ -6144,7 +10041,10 @@ class RecordController:
         # inclusive lower edge of the user's window.
         floor = (0 if bg_dark <= 0 else min(255, bg_dark + 1)) if thresholds_adjusted else 0
 
-        src_img = Image.open(_bytes_io(png)).convert("L")
+        if isinstance(png, Image.Image):
+            src_img = png if png.mode == "L" else png.convert("L")
+        else:
+            src_img = Image.open(_bytes_io(png)).convert("L")
         gray = np.asarray(src_img, dtype=np.uint8)
         # Capture-side independence: a 160x160 (or larger) square device
         # frame is box-averaged down to the preprocessing side with the
@@ -6218,7 +10118,6 @@ class RecordController:
             rx2 = max(rx1 + 1, min(full_w, rx2))
             ry2 = max(ry1 + 1, min(full_h, ry2))
             roi_method = str(reading.get("roi_method") or "input")
-        roi_gray = np.ascontiguousarray(gray[ry1:ry2, rx1:rx2])
         sign_pct = float(reading.get("sign_pct") or 0.0)
 
         def _to_full_box(box: Any) -> Any:
@@ -6234,6 +10133,8 @@ class RecordController:
 
         slots: List[Dict[str, Any]] = []
         slot_pngs: List[bytes] = []
+        slot_displays: List[np.ndarray] = []
+        slot_raw_crops: List[np.ndarray] = []
         all_match = bool(labels)
         ood_reasons: List[str] = []
         for i, slot in enumerate(reading.get("slots") or []):
@@ -6332,6 +10233,7 @@ class RecordController:
                     "_entropy_only": bool(slot_entropy_only),
                     "max_prob": float(slot_max_prob),
                     "entropy_ratio": float(slot_entropy_ratio),
+                    "ok": bool(slot.get("ok")),
                     "empty": bool(slot.get("empty", True)),
                     "box": full_box,
                     "box_norm": full_box_norm,
@@ -6339,7 +10241,16 @@ class RecordController:
                 }
             )
             display = np.asarray(slot.get("display", glyph), dtype=np.uint8)
+            slot_displays.append(display)
             slot_pngs.append(_to_png_bytes(Image.fromarray(display, mode="L")))
+            if full_box is not None:
+                bx1, by1, bx2, by2 = (int(v) for v in full_box)
+                bx1 = max(0, min(full_w, bx1))
+                by1 = max(0, min(full_h, by1))
+                bx2 = max(bx1 + 1, min(full_w, bx2))
+                by2 = max(by1 + 1, min(full_h, by2))
+                raw = np.ascontiguousarray(gray[by1:by2, bx1:bx2])
+                slot_raw_crops.append(raw)
 
         # ── compare the three readings against EVERY allowed plate ───────
         # An exact 3-for-3 plate wins immediately.  If none is exact, keep the
@@ -6411,6 +10322,32 @@ class RecordController:
         slot_probs = [float(s["prob"]) for s in slots]
 
         sign_box = _to_full_box(reading.get("sign_box"))
+
+        # ── Live ROI stabilization ──────────────────────────────────────
+        # The SPA draws one green box per slot.  On a live feed those boxes
+        # jitter with sensor noise and jump between unrelated dark blobs
+        # when no plate is in view, so they are tracked as a group (EMA +
+        # IoU deadband + 2-frame snap).  Uploads/synth frames are static.
+        live = source in ("webcam", "device")
+        tracked = [s["box_norm"] for s in slots if isinstance(s.get("box_norm"), list)]
+        stabilized = self._stabilize_live_boxes(session_id, "sign", tracked, live=live)
+        if stabilized:
+            walker = iter(stabilized)
+            for slot_out in slots:
+                if not isinstance(slot_out.get("box_norm"), list):
+                    continue
+                boxn = next(walker, None)
+                if boxn is None:
+                    continue
+                slot_out["box_norm"] = [float(v) for v in boxn]
+                if full_w > 0 and full_h > 0:
+                    slot_out["box"] = [
+                        int(round(boxn[0] * full_w)),
+                        int(round(boxn[1] * full_h)),
+                        int(round(boxn[2] * full_w)),
+                        int(round(boxn[3] * full_h)),
+                    ]
+
         # The ROI overlay and the class-edit preview both read `crop` as
         # FULL-frame fractions.  The sign board ROI is the meaningful box
         # here: `sign_box` is only the union of the three glyphs.
@@ -6429,34 +10366,147 @@ class RecordController:
             float(rx2) / float(full_w) if full_w > 0 else 1.0,
             float(ry2) / float(full_h) if full_h > 0 else 1.0,
         ]
+        overlay_box_norm = (
+            _roi_union([s["box_norm"] for s in slots if isinstance(s.get("box_norm"), list)])
+            or sign_box_norm
+            or roi_box_norm
+        )
+
+        # ── Plate validity gate ─────────────────────────────────────────
+        # A frame with no plate still produces THREE slot crops (of hair,
+        # shadow, desk edges).  Geometry/area/aspect sanity is what tells
+        # the UI that the green box is not a detection: the overlay is
+        # hidden and the frame is reported OOD, instead of the box snapping
+        # between blobs and the full-frame fallback.
+        def _plate_geometry_ok() -> bool:
+            boxes = [s.get("box") for s in slots if isinstance(s.get("box"), list)]
+            if not boxes or sign_box is None or full_w <= 0 or full_h <= 0:
+                return False
+            bw = float(sign_box[2] - sign_box[0])
+            bh = float(sign_box[3] - sign_box[1])
+            if bw < 4.0 or bh < 4.0:
+                return False
+            if bw < 0.06 * full_w or bh < 0.02 * full_h:
+                return False
+            if bw * bh > 0.95 * full_w * full_h:
+                return False
+            aspect = bw / max(1.0, bh)
+            if not (0.20 <= aspect <= 20.0):
+                return False
+            centers = [(float(b[1]) + float(b[3])) * 0.5 for b in boxes]
+            if centers and (max(centers) - min(centers)) > 0.75 * bh:
+                return False
+            return any(bool(s.get("ok")) and not bool(s.get("empty")) for s in slots)
+
+        SIGN_PCT_MIN = float(ood_sign_pct_min if ood_sign_pct_min is not None else 0.3)
+        SIGN_PCT_MAX = float(ood_sign_pct_max if ood_sign_pct_max is not None else 70.0)
+        if SIGN_PCT_MIN > SIGN_PCT_MAX:
+            SIGN_PCT_MIN, SIGN_PCT_MAX = SIGN_PCT_MAX, SIGN_PCT_MIN
+        geometry_ok = _plate_geometry_ok()
+        pct_ok = bool(SIGN_PCT_MIN <= float(sign_pct) <= SIGN_PCT_MAX)
+        roi_valid = bool(geometry_ok and pct_ok)
+        if not geometry_ok:
+            # The verdict path keeps Layer 1 disarmed (device parity), but
+            # "nothing that looks like a plate was found" is a real reject.
+            no_contour = "no plate contour"
+            if not pct_ok:
+                no_contour += (
+                    f" / sign_pct={float(sign_pct):.1f}% outside "
+                    f"[{SIGN_PCT_MIN:.1f},{SIGN_PCT_MAX:.1f}]"
+                )
+            if not any(no_contour in r for r in ood_reasons):
+                ood_reasons.append(no_contour)
+
         # User-facing threshold view: inside the Dark..Lum window is BLACK
         # ink; everything else is PURE WHITE.  This is what Orig / both
-        # toggles show (with the ROI box on top); the model tensor is built
-        # separately and keeps its own polarity.
+        # toggles show; the model tensor is built separately and keeps its
+        # own polarity.
         inside_full = (gray >= bg_dark) & (gray <= bg_lum)
         full_display = np.where(inside_full, 0, 255).astype(np.uint8)
-        # ROI CHECKED must show the EXACT pixels inside the green box drawn
-        # on the full view — not a re-cleaned mask.  Same array, same slice:
-        # whatever is visible inside the box unchecked is visible checked.
-        processed_display = full_display[ry1:ry2, rx1:rx2].copy()
-        full_png = encode_preview(Image.fromarray(full_display, mode="L"))
-        processed_png = encode_preview(Image.fromarray(processed_display, mode="L"))
-        raw_crop_png = encode_preview(Image.fromarray(roi_gray, mode="L"))
+
+        # ROI ON = the segmented 3-slot strip, side by side — the pixels the
+        # three inferences actually consumed.  (Orig picks the raw slot
+        # crops; otherwise the canonical 28x28 thresholded glyphs.)  Showing
+        # the ROI rectangle here made ROI ON and ROI OFF look identical.
+        def _slot_strip(images: List[np.ndarray], *, scale: int = 1, gap: int = 2) -> Optional[np.ndarray]:
+            panels: List[np.ndarray] = []
+            for arr in images:
+                a = np.asarray(arr, dtype=np.uint8)
+                if a.ndim != 2 or a.size == 0:
+                    continue
+                if scale > 1:
+                    a = np.repeat(np.repeat(a, int(scale), axis=0), int(scale), axis=1)
+                panels.append(a)
+            if not panels:
+                return None
+            height = max(p.shape[0] for p in panels)
+            columns: List[np.ndarray] = []
+            for idx, panel in enumerate(panels):
+                if panel.shape[0] < height:
+                    pad = np.full((height - panel.shape[0], panel.shape[1]), 255, dtype=np.uint8)
+                    panel = np.vstack([panel, pad])
+                if idx:
+                    columns.append(np.full((height, int(gap)), 200, dtype=np.uint8))
+                columns.append(panel)
+            return np.ascontiguousarray(np.hstack(columns))
+
+        strip_thresh = _slot_strip(slot_displays, scale=3)
+        raw_panels: List[np.ndarray] = []
+        for raw in slot_raw_crops:
+            arr = np.asarray(raw, dtype=np.uint8)
+            if arr.ndim != 2 or arr.size == 0:
+                continue
+            scale = 84.0 / float(max(1, arr.shape[0]))
+            img = Image.fromarray(arr, mode="L").resize(
+                (max(2, int(round(arr.shape[1] * scale))), 84), Image.BILINEAR
+            )
+            raw_panels.append(np.asarray(img, dtype=np.uint8))
+        strip_raw = _slot_strip(raw_panels)
+
+        # Compact live ticks encode ONLY the stage image the user asked for.
+        # The three 28x28 slot crops stay (they are a few hundred bytes and
+        # the slot canvases draw them every frame).
+        want_roi = bool(view_roi)
+        want_orig = bool(view_orig)
+        full_png = b""
+        processed_png = b""
+        raw_crop_png = b""
+
+        def _encode_arr(arr: Optional[np.ndarray]) -> bytes:
+            if arr is None or getattr(arr, "size", 0) == 0:
+                return b""
+            return encode_preview(Image.fromarray(np.asarray(arr, dtype=np.uint8), mode="L"))
+
+        if not compact:
+            full_png = encode_preview(Image.fromarray(full_display, mode="L"))
+            processed_png = _encode_arr(strip_thresh)
+            raw_crop_png = _encode_arr(strip_raw)
+        elif want_roi and want_orig:
+            raw_crop_png = _encode_arr(strip_raw)
+        elif want_roi:
+            processed_png = _encode_arr(strip_thresh)
+        elif want_orig:
+            full_png = encode_preview(Image.fromarray(gray, mode="L"))
+        else:
+            full_png = encode_preview(Image.fromarray(full_display, mode="L"))
 
         return {
             "labels": slot_labels,
             "probs": slot_probs,
             "top_label": match_text,
             "top_prob": float(min((s["prob"] for s in slots), default=0.0)),
-            "crop": roi_box_norm,
+            "crop": overlay_box_norm,
             "roi_box": roi_box,
             "roi_box_norm": roi_box_norm,
             "roi_method": str(roi_method),
+            # False when nothing plate-shaped was found: the SPA hides the
+            # green overlay instead of drawing noise as a detection.
+            "roi_valid": bool(roi_valid),
             "model_source": str(model.get("model_source") or "latest"),
-            "processed_image_b64": base64.b64encode(processed_png).decode("ascii"),
-            "crop_image_b64": base64.b64encode(raw_crop_png).decode("ascii"),
-            "full_image_b64": base64.b64encode(full_png).decode("ascii"),
-            "processed_variant": "sign-threshold",
+            "processed_image_b64": base64.b64encode(processed_png).decode("ascii") if processed_png else "",
+            "crop_image_b64": base64.b64encode(raw_crop_png).decode("ascii") if raw_crop_png else "",
+            "full_image_b64": base64.b64encode(full_png).decode("ascii") if full_png else "",
+            "processed_variant": "sign-strip",
             "ood": bool(ood_reasons),
             "ood_reason": " | ".join(ood_reasons),
             "sign_pct": float(sign_pct),
@@ -6542,8 +10592,12 @@ class RecordController:
                 "message": "Starting...",
                 "error": "",
                 "result_path": "",
+                "cancelling": "0",
+                "cancelled": "0",
+                "history": [],
                 "updated_at": time.time(),
             }
+            self._train_cancels[session_id] = threading.Event()
             if session_id not in self._train_conds:
                 self._train_conds[session_id] = threading.Condition()
 
@@ -6613,23 +10667,68 @@ class RecordController:
             }
         }
 
+    def _cancel_train(self, session_id: str) -> bool:
+        with self._lock:
+            cur = self._train.get(session_id)
+            event = self._train_cancels.get(session_id)
+            if cur is None or event is None or str(cur.get("running") or "0") != "1":
+                return False
+            event.set()
+            cur["cancelling"] = "1"
+            cur["message"] = "Cancelling…"
+            cur["updated_at"] = time.time()
+        cond = self._train_conds.get(session_id)
+        if cond is not None:
+            with cond:
+                cond.notify_all()
+        return True
+
+    def _train_history_push(self, session_id: str, entry: Dict[str, Any]) -> None:
+        """Append one real epoch record for live /train/status polling."""
+        with self._lock:
+            cur = self._train.get(session_id)
+            if cur is None:
+                return
+            history = cur.get("history")
+            if not isinstance(history, list):
+                history = []
+                cur["history"] = history
+            history.append(dict(entry))
+            if len(history) > 500:
+                del history[:-500]
+
     def _train_status_payload(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
-            cur = self._train.get(session_id) or {"running": "0", "done": "0", "progress": 0.0, "message": "", "error": "", "result_path": ""}
-            payload = {
+            cur = self._train.get(session_id) or {
+                "running": "0", "done": "0", "progress": 0.0, "message": "",
+                "error": "", "result_path": "", "cancelling": "0", "cancelled": "0",
+                "history": [],
+            }
+            payload: Dict[str, Any] = {
                 "ok": "1",
                 "running": str(cur.get("running") or "0"),
                 "done": str(cur.get("done") or "0"),
                 "progress": float(cur.get("progress") or 0.0),
                 "message": str(cur.get("message") or ""),
+                "message_history": list(cur.get("message_history") or []),
                 "error": str(cur.get("error") or ""),
                 "result_path": str(cur.get("result_path") or ""),
+                "cancelling": str(cur.get("cancelling") or "0"),
+                "cancelled": str(cur.get("cancelled") or "0"),
+                "history": list(cur.get("history") or []),
                 "class_accuracies": {},
                 "warnings": [],
+                "confusion_matrix": None,
+                "confusion_labels": None,
+                "tensor_shape": None,
+                "tflite_size_bytes": 0,
+                "latency_ms": 0.0,
+                "metrics": {},
+                "trained": "0",
+                "dataset_dirty_since_train": "0",
             }
-        # Per-class accuracies + self-check warnings from the latest training
-        # meta — the SPA renders them in the training panel so weak classes
-        # are visible on the interface, not just in the logs.
+        # The latest run is the source of the finished KPIs/history/matrix —
+        # during a run the live `history` above already has the new epochs.
         try:
             cfg = self._configs.get(session_id)
             if cfg is not None:
@@ -6639,6 +10738,20 @@ class RecordController:
                     if isinstance(meta, dict):
                         payload["class_accuracies"] = meta.get("class_accuracies") or {}
                         payload["warnings"] = list(meta.get("warnings") or [])
+                        payload["confusion_matrix"] = meta.get("confusion_matrix")
+                        payload["confusion_labels"] = meta.get("confusion_labels")
+                        payload["tensor_shape"] = meta.get("tensor_shape")
+                        payload["tflite_size_bytes"] = int(meta.get("tflite_size_bytes") or 0)
+                        payload["latency_ms"] = float(meta.get("latency_ms") or 0.0)
+                        payload["metrics"] = dict(meta.get("metrics") or {})
+                        payload["metrics"]["class_accuracies"] = dict(meta.get("class_accuracies") or {})
+                        payload["labels"] = list(meta.get("labels") or [])
+                        payload["trained"] = "1"
+                        if payload["running"] != "1" and not payload["history"]:
+                            payload["history"] = list(meta.get("history") or [])
+                payload["dataset_dirty_since_train"] = (
+                    "1" if self._dataset_dirty_since_train(cfg.dataset_root) else "0"
+                )
         except Exception:
             pass
         return payload
@@ -6652,7 +10765,13 @@ class RecordController:
             if progress is not None:
                 cur["progress"] = max(0.0, min(1.0, float(progress)))
             if message is not None:
-                cur["message"] = str(message)
+                text = str(message)
+                cur["message"] = text
+                history = cur.setdefault("message_history", [])
+                if not history or history[-1] != text:
+                    history.append(text)
+                    if len(history) > 60:
+                        del history[:-60]
             if error is not None:
                 cur["error"] = str(error)
             if done is not None:
@@ -6673,8 +10792,9 @@ class RecordController:
         if sess_cfg is None:
             self._train_set(session_id, error="missing config", done=True)
             return
+        run_dir = None
         try:
-            from trainer import TrainConfig, TrainResult, new_run_dir, train_and_export
+            from trainer import TrainingCancelled, TrainConfig, TrainResult, new_run_dir, train_and_export
 
             project_type = str(
                 getattr(sess_cfg, "project_type", PROJECT_TYPE_IMAGE)
@@ -6754,9 +10874,33 @@ class RecordController:
                 else self._auto_seed_emnist_enabled(sess_cfg.dataset_root)
             )
 
+            # Image projects train on EITHER grayscale or RGB.  The glyph
+            # projects are locked to one channel (their front-end discards
+            # color before training), so a stray client value cannot turn a
+            # 28x28 glyph into a 3-channel tensor.
+            color_mode = "grayscale"
+            if project_type == PROJECT_TYPE_IMAGE:
+                requested_mode = str(cfg_dict.get("color_mode") or "").strip().lower()
+                if requested_mode in {"rgb", "color", "3", "3-ch"}:
+                    color_mode = "rgb"
+                elif requested_mode in {"grayscale", "gray", "l", "1", "1-ch"}:
+                    color_mode = "grayscale"
+                else:
+                    try:
+                        channels = int(cfg_dict.get("channels") or 0)
+                    except Exception:
+                        channels = 0
+                    if channels:
+                        color_mode = "rgb" if channels == 3 else "grayscale"
+                    else:
+                        color_mode = "grayscale" if int(sess_cfg.serial_channels) == 1 else "rgb"
+
+            ink_raw = str(cfg_dict.get("ink_polarity") if cfg_dict.get("ink_polarity") is not None else 0).strip().lower()
+            ink_polarity = 1 if ink_raw in {"1", "bright", "bright_on_dark", "light", "inverted", "emnist"} else 0
+
             cfg = TrainConfig(
                 img_size=int(cfg_dict.get("img_size") or 96),
-                color_mode="grayscale",
+                color_mode=color_mode,
                 batch_size=int(cfg_dict.get("batch_size") or 16),
                 epochs=int(cfg_dict.get("epochs") or 10),
                 validation_split=float(cfg_dict.get("validation_split") or 0.2),
@@ -6787,6 +10931,9 @@ class RecordController:
                 ocr_emnist_per_class=int(cfg_dict.get("ocr_emnist_per_class") or 200),
                 # sign_ocr derives this from the explicit "use _background as
                 # the only rejector" toggle (default OFF); OCR keeps its own
+                # 03 TRAIN's Ink Polarity control → TrainConfig.  It is a
+                # glyph-project transform only; image runs ignore it.
+                ink_polarity=ink_polarity,
                 # background-class checkbox.
                 ocr_background_enabled=background_enabled,
                 ocr_background_samples=int(cfg_dict.get("ocr_background_samples") or 0),
@@ -6813,8 +10960,43 @@ class RecordController:
             workspace_root = sess_cfg.dataset_root.parent
             run_dir = new_run_dir(workspace_root / "runs")
             processed_dataset_dir = self._processed_cache_dir(sess_cfg.dataset_root)
+            with self._lock:
+                cancel_event = self._train_cancels.get(session_id)
 
-            self._train_set(session_id, progress=0.01, message="Preparing ROI dataset...")
+            def should_stop() -> bool:
+                return bool(cancel_event is not None and cancel_event.is_set())
+
+            # Training is CPU/tensor-heavy.  Stop this session's camera /
+            # serial producer first: keeping an OpenCV grabber alive while
+            # TensorFlow initialises in the same macOS process is the
+            # documented deadlock recipe on Apple Silicon (and it also frees
+            # the camera for other apps during a long run).
+            try:
+                self._bump_stream_generation()
+                self._stop_live(session_id=session_id, source=None, wait=True, timeout_s=1.5)
+            except Exception:
+                pass
+            total_files = sum(
+                len(_list_class_image_files(sess_cfg.dataset_root / sanitize_class_name(c)))
+                for c in project_classes
+            )
+            _prep_t0 = time.perf_counter()
+            self._train_set(
+                session_id,
+                progress=0.01,
+                message=f"Preparing ROI dataset (0/{total_files})...",
+            )
+            if should_stop():
+                raise TrainingCancelled("Training cancelled by user.")
+
+            def _cache_progress(done: int, total: int) -> None:
+                frac = 0.01 + 0.11 * (float(done) / float(max(1, total)))
+                self._train_set(
+                    session_id,
+                    progress=frac,
+                    message=f"Preparing ROI dataset ({done}/{total})...",
+                )
+
             self._rebuild_processed_cache(
                 sess_cfg.dataset_root,
                 class_preprocess=cfg.class_preprocess,
@@ -6823,10 +11005,21 @@ class RecordController:
                 out_size=int(cfg.img_size),
                 fast_mode=(str(cfg.crop_mode or CROP_MODE_CENTER) != CROP_MODE_AUTO_SEARCH),
                 project_type=str(cfg.project_type),
+                progress_callback=_cache_progress,
+                should_stop=should_stop,
             )
+            _cache_ms = (time.perf_counter() - _prep_t0) * 1000.0
+            self._train_set(session_id, progress=0.13, message="Splitting train/val...")
+            if should_stop():
+                raise TrainingCancelled("Training cancelled by user.")
+            self._train_set(session_id, progress=0.15, message="Building INT8 model...")
 
             def on_progress(p: float, msg: str) -> None:
-                self._train_set(session_id, progress=p, message=msg)
+                try:
+                    mapped = 0.15 + 0.85 * max(0.0, min(1.0, float(p)))
+                except Exception:
+                    mapped = 0.15
+                self._train_set(session_id, progress=mapped, message=msg)
 
             start_msg = "Starting training..."
             if not bool(cfg.auto_adjust_batch_and_epochs):
@@ -6851,14 +11044,43 @@ class RecordController:
                         )
                 except Exception:
                     pass
-            self._train_set(session_id, progress=0.03, message=start_msg)
+            if should_stop():
+                raise TrainingCancelled("Training cancelled by user.")
+            self._train_set(session_id, progress=0.15, message=start_msg)
             result: TrainResult = train_and_export(
                 dataset_dir=processed_dataset_dir,
                 run_dir=run_dir,
                 cfg=cfg,
                 progress=on_progress,
+                should_stop=should_stop,
+                on_history=lambda entry: self._train_history_push(session_id, entry),
             )
             latest = self._train_result_path(sess_cfg.dataset_root)
+            trainer_timings = dict((result.metrics or {}).get("timings") or {})
+            timing_payload = {
+                "prep_ms": float(_cache_ms + float(trainer_timings.get("prep_ms") or 0.0)),
+                "backbone_load_ms": float(trainer_timings.get("backbone_load_ms") or 0.0),
+                "fit_ms": float(trainer_timings.get("fit_ms") or 0.0),
+                "quant_int8_ms": float(trainer_timings.get("quant_int8_ms") or 0.0),
+                "persist_ms": float(trainer_timings.get("persist_ms") or 0.0),
+                "total_ms": float(_cache_ms + float(trainer_timings.get("total_ms") or 0.0)),
+            }
+            try:
+                _controller_log(
+                    "TRAIN TIMING session={} type={} prep={:.0f}ms backbone={:.0f}ms "
+                    "fit={:.0f}ms quant_int8={:.0f}ms persist={:.0f}ms total={:.0f}ms".format(
+                        session_id,
+                        cfg.project_type,
+                        timing_payload["prep_ms"],
+                        timing_payload["backbone_load_ms"],
+                        timing_payload["fit_ms"],
+                        timing_payload["quant_int8_ms"],
+                        timing_payload["persist_ms"],
+                        timing_payload["total_ms"],
+                    )
+                )
+            except Exception:
+                pass
             payload = {
                 "run_dir": str(result.run_dir),
                 "labels": list(result.labels),
@@ -6867,6 +11089,7 @@ class RecordController:
                 "model_h_path": str(result.model_h_path),
                 "model_cpp_path": str(result.model_cpp_path),
                 "metrics": dict(result.metrics),
+                "timings": timing_payload,
                 "class_accuracies": dict(result.class_accuracies) if result.class_accuracies else {},
                 "warnings": list(result.warnings) if result.warnings else [],
                 "img_size": int(cfg.img_size),
@@ -6895,12 +11118,26 @@ class RecordController:
                 # what produced it — a name that varied by project type would
                 # make every reader of this field branch on it too.
                 "ocr_mix": dict(result.meta) if is_glyph_project(cfg.project_type) else {},
+                # Real Phase 3 telemetry: the 03 TRAIN page plots exactly
+                # these values and never synthesises a curve or matrix.
+                "history": list(result.history or []),
+                "confusion_matrix": result.confusion_matrix,
+                "confusion_labels": result.confusion_labels,
+                "tensor_shape": list(result.tensor_shape or []),
+                "tflite_size_bytes": int(result.tflite_size_bytes or 0),
+                "latency_ms": float(result.latency_ms or 0.0),
+                "labels": list(result.labels),
+                "dataset_dirty_since_train": False,
             }
             # Atomic write: a torn meta read by a concurrent /preview/predict
             # used to 400 every prediction until the next training.
             latest_tmp = latest.with_suffix(".json.tmp")
             latest_tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             latest_tmp.replace(latest)
+            try:
+                self._dataset_dirty_path(sess_cfg.dataset_root).unlink(missing_ok=True)
+            except Exception:
+                pass
             # Drop the cached preview interpreter AND the deployed-model pin
             # so the very next predict loads the freshly trained model (the
             # pin is re-stamped by the next export — that is its job, not
@@ -6940,12 +11177,63 @@ class RecordController:
                     reading_order=cfg.reading_order,
                     replace_synthetic=True,
                 )
-            done_msg = "Done."
+            done_msg = (
+                f"Done · prep {timing_payload['prep_ms']:.0f}ms · "
+                f"fit {timing_payload['fit_ms']:.0f}ms · "
+                f"quant {timing_payload['quant_int8_ms']:.0f}ms · "
+                f"total {timing_payload['total_ms']:.0f}ms"
+            )
             if result.warnings:
-                done_msg = "Done — WARNINGS: " + " | ".join(result.warnings)
+                done_msg += " — WARNINGS: " + " | ".join(result.warnings)
+            # Mark training done BEFORE archive I/O so Preview can open
+            # immediately; the snapshot packages in the background.
             self._train_set(session_id, progress=1.0, message=done_msg, result_path=str(latest), done=True)
-        except Exception as e:
-            self._train_set(session_id, error=str(e), done=True)
+
+            def _background_backup() -> None:
+                try:
+                    self._create_backup(session_id, "TRAIN")
+                except Exception as exc:
+                    try:
+                        _controller_log(f"TRAIN BACKUP failed session={session_id}: {exc!r}")
+                    except Exception:
+                        pass
+
+            threading.Thread(
+                target=_background_backup,
+                name="train-backup",
+                daemon=True,
+            ).start()
+        except TrainingCancelled:
+            # Delete the partial run so runs/latest never advertises a model
+            # that was never finished, and leave the dirty marker alone.
+            if run_dir is not None:
+                try:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            with self._lock:
+                cur = self._train.get(session_id)
+                if cur is not None:
+                    cur["cancelling"] = "0"
+                    cur["cancelled"] = "1"
+                    cur["updated_at"] = time.time()
+            self._train_set(session_id, error="", message="Cancelled.", done=True)
+        except BaseException as e:
+            # NEVER fail silently at a progress plateau: log the full stack
+            # to aioscout.log and surface the error in the TRAIN panel.
+            tb = traceback.format_exc()
+            try:
+                _controller_log(f"TRAIN ERROR session={session_id}:\n{tb}")
+            except Exception:
+                pass
+            self._train_set(
+                session_id,
+                error=str(e) or e.__class__.__name__,
+                done=True,
+            )
+        finally:
+            with self._lock:
+                self._train_cancels.pop(session_id, None)
 
     def _record_worker(self, session_id: str, source: str, class_name: str, live_thread: Optional[threading.Thread] = None) -> None:
         # Single-owner rule for BOTH sources: the live worker holds the
@@ -7012,6 +11300,13 @@ class RecordController:
         the HTTP server down.  Called from the app-level atexit hook and
         the /shutdown endpoint.
         """
+        # Flush any debounced Tier-1 metadata commit / capture writes before
+        # the configs and workspace go.
+        try:
+            self._flush_capture_writes(timeout=5.0)
+        except Exception:
+            pass
+        self._flush_pending_meta_commits()
         with self._lock:
             keys = list(self._live.keys())
             record_sids = list(self._record_threads.keys())
@@ -7029,6 +11324,8 @@ class RecordController:
                 self._stop_record(sid, wait=True, timeout_s=1.5)
             except Exception:
                 continue
+        with self._lock:
+            self._active_source.clear()
         try:
             from mac_camera import shutdown_all_caps
 
@@ -7040,20 +11337,58 @@ class RecordController:
         except Exception:
             pass
 
+    def _bump_stream_generation(self) -> int:
+        with self._lock:
+            self._stream_gen = int(getattr(self, "_stream_gen", 0)) + 1
+            return self._stream_gen
+
+    def _stream_generation_current(self, token: int) -> bool:
+        with self._lock:
+            return int(token) == int(getattr(self, "_stream_gen", 0))
+
+    @property
+    def active_mjpeg_streams(self) -> int:
+        with self._lock:
+            return int(getattr(self, "_active_streams", 0))
+
     def _stop_live(self, session_id: str, source: Optional[str] = None, *, wait: bool = False, timeout_s: float = 2.0) -> None:
         threads: List[threading.Thread] = []
+        handles: List[tuple] = []
         with self._lock:
+            if source is None or self._active_source.get(session_id) == source:
+                self._active_source.pop(session_id, None)
             keys = [self._live_key(session_id, source)] if source else [k for k in self._live if k.startswith(f"{session_id}:")]
             for key in keys:
                 state = self._live.get(key)
                 if state is not None:
                     state["running"] = False
+                    # Never serve a stale frame after close.
+                    state["preview_png"] = None
+                    state["capture_png"] = None
+                    cap = state.pop("_cap", None)
+                    reader = state.pop("_serial_reader", None)
+                    if cap is not None:
+                        handles.append(("cap", cap))
+                    if reader is not None:
+                        handles.append(("serial", reader))
                 stop_evt = self._live_stops.get(key)
                 if stop_evt is not None:
                     stop_evt.set()
                 thread = self._live_threads.get(key)
                 if thread is not None:
                     threads.append(thread)
+                with self._latest_frame_lock:
+                    self._latest_capture_frames.pop(key, None)
+        # Release the OS handles even if the worker is wedged in read():
+        # cv2 release / serial close unblocks it and extinguishes the LED.
+        for kind, handle in handles:
+            try:
+                if kind == "cap":
+                    handle.release()
+                else:
+                    handle.close()
+            except Exception:
+                pass
         if wait:
             deadline = time.time() + max(0.0, float(timeout_s))
             for thread in threads:
@@ -7070,10 +11405,51 @@ class RecordController:
                     if current is thread and not thread.is_alive():
                         self._live_threads.pop(key, None)
 
-    def _ensure_live(self, session_id: str, source: str) -> None:
+    def _live_closed_recently(self, session_id: str) -> bool:
+        try:
+            closed_at = float(self._live_closed_at.get(session_id) or 0.0)
+        except Exception:
+            closed_at = 0.0
+        return bool(closed_at) and (time.time() - closed_at) < LIVE_REOPEN_BLOCK_S
+
+    def _await_live_activation(self, session_id: str, timeout_s: float = 0.8) -> bool:
+        """Briefly bridge a stage-open race with the close tombstone.
+
+        The collect/preview page issues its MJPEG/predict GET at almost the
+        same moment as POST /live/activate.  Without this short wait the GET
+        sees the tombstone, returns 409, and the UI waits for its 2.5 s retry
+        — exactly the perceived capture/preview delay.  A genuinely stale
+        retry never sees the tombstone lifted and still gets 409.
+        """
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while time.time() < deadline:
+            if not self._live_closed_recently(session_id):
+                return True
+            time.sleep(0.02)
+        return not self._live_closed_recently(session_id)
+
+    def _ensure_live(self, session_id: str, source: str, *, explicit: bool = False) -> None:
         cfg = self._configs.get(session_id)
         if cfg is None:
             raise RuntimeError("missing config")
+        if explicit:
+            # /live/activate is the ONLY thing that clears the tombstone.
+            self._live_closed_at.pop(session_id, None)
+        elif self._live_closed_recently(session_id):
+            raise RuntimeError("live session is closed")
+        # Single active loop per session: switching webcam <-> device closes
+        # the previous producer before the new one opens its device handle.
+        # Done outside the state lock because _stop_live joins the worker.
+        previous_source = ""
+        with self._lock:
+            previous_source = str(self._active_source.get(session_id) or "")
+            if previous_source != source:
+                self._active_source[session_id] = source
+        if previous_source and previous_source != source:
+            try:
+                self._stop_live(session_id, previous_source, wait=True, timeout_s=1.5)
+            except Exception:
+                pass
         key = self._live_key(session_id, source)
         now = time.time()
         with self._lock:
@@ -7123,6 +11499,30 @@ class RecordController:
             self._live_threads[key] = t
         t.start()
 
+    def _restart_webcam_live(self, session_id: str) -> bool:
+        """Stop/join the old webcam worker and open a NEW one.
+
+        Reusing the old worker after the camera selection changes leaves the
+        existing /live/mjpeg socket bound to the previous device (macOS shares
+        one AVFoundation capture per process), so the stage never visibly
+        switches.  Bumping the stream generation retires every old MJPEG
+        generator immediately, then a fresh worker opens the new camera.
+        """
+        with self._lock:
+            active = str(self._active_source.get(session_id) or "")
+        if active != "webcam":
+            return False
+        self._bump_stream_generation()
+        try:
+            self._stop_live(session_id, "webcam", wait=True, timeout_s=2.0)
+        except Exception:
+            pass
+        try:
+            self._ensure_live(session_id, "webcam")
+        except Exception:
+            pass
+        return True
+
     def _get_live_preview(self, session_id: str, source: str, autostart: bool = True) -> Optional[bytes]:
         key = self._live_key(session_id, source)
         with self._lock:
@@ -7147,6 +11547,8 @@ class RecordController:
             if thread is None or not thread.is_alive():
                 needs_revival = True
         if needs_revival and autostart:
+            if self._live_closed_recently(session_id):
+                return None
             try:
                 self._ensure_live(session_id, source)
             except Exception:
@@ -7262,10 +11664,12 @@ class RecordController:
                 state["preview_png"] = preview_png
                 state["_preview_ts"] = now
                 state["_publish_ts"] = now
+                state["frame_seq"] = int(state.get("frame_seq") or 0) + 1
             if capture_png is not None:
                 state["capture_png"] = capture_png
                 state["_capture_ts"] = now
                 state["_publish_ts"] = now
+                state["frame_seq"] = int(state.get("frame_seq") or 0) + 1
             if error is not None:
                 state["error"] = error
             if actual is not None:
@@ -7318,6 +11722,10 @@ class RecordController:
                 reader_sig = sig
                 try:
                     reader.open()
+                    with self._lock:
+                        live_state = self._live.get(key)
+                        if live_state is not None:
+                            live_state["_serial_reader"] = reader
                 except Exception as e:
                     msg = str(e) or "Unable to open serial device."
                     self._live_set(key, error=msg[:220])
@@ -7348,6 +11756,12 @@ class RecordController:
                     if int(out_side) == raw_side
                     else _raw96_to_png(raw, crop_box=cfg.crop_box, frame_side=raw_side, out_side=raw_side)
                 )
+                with self._latest_frame_lock:
+                    self._latest_capture_frames[key] = {
+                        "kind": "png",
+                        "data": capture_png,
+                        "ts": time.time(),
+                    }
                 self._live_set(key, preview_png=preview_png, capture_png=capture_png, error="")
                 last_error = ""
             except Exception as e:
@@ -7367,11 +11781,14 @@ class RecordController:
     def _live_webcam(self, key: str, session_id: str, cfg: SessionConfig, gen: int, stop_evt: threading.Event) -> None:
         import cv2
 
+        _cv2_single_threaded(cv2)
         cap = None
         cam_sig = None
         last_error = ""
         read_failures = 0
         ever_framed = False
+        last_preview_at = 0.0
+        last_capture_at = 0.0
         try:
             while not stop_evt.is_set() and self._live_running(key, gen):
                 try:
@@ -7408,6 +11825,12 @@ class RecordController:
                         cam_sig = current_sig
                         read_failures = 0
                         last_error = ""
+                        # Expose the OS handle so _stop_live can release it
+                        # synchronously (camera LED must go out on close).
+                        with self._lock:
+                            live_state = self._live.get(key)
+                            if live_state is not None:
+                                live_state["_cap"] = cap
                         self._live_set(key, actual=_camera_open_info_dict(info), error="")
                     ok, frame = cap.read()
                     if not ok or frame is None:
@@ -7450,22 +11873,47 @@ class RecordController:
                             preview_frame = cv2.resize(frame, (max_w, scaled_h), interpolation=cv2.INTER_AREA)
                     except Exception:
                         preview_frame = frame
-                    preview_png = _to_png_bytes(Image.fromarray(preview_frame))
                     img = Image.fromarray(frame).convert("RGB")
                     if cfg.crop_box is not None:
                         x1, y1, x2, y2 = cfg.crop_box
                         img = img.crop((x1, y1, x2, y2))
-                    # capture_png is what /live/capture and _record_from_live
-                    # write to disk, and what the Manual ROI editor shows as
-                    # "Original Sample".  Keep it at camera resolution — the
-                    # old `resize((img_size, img_size))` here saved 28x28
-                    # thumbnails for an OCR project, so the user was dragging
-                    # a ROI on a blown-up thumbnail and the crop had nothing
-                    # left to select.  _cache_one_sample still stores the
-                    # training tensor at img_size, after the crop.
+                    # Full-resolution "Original Sample" frame.  /live/capture
+                    # reads this in-memory object; it never waits for a read
+                    # and never re-encodes it on the HTTP thread.
                     img = _cap_capture_resolution(img)
-                    self._live_set(key, preview_png=preview_png, capture_png=_to_png_bytes(img), error="")
-                    time.sleep(0.06)
+                    now = time.time()
+                    with self._latest_frame_lock:
+                        self._latest_capture_frames[key] = {
+                            "kind": "pil",
+                            "image": img,
+                            "preview_image": preview_frame,
+                            "ts": now,
+                        }
+                    try:
+                        view_fps = max(1.0, min(30.0, float(getattr(cfg, "view_fps", 0) or cfg.fps or 20.0)))
+                    except Exception:
+                        view_fps = 20.0
+                    try:
+                        capture_fps = max(1.0, min(15.0, float(getattr(cfg, "capture_fps", 0) or 6.0)))
+                    except Exception:
+                        capture_fps = 6.0
+                    preview_png = None
+                    capture_png = None
+                    if now - last_preview_at >= (1.0 / view_fps):
+                        preview_png = _to_png_bytes(Image.fromarray(preview_frame))
+                        last_preview_at = now
+                    if now - last_capture_at >= (1.0 / capture_fps):
+                        # Legacy record paths consume capture_png; the SPA's
+                        # hold-capture uses the in-memory frame above.
+                        capture_png = _to_png_bytes(img)
+                        last_capture_at = now
+                    self._live_set(
+                        key,
+                        preview_png=preview_png,
+                        capture_png=capture_png,
+                        error="",
+                    )
+                    time.sleep(0.001)
                 except Exception as e:
                     # The live thread must NEVER die: an exception here used
                     # to kill the worker while the cached preview_png kept
@@ -7526,6 +11974,7 @@ class RecordController:
                 import cv2
             except Exception:
                 return None
+            _cv2_single_threaded(cv2)
             try:
                 cap, _actual_index = _open_working_camera(int(cfg.webcam_index or 0), unique_id=cfg.webcam_id)
             except Exception:
@@ -7591,6 +12040,7 @@ class RecordController:
             with self._lock:
                 self._active[session_id] = {"recording": "0", "error": "missing opencv-python"}
             return
+        _cv2_single_threaded(cv2)
 
         cap, info = _open_working_camera(int(cfg.webcam_index or 0), unique_id=cfg.webcam_id)
         if cap is None or not cap.isOpened():
@@ -7766,11 +12216,19 @@ class RecordController:
                 previews.append(_preview_item_payload(p))
             except Exception:
                 continue
+        processed = self._processed_previews_payload(dataset_root, [class_name]).get(class_name, [])
+        class_pre = self._class_preprocess_load(dataset_root)
+        sample_pre = self._sample_preprocess_load(dataset_root)
         return {
             "ok": "1",
             "class": class_name,
             "count": str(len(files)),
+            "filenames": [str(p.name) for p in files],
             "previews": previews,
+            "processed_previews": processed,
+            "class_preprocess": class_pre.get(class_name) or {},
+            "sample_preprocess": sample_pre.get(class_name) or {},
+            "dataset_dirty_since_train": self._dataset_dirty_since_train(dataset_root),
         }
 
     def _class_filenames_payload(self, dataset_root: Path, class_name: str) -> Dict[str, Any]:
@@ -7783,19 +12241,139 @@ class RecordController:
             "filenames": [str(p.name) for p in files],
         }
 
-    def _sample_image_png(self, dataset_root: Path, class_name: str, filename: str) -> bytes:
+    def _capture_writer_loop(self) -> None:
+        while True:
+            job = self._capture_write_queue.get()
+            try:
+                if job is None:
+                    continue
+                path = Path(job["path"])
+                png = job.get("png")
+                image = job.get("image")
+                if png is None and image is not None:
+                    png = _to_png_bytes(image)
+                if png is not None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_suffix(path.suffix + ".tmp")
+                    tmp.write_bytes(png)
+                    tmp.replace(path)
+                    try:
+                        self._cache_one_sample(
+                            Path(job["dataset_root"]),
+                            str(job["class"]),
+                            path,
+                            img_size=int(job.get("img_size") or 96),
+                            project_type=str(job.get("project_type") or PROJECT_TYPE_IMAGE),
+                        )
+                    except Exception as exc:
+                        _controller_log(f"capture cache failed {path.name}: {exc}")
+                    self._mark_dataset_dirty(Path(job["dataset_root"]))
+            except Exception as exc:
+                _controller_log(f"capture disk write failed: {exc}")
+            finally:
+                with self._capture_write_cond:
+                    self._capture_write_pending = max(0, self._capture_write_pending - 1)
+                    self._capture_write_cond.notify_all()
+                self._capture_write_queue.task_done()
+
+    def _next_capture_path(self, dataset_root: Path, class_name: str) -> Path:
+        safe = sanitize_class_name(class_name)
+        class_dir = Path(dataset_root) / safe
+        class_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(class_name)).strip("._-").lower() or "sample"
+        with self._capture_name_lock:
+            key = str(class_dir)
+            seq = int(self._capture_name_seq.get(key) or 0) + 1
+            self._capture_name_seq[key] = seq
+        return class_dir / f"{slug}_{int(time.time() * 1000)}_{seq:04d}.png"
+
+    def _enqueue_capture_write(
+        self,
+        cfg: SessionConfig,
+        class_name: str,
+        path: Path,
+        *,
+        png: Optional[bytes] = None,
+        image: Optional[Any] = None,
+    ) -> None:
+        with self._capture_write_cond:
+            self._capture_write_pending += 1
+        self._capture_write_queue.put({
+            "dataset_root": str(cfg.dataset_root),
+            "class": str(class_name),
+            "path": str(path),
+            "png": png,
+            "image": image,
+            "img_size": int(cfg.img_size),
+            "project_type": str(cfg.project_type),
+        })
+
+    def _flush_capture_writes(self, timeout: float = 5.0) -> bool:
+        deadline = time.time() + max(0.0, float(timeout))
+        with self._capture_write_cond:
+            while self._capture_write_pending > 0:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._capture_write_cond.wait(timeout=remaining)
+        return True
+
+    def _thumbnail_cache_path(self, dataset_root: Path, class_name: str, path: Path) -> Path:
+        return (
+            Path(dataset_root).parent
+            / ".tm_thumb_cache"
+            / sanitize_class_name(class_name)
+            / f"{path.stem}.png"
+        )
+
+    def _sample_image_png(
+        self,
+        dataset_root: Path,
+        class_name: str,
+        filename: str,
+        *,
+        thumb: bool = False,
+    ) -> bytes:
         class_dir = dataset_root / sanitize_class_name(class_name)
         path = (class_dir / str(filename)).resolve()
         if not str(path).startswith(str(class_dir.resolve())) or not path.exists() or not path.is_file():
             raise FileNotFoundError(filename)
+        if not thumb:
+            img = Image.open(path)
+            try:
+                return _to_png_bytes(img.convert("RGB" if img.mode not in {"L", "RGB"} else img.mode))
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+        # Thumbnails are the hot path: class cards and strips only need 96 px,
+        # never a full-resolution re-encode per tile.  The cache file is keyed
+        # by the source mtime and is regenerated only when the sample changes.
+        cache_path = self._thumbnail_cache_path(dataset_root, class_name, path)
+        try:
+            if cache_path.is_file() and cache_path.stat().st_mtime_ns >= path.stat().st_mtime_ns:
+                return cache_path.read_bytes()
+        except Exception:
+            pass
         img = Image.open(path)
         try:
-            return _to_png_bytes(img.convert("RGB" if img.mode not in {"L", "RGB"} else img.mode))
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in {"L", "RGB"}:
+                img = img.convert("RGB")
+            img.thumbnail((96, 96), Image.BILINEAR)
+            png = _to_png_bytes(img)
         finally:
             try:
                 img.close()
             except Exception:
                 pass
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._atomic_write_bytes(cache_path, png)
+        except Exception:
+            pass
+        return png
 
     def _dataset_labels_load(self, dataset_dir: Path) -> List[str]:
         labels_json = dataset_dir / "labels.json"
@@ -7866,6 +12444,19 @@ def list_webcam_options(max_count: int = 6) -> List[Dict[str, str]]:
                         options.append({"index": idx, "label": name, "unique_id": str(cam.get("spcamera_unique-id") or "")})
             except Exception:
                 pass
+    if not options and os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-PnpDevice -Class Camera -Status OK | Select-Object -ExpandProperty FriendlyName"],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            if proc.returncode == 0:
+                names = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+                for idx, name in enumerate(names[:max_count]):
+                    options.append({"index": idx, "label": name, "unique_id": ""})
+        except Exception:
+            pass
     if not options:
         for idx in range(max_count):
             options.append({"index": idx, "label": f"Camera {idx}", "unique_id": ""})
@@ -7908,6 +12499,24 @@ def _send_json(req: BaseHTTPRequestHandler, obj: Dict[str, Any], status: int = 2
     except (BrokenPipeError, ConnectionResetError, OSError):
         # Client disconnected mid-response (SPA aborts fetches with
         # AbortController) — nothing to send to; ignore silently.
+        pass
+
+
+def _send_bytes(
+    req: BaseHTTPRequestHandler,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+    status: int = 200,
+    cache_control: str = "no-store, max-age=0",
+) -> None:
+    try:
+        req.send_response(status)
+        req.send_header("Cache-Control", str(cache_control or "no-store, max-age=0"))
+        req.send_header("Content-Type", str(content_type or "application/octet-stream"))
+        req.send_header("Content-Length", str(len(data)))
+        req.end_headers()
+        req.wfile.write(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
         pass
 
 
@@ -7990,6 +12599,31 @@ def _preview_item_payload(path: Path) -> Dict[str, str]:
         "filename": str(path.name),
     }
 
+def _sample_src_url(session_id: str, class_name: str, path: Path) -> str:
+    """Versioned /sample_image URL.
+
+    Edit saves rewrite the processed cache at a stable per-sample path; WKWebView
+    will otherwise keep serving the old bytes from its immutable cache.  The
+    mtime token changes whenever the file is rebuilt, so Collect/Edit/Preview
+    re-fetch instead of showing a stale crop.
+    """
+    try:
+        version = int(path.stat().st_mtime_ns)
+    except Exception:
+        version = int(time.time() * 1000)
+    return (
+        f"/sample_image?session={quote(session_id)}"
+        f"&class={quote(class_name)}"
+        f"&filename={quote(path.name)}"
+        f"&v={version}"
+    )
+
+
+def _sample_thumb_url(session_id: str, class_name: str, path: Path) -> str:
+    """Cached 96 px thumbnail variant of ``_sample_src_url``."""
+    return _sample_src_url(session_id, class_name, path) + "&thumb=1"
+
+
 
 @dataclass(frozen=True)
 class CameraOpenInfo:
@@ -8058,6 +12692,17 @@ def _uid_for_webcam_index(camera_index: int, max_count: int = 6) -> str:
     return ""
 
 
+def _limit_capture_buffer(cap: Any) -> None:
+    """Keep one queued frame so live preview never trails the camera."""
+    try:
+        import cv2
+
+        _cv2_single_threaded(cv2)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+
 def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, max_probe_index: int = 3):
     """Open the SELECTED camera, never "some camera that opens".
 
@@ -8074,6 +12719,7 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
     """
     import cv2
 
+    _cv2_single_threaded(cv2)
     idx = int(preferred_index or 0)
     uid = str(unique_id or "").strip()
     if sys.platform == "darwin" and uid:
@@ -8084,6 +12730,7 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
             cap = opener(uid)
         except Exception as e:
             return None, CameraOpenInfo("failed", idx, uid, "", str(e)[:220])
+        _limit_capture_buffer(cap)
         if cap is not None and cap.isOpened():
             return cap, CameraOpenInfo("unique_id", idx, uid, "", "")
         return None, CameraOpenInfo("failed", idx, uid, "", f"Selected camera (ID {uid[:12]}…) is not connected or cannot be opened.")
@@ -8096,12 +12743,14 @@ def _open_working_camera(preferred_index: int, unique_id: Optional[str] = None, 
                     cap = opener(derived)
                 except Exception as e:
                     return None, CameraOpenInfo("failed", idx, derived, "", str(e)[:220])
+                _limit_capture_buffer(cap)
                 if cap is not None and cap.isOpened():
                     return cap, CameraOpenInfo("unique_id", idx, derived, "", "")
     candidates = [idx] + [i for i in range(max_probe_index + 1) if i != idx]
     for i in candidates:
         try:
             cap = cv2.VideoCapture(int(i))
+            _limit_capture_buffer(cap)
         except Exception:
             continue
         opened = bool(cap.isOpened())
@@ -8280,13 +12929,13 @@ def _to_png_bytes(img: Image.Image) -> bytes:
 # image/ocr previews stutter while the sign verdict (a few tiny nodes) looked
 # smooth.  Downscaling to preview size and using JPEG turns each frame into a
 # few KB and a sub-millisecond decode.
-_PREVIEW_JPEG_MAX_SIDE = 160
+_PREVIEW_JPEG_MAX_SIDE = 480
 _PREVIEW_JPEG_QUALITY = 82
 
 
 def _to_preview_jpeg_bytes(
     img: Image.Image,
-    max_side: int = 192,
+    max_side: int = 480,
     quality: int = _PREVIEW_JPEG_QUALITY,
 ) -> bytes:
     """Downscale a display image and encode JPEG for the live preview."""

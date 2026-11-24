@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -84,6 +85,7 @@ from trainer import (
     DatasetBundle,
     FitContext,
     TrainConfig,
+    TrainingCancelled,
     TrainStrategy,
     glyph_head_layers,
     conv_backbone_kwargs,
@@ -100,6 +102,8 @@ BACKBONE_CACHE_VERSION = "v3"  # v3: compact GAP head; drop any >500 KB cache
 # ════════════════════════════════════════════════════════════════════════
 # Small shared helpers
 # ════════════════════════════════════════════════════════════════════════
+_BACKBONE_MODEL_CACHE: Dict[Tuple[str, int], Any] = {}
+
 def _project_convention(cfg: TrainConfig) -> Tuple[str, int, List[str]]:
     """(glyph convention, ink polarity, classes with a different convention).
 
@@ -511,12 +515,22 @@ def ocr_prepare(dataset_dir: Path, cfg: TrainConfig) -> DatasetBundle:
     app_data = _app_data_dir()
     backbone_path: Optional[Path] = None
     backbone = None
+    backbone_load_ms = 0.0
     warnings: List[str] = []
     if bool(cfg.ocr_transfer_learning):
         backbone_path = ensure_pretrained_backbone(app_data, cfg, convention=convention)
         if backbone_path is not None:
             try:
-                backbone = tf.keras.models.load_model(str(backbone_path))
+                stat = backbone_path.stat()
+                cache_key = (str(backbone_path), int(stat.st_mtime_ns))
+                cached = _BACKBONE_MODEL_CACHE.get(cache_key)
+                if cached is not None:
+                    backbone = cached
+                else:
+                    _t = time.perf_counter()
+                    backbone = tf.keras.models.load_model(str(backbone_path))
+                    backbone_load_ms = (time.perf_counter() - _t) * 1000.0
+                    _BACKBONE_MODEL_CACHE[cache_key] = backbone
             except Exception as e:
                 warnings.append(f"could not load the pretrained backbone ({e}); training from scratch")
 
@@ -562,6 +576,7 @@ def ocr_prepare(dataset_dir: Path, cfg: TrainConfig) -> DatasetBundle:
     meta = mix.to_meta()
     meta["backbone_path"] = str(backbone_path) if backbone_path else None
     meta["backbone"] = backbone
+    meta["backbone_load_ms"] = float(backbone_load_ms)
     meta["convention"] = convention
     meta["polarity"] = int(polarity)
     meta["warnings"] = warnings
@@ -603,10 +618,93 @@ def ocr_build_model(bundle: DatasetBundle, cfg: TrainConfig) -> tf.keras.Model:
     return model
 
 
+def _fit_head_on_cached_embeddings(
+    model: tf.keras.Model,
+    backbone: Any,
+    bundle: DatasetBundle,
+    cfg: TrainConfig,
+    ctx: FitContext,
+    epochs: int,
+) -> bool:
+    """Train the head on ONE backbone pass worth of cached embeddings.
+
+    The backbone is frozen in phase 1, so `backbone(x, training=False)` is
+    constant across head epochs.  Computing it once per sample (batched) and
+    fitting the head on those vectors removes ~20-50 full conv passes over
+    the same images.  The head layers are shared with `model`, so their
+    trained weights land in the model that is exported.
+
+    Returns False when the layer graph is not the expected
+    Sequential(backbone) → head shape, so the caller can fall back to the
+    ordinary (slower) path rather than train the wrong thing.
+    """
+    try:
+        layers = list(model.layers)
+        if backbone not in layers:
+            return False
+        head_layers = [
+            layer
+            for layer in layers[layers.index(backbone) + 1 :]
+            if not isinstance(layer, tf.keras.layers.InputLayer)
+        ]
+        if not head_layers:
+            return False
+
+        def _collect(ds: Any) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+            if ds is None:
+                return None
+            xs: List[np.ndarray] = []
+            ys: List[np.ndarray] = []
+            for xb, yb in ds:
+                xs.append(np.asarray(backbone(xb, training=False)))
+                ys.append(np.asarray(yb))
+            if not xs:
+                return None
+            return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
+
+        train_emb = _collect(bundle.train_ds)
+        if train_emb is None:
+            return False
+        val_emb = _collect(bundle.val_ds)
+        inp = tf.keras.Input(shape=train_emb[0].shape[1:], name="cached_features")
+        h = inp
+        for layer in head_layers:
+            h = layer(h)
+        head_model = tf.keras.Model(inp, h, name="head_from_cache")
+        head_model.compile(
+            optimizer=make_optimizer(cfg, float(cfg.ocr_head_lr)),
+            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+            metrics=["accuracy"],
+        )
+        fit_kwargs: Dict[str, Any] = {
+            "epochs": max(1, int(epochs)),
+            "verbose": 0,
+            "batch_size": max(1, int(cfg.batch_size)),
+            "callbacks": ctx.make_callbacks(int(epochs), tag="(head)", lo=0.05, hi=0.45),
+            "class_weight": bundle.class_weights,
+        }
+        if val_emb is not None:
+            fit_kwargs["validation_data"] = val_emb
+        head_model.fit(train_emb[0], train_emb[1], **fit_kwargs)
+        return True
+    except Exception:
+        return False
+
+
 def ocr_fit(model: tf.keras.Model, bundle: DatasetBundle, cfg: TrainConfig, ctx: FitContext) -> None:
     """Phase 1 (head only) then phase 2 (last conv block, lower LR)."""
+    def _check_cancel() -> None:
+        if ctx.should_stop is not None:
+            try:
+                if ctx.should_stop():
+                    raise TrainingCancelled("Training cancelled by user.")
+            except TrainingCancelled:
+                raise
+            except Exception:
+                pass
+
     backbone = bundle.meta.get("backbone")
-    fit_common: Dict[str, Any] = {"verbose": 1, "class_weight": bundle.class_weights}
+    fit_common: Dict[str, Any] = {"verbose": 0, "class_weight": bundle.class_weights}
     if bundle.val_ds is not None:
         fit_common["validation_data"] = bundle.val_ds
 
@@ -620,9 +718,24 @@ def ocr_fit(model: tf.keras.Model, bundle: DatasetBundle, cfg: TrainConfig, ctx:
                   **fit_common)
         return
 
-    model.fit(bundle.train_ds, epochs=head_epochs,
-              callbacks=ctx.make_callbacks(head_epochs, tag="(head)", lo=0.05, hi=0.45),
-              **fit_common)
+    # ── Frozen-backbone fast path ───────────────────────────────────────
+    # The backbone cannot change during the head phase, so its activations
+    # are computed ONCE and the head trains on the cached embeddings.
+    # Running the full conv stack for every head epoch was the dominant
+    # cost on a small embedded dataset (20-50 redundant forward passes over
+    # the same images); this keeps the identical gradient for the head
+    # weights because only the head's parameters receive updates.
+    cached = _fit_head_on_cached_embeddings(
+        model, backbone, bundle, cfg, ctx, head_epochs
+    )
+    if not cached:
+        # Fall back to the full model if the layer graph is not the expected
+        # Sequential(backbone)->head shape (never expected, but a silently
+        # wrong embedding path would be worse than a slower one).
+        model.fit(bundle.train_ds, epochs=head_epochs,
+                  callbacks=ctx.make_callbacks(head_epochs, tag="(head)", lo=0.05, hi=0.45),
+                  **fit_common)
+    _check_cancel()
 
     if ft_epochs > 0 and int(cfg.ocr_unfreeze_blocks) > 0:
         released = unfreeze_last_conv_blocks(backbone, int(cfg.ocr_unfreeze_blocks))

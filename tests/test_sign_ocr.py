@@ -283,6 +283,7 @@ class FakeController:
         self._lock = threading.RLock()
         self._configs = {}
         self._preview_locks = {}
+        self._roi_track = {}
         self._preview_load_model = types.MethodType(
             lambda _self, session_id=None, **kw: {
                 "labels": list(labels),
@@ -302,7 +303,11 @@ class FakeController:
         # These two touch nothing but their arguments, so the REAL ones are
         # used: the preprocessing-record choice and the composite image are
         # part of what the test is checking, not scaffolding around it.
-        for name in ("_sign_ocr_preprocess_config", "_sign_ocr_composite"):
+        for name in (
+            "_sign_ocr_preprocess_config",
+            "_sign_ocr_composite",
+            "_stabilize_live_boxes",
+        ):
             setattr(
                 self,
                 name,

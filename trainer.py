@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -130,6 +132,15 @@ class TrainConfig:
     ocr_unfreeze_blocks: int = 1
 
 
+class TrainingCancelled(RuntimeError):
+    """Raised when the controller asks a run to stop.
+
+    A dedicated type (rather than a generic RuntimeError) is what lets
+    ``_train_worker`` delete the partial run directory instead of reporting
+    the run as a failure.
+    """
+
+
 @dataclass(frozen=True)
 class TrainResult:
     run_dir: Path
@@ -145,6 +156,16 @@ class TrainResult:
     # OCR project puts its EMNIST/background mix manifest here.  Typed as a
     # plain dict so the trainer needs to know nothing about any one project.
     meta: Dict[str, Any] = field(default_factory=dict)
+    # Real telemetry the 03 TRAIN page renders.  One record per epoch:
+    # {"epoch", "loss", "accuracy", "val_loss", "val_accuracy"}; multi-phase
+    # OCR runs also carry a "phase" label.
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    # Confusion matrix on the int8 self-check split.  matrix[true][pred].
+    confusion_matrix: Optional[List[List[int]]] = None
+    confusion_labels: Optional[List[str]] = None
+    tensor_shape: Optional[List[int]] = None
+    tflite_size_bytes: int = 0
+    latency_ms: float = 0.0
 
 
 def _channels(color_mode: str) -> int:
@@ -448,7 +469,10 @@ def build_model(input_shape: Tuple[int, int, int], num_classes: int, cfg: TrainC
 
 
 def _representative_data_gen(train_ds: tf.data.Dataset, cfg: TrainConfig):
-    n = max(1, int(cfg.representative_samples))
+    # Calibration does not need hundreds of frames.  A small stratified slice
+    # (the training set is already shuffled) keeps INT8 conversion fast while
+    # preserving activation-range coverage across classes.
+    n = min(32, max(1, int(cfg.representative_samples)))
     seen = 0
     for batch_x, _ in train_ds.unbatch().batch(1).take(n):
         x = tf.convert_to_tensor(batch_x, dtype=tf.float32)
@@ -488,12 +512,15 @@ def convert_to_int8_tflite(model: tf.keras.Model, train_ds: tf.data.Dataset, cfg
 
 def _keras_predict_fn(model: Any) -> Callable[[np.ndarray], np.ndarray]:
     def fn(batch01: np.ndarray) -> np.ndarray:
-        return model.predict(batch01, verbose=0)
+        # Direct eager call.  model.predict() builds/traces a tf.data pipeline
+        # for every call (tens of ms on these tiny self-check batches); the
+        # training self-check only needs the logits.
+        return np.asarray(model(batch01, training=False))
 
     return fn
 
 
-def _tflite_predict_fn(tflite_bytes: bytes) -> Callable[[np.ndarray], np.ndarray]:
+def _tflite_predict_fn(tflite_bytes: bytes, color_mode: str = "grayscale") -> Callable[[np.ndarray], np.ndarray]:
     import tensorflow as tf
 
     interp = tf.lite.Interpreter(model_content=tflite_bytes)
@@ -502,12 +529,22 @@ def _tflite_predict_fn(tflite_bytes: bytes) -> Callable[[np.ndarray], np.ndarray
     out = interp.get_output_details()[0]
     qs, qz = inp["quantization"]
     os_, oz = out["quantization"]
+    channels = _channels(color_mode)
 
     def fn(batch01: np.ndarray) -> np.ndarray:
         outs = []
         for arr01 in batch01:
-            arr2d = arr01[:, :, 0] if arr01.ndim == 3 else arr01
-            x = np.clip(np.round(arr2d / qs + qz), -128, 127).astype(np.int8)[None, :, :, None]
+            if arr01.ndim == 2:
+                arr = arr01[..., None]
+                if channels == 3:
+                    arr = np.repeat(arr, 3, axis=-1)
+            else:
+                arr = arr01
+                if channels == 1:
+                    arr = arr[..., :1]
+                elif arr.shape[-1] != 3:
+                    arr = np.repeat(arr[..., :1], 3, axis=-1)
+            x = np.clip(np.round(arr / qs + qz), -128, 127).astype(np.int8)[None, ...]
             interp.set_tensor(inp["index"], x)
             interp.invoke()
             raw = interp.get_tensor(out["index"]).reshape(-1)
@@ -522,10 +559,66 @@ def _tflite_predict_fn(tflite_bytes: bytes) -> Callable[[np.ndarray], np.ndarray
     return fn
 
 
+def measure_tflite_latency(tflite_bytes: bytes, warmup: int = 4, runs: int = 15) -> float:
+    """Median single-frame inference time in milliseconds (INT8).
+
+    Warm-up invocations absorb the first-call allocation cost; the median of
+    the measured runs is the number the UI reports as ESP32-relative input
+    latency evidence (the desktop CPU is not a P4, so this is a comparative
+    KPI, not a device promise).
+    """
+    import time as _time
+
+    import tensorflow as tf
+
+    try:
+        interp = tf.lite.Interpreter(model_content=tflite_bytes)
+        interp.allocate_tensors()
+        inp = interp.get_input_details()[0]
+        shape = tuple(int(x) for x in inp["shape"])
+        dtype = inp["dtype"]
+        zeros = np.zeros(shape, dtype=dtype)
+        for _ in range(max(1, int(warmup))):
+            interp.set_tensor(inp["index"], zeros)
+            interp.invoke()
+        samples: List[float] = []
+        for _ in range(max(1, int(runs))):
+            interp.set_tensor(inp["index"], zeros)
+            t0 = _time.perf_counter()
+            interp.invoke()
+            samples.append((_time.perf_counter() - t0) * 1000.0)
+        if not samples:
+            return 0.0
+        samples.sort()
+        return float(samples[len(samples) // 2])
+    except Exception:
+        return 0.0
+
+
+def _load_eval_images(files: List[Path], color_mode: str) -> np.ndarray:
+    """Self-check inputs in the EXACT channel layout the model trained on."""
+    from PIL import Image
+
+    channels = _channels(color_mode)
+    imgs = []
+    for p in files:
+        img = Image.open(p)
+        try:
+            mode = "RGB" if channels == 3 else "L"
+            arr = np.asarray(img.convert(mode), dtype=np.uint8).astype(np.float32) / 255.0
+        finally:
+            img.close()
+        if channels == 1:
+            arr = arr[..., None]
+        imgs.append(arr)
+    return np.stack(imgs)
+
+
 def evaluate_class_accuracies(
     predict_fn: Callable[[np.ndarray], np.ndarray],
     dataset_dir: Path,
     labels: List[str],
+    color_mode: str = "grayscale",
 ) -> Dict[str, float]:
     """Per-class accuracy on the processed dataset (normalize-only path).
 
@@ -533,23 +626,45 @@ def evaluate_class_accuracies(
     own training images has collapsed (single-class output) and must never
     ship silently — callers surface the weak classes to the user.
     """
-    from PIL import Image
-
     accs: Dict[str, float] = {}
     for label in labels:
         cls_dir = Path(dataset_dir) / label
         files = sorted([p for p in cls_dir.glob("*.png") if p.is_file()])
         if not files:
             continue
-        imgs = []
-        for p in files:
-            g = np.asarray(Image.open(p).convert("L"), dtype=np.uint8)
-            imgs.append(g.astype(np.float32) / 255.0)
-        x = np.stack(imgs)[..., None]
+        x = _load_eval_images(files, color_mode)
         probs = predict_fn(x)
         truth = labels.index(label)
         accs[label] = float((np.argmax(probs, axis=1) == truth).mean())
     return accs
+
+
+def evaluate_confusion(
+    predict_fn: Callable[[np.ndarray], np.ndarray],
+    dataset_dir: Path,
+    labels: List[str],
+    color_mode: str = "grayscale",
+) -> Tuple[List[str], List[List[int]]]:
+    """Real TRUE × PRED counts on the self-check split.
+
+    Returns (labels, matrix) with matrix[true_index][pred_index].  Rows are
+    the ground truth, exactly what the 03 TRAIN grid renders.
+    """
+    n = len(labels)
+    matrix: List[List[int]] = [[0 for _ in range(n)] for _ in range(n)]
+    for true_idx, label in enumerate(labels):
+        cls_dir = Path(dataset_dir) / label
+        files = sorted([p for p in cls_dir.glob("*.png") if p.is_file()])
+        if not files:
+            continue
+        x = _load_eval_images(files, color_mode)
+        probs = predict_fn(x)
+        preds = np.argmax(probs, axis=1)
+        for pred_idx in preds:
+            j = int(pred_idx)
+            if 0 <= j < n:
+                matrix[true_idx][j] += 1
+    return list(labels), matrix
 
 
 def export_tflite_c_sources(tflite_model: bytes, array_name: str) -> Tuple[str, str]:
@@ -597,14 +712,23 @@ def _adjust_cfg_for_dataset_size(dataset_dir: Path, cfg: TrainConfig) -> Tuple[T
     steps_per_epoch = max(1, int(train_count // new_batch))
 
     user_epochs = max(1, int(cfg.epochs))
-    target_total_updates = 800
-    min_total_updates = 300
+    # The 800-update budget is tuned for corpora where an epoch is cheap.
+    # On a tiny embedded set every epoch is a full pass over the same images,
+    # and 800 updates turns 80 samples into 200 epochs — minutes of CPU for
+    # a model that converged long before.  Scale the budget (and the epoch
+    # ceiling) with the corpus; large projects keep the original numbers.
+    if total_files < 150:
+        target_total_updates, min_total_updates, epoch_cap = 160, 80, 60
+    elif total_files < 500:
+        target_total_updates, min_total_updates, epoch_cap = 400, 200, 120
+    else:
+        target_total_updates, min_total_updates, epoch_cap = 800, 300, 200
     suggested_epochs = user_epochs
     if steps_per_epoch >= 1:
         updates_at_user = steps_per_epoch * user_epochs
         if updates_at_user < min_total_updates:
             suggested_epochs = max(user_epochs, int(math.ceil(float(target_total_updates) / float(steps_per_epoch))))
-    suggested_epochs = max(user_epochs, min(suggested_epochs, 200))
+    suggested_epochs = max(user_epochs, min(suggested_epochs, int(epoch_cap)))
 
     if new_batch == user_batch and suggested_epochs == user_epochs:
         return cfg, total_files, train_count
@@ -732,6 +856,10 @@ class FitContext:
     fits in two phases and each phase needs fresh EarlyStopping /
     ReduceLROnPlateau state — reusing a callback instance across phases
     would carry the first phase's best-weights decision into the second.
+
+    `should_stop` is polled by a Keras callback at the end of every epoch
+    (and by the strategies between phases) so cancellation never waits for
+    a full training run to finish.
     """
 
     progress: Optional[Callable[[float, str], None]]
@@ -739,6 +867,7 @@ class FitContext:
     train_ds: Any = None
     val_ds: Any = None
     class_weights: Optional[Dict[int, float]] = None
+    should_stop: Optional[Callable[[], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -789,7 +918,7 @@ def _default_fit(model: Any, bundle: DatasetBundle, cfg: TrainConfig, ctx: FitCo
     epochs = int(cfg.epochs)
     fit_kwargs: Dict[str, Any] = {
         "epochs": epochs,
-        "verbose": 1,
+        "verbose": 0,
         "callbacks": ctx.make_callbacks(epochs),
     }
     if bundle.val_ds is not None:
@@ -831,20 +960,52 @@ def train_and_export(
     model_base_name: str = "model",
     array_name: str = "g_model",
     progress: Optional[Callable[[float, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_history: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> TrainResult:
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    timings: Dict[str, float] = {}
+    _t_total = time.perf_counter()
 
     dataset_dir = Path(dataset_dir)
     strategy = get_train_strategy(cfg.project_type)
     cfg = strategy.adjust_cfg(dataset_dir, cfg)
+    history: List[Dict[str, Any]] = []
+
+    def _cancelled() -> bool:
+        try:
+            return bool(should_stop and should_stop())
+        except Exception:
+            return False
+
+    def _check_cancel() -> None:
+        if _cancelled():
+            raise TrainingCancelled("Training cancelled by user.")
 
     if progress is not None:
         progress(0.02, "Building datasets...")
 
+    _check_cancel()
+    _t = time.perf_counter()
     bundle = strategy.prepare(dataset_dir, cfg)
+    timings["prep_ms"] = (time.perf_counter() - _t) * 1000.0
+    timings["backbone_load_ms"] = float(bundle.meta.get("backbone_load_ms") or 0.0)
     labels = bundle.class_names
+    _check_cancel()
+    _t = time.perf_counter()
     model = strategy.build_model(bundle, cfg)
+    timings["build_ms"] = (time.perf_counter() - _t) * 1000.0
+    _check_cancel()
+
+    # Apple Silicon Metal graph compilation dominates tiny embedded datasets.
+    # Keep the exact math, but run small runs on CPU threads.
+    small_cpu = bool(
+        sys.platform == "darwin"
+        and int(getattr(bundle, "total_files", 0) or 0) < 500
+        and not os.environ.get("AIOSCOUT_FORCE_GPU")
+    )
+    device_ctx = tf.device("/CPU:0") if small_cpu else contextlib.nullcontext()
 
     def make_callbacks(epochs_total: int, tag: str = "", lo: float = 0.05, hi: float = 0.80):
         """Fresh callbacks for one fit phase.
@@ -854,6 +1015,38 @@ def train_and_export(
         it stops before the head has moved.
         """
         callbacks: List[Any] = []
+
+        class _EpochHistory(tf.keras.callbacks.Callback):
+            """One real record per epoch — the chart/KPI source."""
+
+            def on_epoch_end(self, epoch, logs=None):
+                logs = logs or {}
+                entry: Dict[str, Any] = {"epoch": int(epoch) + 1}
+                for key in ("loss", "accuracy", "val_loss", "val_accuracy"):
+                    value = logs.get(key)
+                    if value is not None:
+                        try:
+                            entry[key] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                if tag:
+                    entry["phase"] = tag.strip("() ")
+                history.append(entry)
+                if on_history is not None:
+                    try:
+                        on_history(entry)
+                    except Exception:
+                        pass
+
+        class _CancelCheck(tf.keras.callbacks.Callback):
+            """Cooperative stop at the epoch boundary."""
+
+            def on_epoch_end(self, epoch, logs=None):
+                _check_cancel()
+
+        callbacks.append(_EpochHistory())
+        callbacks.append(_CancelCheck())
+
         if progress is not None:
             total = max(1, int(epochs_total))
             label = f" {tag}" if tag else ""
@@ -902,20 +1095,33 @@ def train_and_export(
         train_ds=bundle.train_ds,
         val_ds=bundle.val_ds,
         class_weights=bundle.class_weights,
+        should_stop=should_stop,
     )
-    strategy.fit(model, bundle, cfg, ctx)
+    _t = time.perf_counter()
+    with device_ctx:
+        strategy.fit(model, bundle, cfg, ctx)
+    timings["fit_ms"] = (time.perf_counter() - _t) * 1000.0
+    _check_cancel()
 
     eval_ds = bundle.val_ds if bundle.val_ds is not None else bundle.train_ds
     if progress is not None:
         progress(0.85, "Evaluating...")
-    loss, acc = model.evaluate(eval_ds, verbose=0)
+    with device_ctx:
+        loss, acc = model.evaluate(eval_ds, verbose=0)
+    _check_cancel()
 
+    _t = time.perf_counter()
     keras_model_path = run_dir / f"{model_base_name}.keras"
     model.save(str(keras_model_path))
+    timings["persist_ms"] = (time.perf_counter() - _t) * 1000.0
 
     if progress is not None:
         progress(0.9, "Converting to int8 TFLite...")
-    tflite_bytes = convert_to_int8_tflite(model, bundle.calibration_ds, cfg)
+    _t = time.perf_counter()
+    with device_ctx:
+        tflite_bytes = convert_to_int8_tflite(model, bundle.calibration_ds, cfg)
+    timings["quant_int8_ms"] = (time.perf_counter() - _t) * 1000.0
+    _check_cancel()
     tflite_path = run_dir / f"{model_base_name}.tflite"
     tflite_path.write_bytes(tflite_bytes)
 
@@ -925,10 +1131,28 @@ def train_and_export(
     # so quantization degradation is surfaced too.
     warnings_out: List[str] = [str(w) for w in (bundle.meta.get("warnings") or [])]
     accs_f32: Dict[str, float] = {}
+    confusion_labels: Optional[List[str]] = None
+    confusion_matrix: Optional[List[List[int]]] = None
     self_check_dir = Path(bundle.eval_dir) if bundle.eval_dir is not None else Path(dataset_dir)
     try:
-        accs_f32 = evaluate_class_accuracies(_keras_predict_fn(model), self_check_dir, labels)
-        accs_i8 = evaluate_class_accuracies(_tflite_predict_fn(tflite_bytes), self_check_dir, labels)
+        color_mode = str(getattr(cfg, "color_mode", "grayscale") or "grayscale")
+        accs_f32 = evaluate_class_accuracies(
+            _keras_predict_fn(model), self_check_dir, labels, color_mode=color_mode
+        )
+        accs_i8 = evaluate_class_accuracies(
+            _tflite_predict_fn(tflite_bytes, color_mode), self_check_dir, labels, color_mode=color_mode
+        )
+        # The deployed artifact is the INT8 graph, so the confusion matrix
+        # the UI shows is measured on it — not on the float model.
+        try:
+            confusion_labels, confusion_matrix = evaluate_confusion(
+                _tflite_predict_fn(tflite_bytes, color_mode),
+                self_check_dir,
+                labels,
+                color_mode=color_mode,
+            )
+        except Exception as ce:
+            warnings_out.append(f"confusion matrix unavailable: {ce}")
         for label in labels:
             a32 = accs_f32.get(label)
             a8 = accs_i8.get(label)
@@ -947,8 +1171,11 @@ def train_and_export(
         for w in warnings_out:
             print("  -", w)
 
+    _check_cancel()
     if progress is not None:
         progress(0.96, "Exporting sources...")
+    _t = time.perf_counter()
+    latency_ms = measure_tflite_latency(tflite_bytes)
     source_code, header_code = export_tflite_c_sources(tflite_bytes, array_name=array_name)
     model_h_path = run_dir / "model.h"
     model_cpp_path = run_dir / "model.cpp"
@@ -961,6 +1188,22 @@ def train_and_export(
         json.dumps(asdict(cfg), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    timings["persist_ms"] = float(timings.get("persist_ms") or 0.0) + (time.perf_counter() - _t) * 1000.0
+    timings["total_ms"] = (time.perf_counter() - _t_total) * 1000.0
+    try:
+        print(
+            "[trainer] timings prep_ms={:.0f} backbone_load_ms={:.0f} fit_ms={:.0f} "
+            "quant_int8_ms={:.0f} persist_ms={:.0f} total_ms={:.0f}".format(
+                timings.get("prep_ms", 0.0),
+                timings.get("backbone_load_ms", 0.0),
+                timings.get("fit_ms", 0.0),
+                timings.get("quant_int8_ms", 0.0),
+                timings.get("persist_ms", 0.0),
+                timings.get("total_ms", 0.0),
+            )
+        )
+    except Exception:
+        pass
     if progress is not None:
         progress(1.0, "Done.")
 
@@ -971,10 +1214,16 @@ def train_and_export(
         tflite_path=tflite_path,
         model_h_path=model_h_path,
         model_cpp_path=model_cpp_path,
-        metrics={"val_loss": float(loss), "val_accuracy": float(acc)},
+        metrics={"val_loss": float(loss), "val_accuracy": float(acc), "timings": dict(timings)},
         class_accuracies=accs_f32,
         warnings=warnings_out,
         meta=_json_safe_meta(bundle.meta),
+        history=history,
+        confusion_matrix=confusion_matrix,
+        confusion_labels=confusion_labels,
+        tensor_shape=[int(x) for x in bundle.input_shape],
+        tflite_size_bytes=int(len(tflite_bytes)),
+        latency_ms=float(latency_ms),
     )
 
 
